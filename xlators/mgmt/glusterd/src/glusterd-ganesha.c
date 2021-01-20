@@ -13,7 +13,6 @@
 #include "glusterd-op-sm.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
-#include "glusterd-nfs-svc.h"
 #include "glusterd-volgen.h"
 #include "glusterd-messages.h"
 #include <glusterfs/syscall.h>
@@ -422,6 +421,35 @@ check_host_list(void)
 }
 
 int
+gd_ganesha_send_dbus(char *volname, char *value)
+{
+    runner_t runner = {
+        0,
+    };
+    int ret = -1;
+    runinit(&runner);
+
+    GF_VALIDATE_OR_GOTO("glusterd-ganesha", volname, out);
+    GF_VALIDATE_OR_GOTO("glusterd-ganesha", value, out);
+
+    ret = 0;
+    if (check_host_list()) {
+        /* Check whether ganesha is running on this node */
+        if (manage_service("status")) {
+            gf_msg("glusterd-ganesha", GF_LOG_WARNING, 0,
+                   GD_MSG_GANESHA_NOT_RUNNING,
+                   "Export failed, NFS-Ganesha is not running");
+        } else {
+            runner_add_args(&runner, GANESHA_PREFIX "/dbus-send.sh", CONFDIR,
+                            value, volname, NULL);
+            ret = runner_run(&runner);
+        }
+    }
+out:
+    return ret;
+}
+
+int
 manage_export_config(char *volname, char *value, char **op_errstr)
 {
     runner_t runner = {
@@ -448,9 +476,6 @@ int
 ganesha_manage_export(dict_t *dict, char *value,
                       gf_boolean_t update_cache_invalidation, char **op_errstr)
 {
-    runner_t runner = {
-        0,
-    };
     int ret = -1;
     glusterd_volinfo_t *volinfo = NULL;
     dict_t *vol_opts = NULL;
@@ -459,7 +484,6 @@ ganesha_manage_export(dict_t *dict, char *value,
     glusterd_conf_t *priv = NULL;
     gf_boolean_t option = _gf_false;
 
-    runinit(&runner);
     this = THIS;
     GF_ASSERT(this);
     priv = this->private;
@@ -539,26 +563,13 @@ ganesha_manage_export(dict_t *dict, char *value,
             goto out;
         }
     }
-
-    if (check_host_list()) {
-        /* Check whether ganesha is running on this node */
-        if (manage_service("status")) {
-            gf_msg(this->name, GF_LOG_WARNING, 0, GD_MSG_GANESHA_NOT_RUNNING,
-                   "Export failed, NFS-Ganesha is not running");
-        } else {
-            runner_add_args(&runner, GANESHA_PREFIX "/dbus-send.sh", CONFDIR,
-                            value, volname, NULL);
-            ret = runner_run(&runner);
-            if (ret) {
-                gf_asprintf(op_errstr,
-                            "Dynamic export"
-                            " addition/deletion failed."
-                            " Please see log file for details");
-                goto out;
-            }
-        }
+    ret = gd_ganesha_send_dbus(volname, value);
+    if (ret) {
+        gf_asprintf(op_errstr,
+                    "Dynamic export addition/deletion failed."
+                    " Please see log file for details");
+        goto out;
     }
-
     if (update_cache_invalidation) {
         vol_opts = volinfo->dict;
         ret = dict_set_dynstr_with_alloc(vol_opts,
@@ -618,8 +629,9 @@ tear_down_cluster(gf_boolean_t run_teardown)
             goto out;
         }
 
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-        while (entry) {
+        while ((entry = sys_readdir(dir, scratch))) {
+            if (gf_irrelevant_entry(entry))
+                continue;
             snprintf(path, PATH_MAX, "%s/%s", CONFDIR, entry->d_name);
             ret = sys_lstat(path, &st);
             if (ret == -1) {
@@ -650,7 +662,6 @@ tear_down_cluster(gf_boolean_t run_teardown)
 
             gf_msg_debug(THIS->name, 0, "%s %s",
                          ret ? "Failed to remove" : "Removed", entry->d_name);
-            GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
         }
 
         ret = sys_closedir(dir);
@@ -780,7 +791,6 @@ int
 start_ganesha(char **op_errstr)
 {
     int ret = -1;
-    dict_t *vol_opts = NULL;
     glusterd_volinfo_t *volinfo = NULL;
     glusterd_conf_t *priv = NULL;
     runner_t runner = {
@@ -792,13 +802,13 @@ start_ganesha(char **op_errstr)
 
     cds_list_for_each_entry(volinfo, &priv->volumes, vol_list)
     {
-        vol_opts = volinfo->dict;
+#ifdef BUILD_GNFS
         /* Gluster-nfs has to be disabled across the trusted pool */
         /* before attempting to start nfs-ganesha */
-        ret = dict_set_str(vol_opts, NFS_DISABLE_MAP_KEY, "on");
+        ret = dict_set_str_sizen(volinfo->dict, NFS_DISABLE_MAP_KEY, "on");
         if (ret)
             goto out;
-
+#endif
         ret = glusterd_store_volinfo(volinfo,
                                      GLUSTERD_VOLINFO_VER_AC_INCREMENT);
         if (ret) {
@@ -813,6 +823,7 @@ start_ganesha(char **op_errstr)
      * running, hence we can skip the process of stopping gluster-nfs
      * service
      */
+#ifdef BUILD_GNFS
     if (priv->nfs_svc.inited) {
         ret = priv->nfs_svc.stop(&(priv->nfs_svc), SIGKILL);
         if (ret) {
@@ -823,6 +834,7 @@ start_ganesha(char **op_errstr)
             goto out;
         }
     }
+#endif
 
     if (check_host_list()) {
         runinit(&runner);

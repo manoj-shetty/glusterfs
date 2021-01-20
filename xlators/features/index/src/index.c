@@ -2104,7 +2104,7 @@ index_lookup(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xattr_req)
     worker_enqueue(this, stub);
     return 0;
 normal:
-    ret = dict_get_str(xattr_req, "link-count", &flag);
+    ret = dict_get_str_sizen(xattr_req, "link-count", &flag);
     if ((ret == 0) && (strcmp(flag, GF_XATTROP_INDEX_COUNT) == 0)) {
         STACK_WIND(frame, index_lookup_cbk, FIRST_CHILD(this),
                    FIRST_CHILD(this)->fops->lookup, loc, xattr_req);
@@ -2592,7 +2592,7 @@ notify(xlator_t *this, int event, void *data, ...)
 
     if ((event == GF_EVENT_PARENT_DOWN) && victim->cleanup_starting) {
         stub_cnt = GF_ATOMIC_GET(priv->stub_cnt);
-        clock_gettime(CLOCK_REALTIME, &sleep_till);
+        timespec_now_realtime(&sleep_till);
         sleep_till.tv_sec += 1;
 
         /* Wait for draining stub from queue before notify PARENT_DOWN */

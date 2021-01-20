@@ -24,10 +24,11 @@ from datetime import datetime
 import gsyncdconfig as gconf
 import libgfchangelog
 from rconf import rconf
-from syncdutils import Thread, GsyncdError, escape_space_newline
-from syncdutils import unescape_space_newline, gauxpfx, escape
-from syncdutils import lstat, errno_wrap, FreeObject, lf, matching_disk_gfid
-from syncdutils import NoStimeAvailable, PartialHistoryAvailable
+from syncdutils import (Thread, GsyncdError, escape_space_newline,
+                        unescape_space_newline, gauxpfx, escape,
+                        lstat, errno_wrap, FreeObject, lf, matching_disk_gfid,
+                        NoStimeAvailable, PartialHistoryAvailable,
+                        host_brick_split)
 
 URXTIME = (-1, 0)
 
@@ -1466,7 +1467,7 @@ class GMasterChangelogMixin(GMasterCommon):
         node = rconf.args.resource_remote
         node_data = node.split("@")
         node = node_data[-1]
-        remote_node_ip = node.split(":")[0]
+        remote_node_ip, _ = host_brick_split(node)
         self.status.set_slave_node(remote_node_ip)
 
     def changelogs_batch_process(self, changes):
@@ -1546,6 +1547,12 @@ class GMasterChangeloghistoryMixin(GMasterChangelogMixin):
         data_stime = self.get_data_stime()
 
         end_time = int(time.time())
+
+        #as start of historical crawl marks Geo-rep worker restart
+        if gconf.get("ignore-deletes"):
+            logging.info(lf('ignore-deletes config option is set',
+                         stime=data_stime))
+
         logging.info(lf('starting history crawl',
                         turns=self.history_turns,
                         stime=data_stime,

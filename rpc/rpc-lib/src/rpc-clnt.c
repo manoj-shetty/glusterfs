@@ -97,7 +97,7 @@ call_bail(void *data)
     struct saved_frame *saved_frame = NULL;
     struct saved_frame *trav = NULL;
     struct saved_frame *tmp = NULL;
-    char frame_sent[256] = {
+    char frame_sent[GF_TIMESTR_SIZE] = {
         0,
     };
     struct timespec timeout = {
@@ -105,7 +105,6 @@ call_bail(void *data)
     };
     char peerid[UNIX_PATH_MAX] = {0};
     gf_boolean_t need_unref = _gf_false;
-    int len;
 
     GF_VALIDATE_OR_GOTO("client", data, out);
 
@@ -165,11 +164,8 @@ call_bail(void *data)
 
     list_for_each_entry_safe(trav, tmp, &list, list)
     {
-        gf_time_fmt(frame_sent, sizeof frame_sent, trav->saved_at.tv_sec,
-                    gf_timefmt_FT);
-        len = strlen(frame_sent);
-        snprintf(frame_sent + len, sizeof(frame_sent) - len,
-                 ".%" GF_PRI_SUSECONDS, trav->saved_at.tv_usec);
+        gf_time_fmt_tv(frame_sent, sizeof frame_sent, &trav->saved_at,
+                       gf_timefmt_FT);
 
         gf_log(conn->name, GF_LOG_ERROR,
                "bailing out frame type(%s), op(%s(%d)), xid = 0x%x, "
@@ -317,20 +313,15 @@ saved_frames_unwind(struct saved_frames *saved_frames)
 {
     struct saved_frame *trav = NULL;
     struct saved_frame *tmp = NULL;
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
-    int len;
 
     list_splice_init(&saved_frames->lk_sf.list, &saved_frames->sf.list);
 
     list_for_each_entry_safe(trav, tmp, &saved_frames->sf.list, list)
     {
-        gf_time_fmt(timestr, sizeof timestr, trav->saved_at.tv_sec,
-                    gf_timefmt_FT);
-        len = strlen(timestr);
-        snprintf(timestr + len, sizeof(timestr) - len, ".%" GF_PRI_SUSECONDS,
-                 trav->saved_at.tv_usec);
+        gf_time_fmt_tv(timestr, sizeof timestr, &trav->saved_at, gf_timefmt_FT);
 
         if (!trav->rpcreq || !trav->rpcreq->prog)
             continue;
@@ -928,7 +919,7 @@ rpc_clnt_notify(rpc_transport_t *trans, void *mydata,
         }
 
         case RPC_TRANSPORT_MSG_RECEIVED: {
-            clock_gettime(CLOCK_REALTIME, &conn->last_received);
+            timespec_now_realtime(&conn->last_received);
 
             pollin = data;
             if (pollin->is_reply)
@@ -942,8 +933,7 @@ rpc_clnt_notify(rpc_transport_t *trans, void *mydata,
         }
 
         case RPC_TRANSPORT_MSG_SENT: {
-            clock_gettime(CLOCK_REALTIME, &conn->last_sent);
-
+            timespec_now_realtime(&conn->last_sent);
             ret = 0;
             break;
         }
@@ -960,6 +950,7 @@ rpc_clnt_notify(rpc_transport_t *trans, void *mydata,
                 conn->config.remote_port = 0;
                 conn->connected = 1;
                 conn->disconnected = 0;
+                pthread_cond_broadcast(&conn->cond);
             }
             pthread_mutex_unlock(&conn->lock);
 
@@ -1005,6 +996,7 @@ rpc_clnt_connection_init(struct rpc_clnt *clnt, glusterfs_ctx_t *ctx,
 
     conn = &clnt->conn;
     pthread_mutex_init(&clnt->conn.lock, NULL);
+    pthread_cond_init(&clnt->conn.cond, NULL);
 
     conn->name = gf_strdup(name);
     if (!conn->name) {
@@ -1830,6 +1822,7 @@ rpc_clnt_destroy(struct rpc_clnt *rpc)
     saved_frames_destroy(saved_frames);
     pthread_mutex_destroy(&rpc->lock);
     pthread_mutex_destroy(&rpc->conn.lock);
+    pthread_cond_destroy(&rpc->conn.cond);
 
     /* mem-pool should be destroyed, otherwise,
        it will cause huge memory leaks */

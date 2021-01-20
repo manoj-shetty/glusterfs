@@ -124,9 +124,9 @@ afr_release_notify_lock_for_ta(void *opaque)
 
     this = (xlator_t *)opaque;
     priv = this->private;
-    ret = afr_fill_ta_loc(this, &loc);
+    ret = afr_fill_ta_loc(this, &loc, _gf_true);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, AFR_MSG_THIN_ARB,
+        gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_THIN_ARB,
                "Failed to populate loc for thin-arbiter.");
         goto out;
     }
@@ -521,42 +521,6 @@ afr_compute_pre_op_sources(call_frame_t *frame, xlator_t *this)
                 local->transaction.pre_op_sources[j] = 0;
 }
 
-gf_boolean_t
-afr_has_arbiter_fop_cbk_quorum(call_frame_t *frame)
-{
-    afr_local_t *local = NULL;
-    afr_private_t *priv = NULL;
-    xlator_t *this = NULL;
-    gf_boolean_t fop_failed = _gf_false;
-    unsigned char *pre_op_sources = NULL;
-    int i = 0;
-
-    local = frame->local;
-    this = frame->this;
-    priv = this->private;
-    pre_op_sources = local->transaction.pre_op_sources;
-
-    /* If the fop failed on the brick, it is not a source. */
-    for (i = 0; i < priv->child_count; i++)
-        if (local->transaction.failed_subvols[i])
-            pre_op_sources[i] = 0;
-
-    switch (AFR_COUNT(pre_op_sources, priv->child_count)) {
-        case 1:
-            if (pre_op_sources[ARBITER_BRICK_INDEX])
-                fop_failed = _gf_true;
-            break;
-        case 0:
-            fop_failed = _gf_true;
-            break;
-    }
-
-    if (fop_failed)
-        return _gf_false;
-
-    return _gf_true;
-}
-
 void
 afr_txn_arbitrate_fop(call_frame_t *frame, xlator_t *this)
 {
@@ -873,7 +837,7 @@ afr_has_quorum(unsigned char *subvols, xlator_t *this, call_frame_t *frame)
     priv = this->private;
     up_children_count = AFR_COUNT(subvols, priv->child_count);
 
-    if (afr_lookup_has_quorum(frame, this, subvols))
+    if (afr_lookup_has_quorum(frame, up_children_count))
         return _gf_true;
 
     if (priv->quorum_count == AFR_QUORUM_AUTO) {
@@ -971,12 +935,8 @@ afr_need_dirty_marking(call_frame_t *frame, xlator_t *this)
         priv->child_count)
         return _gf_false;
 
-    if (priv->arbiter_count) {
-        if (!afr_has_arbiter_fop_cbk_quorum(frame))
-            need_dirty = _gf_true;
-    } else if (!afr_has_fop_cbk_quorum(frame)) {
+    if (!afr_has_fop_cbk_quorum(frame))
         need_dirty = _gf_true;
-    }
 
     return need_dirty;
 }
@@ -1026,12 +986,8 @@ afr_handle_quorum(call_frame_t *frame, xlator_t *this)
      * no split-brain with the fix. The problem is eliminated completely.
      */
 
-    if (priv->arbiter_count) {
-        if (afr_has_arbiter_fop_cbk_quorum(frame))
-            return;
-    } else if (afr_has_fop_cbk_quorum(frame)) {
+    if (afr_has_fop_cbk_quorum(frame))
         return;
-    }
 
     if (afr_need_dirty_marking(frame, this))
         goto set_response;
@@ -1073,7 +1029,7 @@ set_response:
 }
 
 int
-afr_fill_ta_loc(xlator_t *this, loc_t *loc)
+afr_fill_ta_loc(xlator_t *this, loc_t *loc, gf_boolean_t is_gfid_based_fop)
 {
     afr_private_t *priv = NULL;
 
@@ -1081,6 +1037,11 @@ afr_fill_ta_loc(xlator_t *this, loc_t *loc)
     loc->parent = inode_ref(priv->root_inode);
     gf_uuid_copy(loc->pargfid, loc->parent->gfid);
     loc->name = priv->pending_key[THIN_ARBITER_BRICK_INDEX];
+    if (is_gfid_based_fop && gf_uuid_is_null(priv->ta_gfid)) {
+        /* Except afr_ta_id_file_check() which is path based, all other gluster
+         * FOPS need gfid.*/
+        return -EINVAL;
+    }
     gf_uuid_copy(loc->gfid, priv->ta_gfid);
     loc->inode = inode_new(loc->parent->table);
     if (!loc->inode) {
@@ -1088,86 +1049,6 @@ afr_fill_ta_loc(xlator_t *this, loc_t *loc)
         return -ENOMEM;
     }
     return 0;
-}
-
-int
-afr_changelog_thin_arbiter_post_op(xlator_t *this, afr_local_t *local)
-{
-    int ret = 0;
-    afr_private_t *priv = NULL;
-    dict_t *xattr = NULL;
-    int failed_count = 0;
-    struct gf_flock flock = {
-        0,
-    };
-    loc_t loc = {
-        0,
-    };
-    int i = 0;
-
-    priv = this->private;
-    if (!priv->thin_arbiter_count)
-        return 0;
-
-    failed_count = AFR_COUNT(local->transaction.failed_subvols,
-                             priv->child_count);
-    if (!failed_count)
-        return 0;
-
-    GF_ASSERT(failed_count == 1);
-    ret = afr_fill_ta_loc(this, &loc);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_THIN_ARB,
-               "Failed to populate thin-arbiter loc for: %s.", loc.name);
-        goto out;
-    }
-
-    xattr = dict_new();
-    if (!xattr) {
-        ret = -ENOMEM;
-        goto out;
-    }
-    for (i = 0; i < priv->child_count; i++) {
-        ret = dict_set_static_bin(xattr, priv->pending_key[i],
-                                  local->pending[i],
-                                  AFR_NUM_CHANGE_LOGS * sizeof(int));
-        if (ret)
-            goto out;
-    }
-
-    flock.l_type = F_WRLCK;
-    flock.l_start = 0;
-    flock.l_len = 0;
-
-    /*TODO: Convert to two domain locking. */
-    ret = syncop_inodelk(priv->children[THIN_ARBITER_BRICK_INDEX],
-                         AFR_TA_DOM_NOTIFY, &loc, F_SETLKW, &flock, NULL, NULL);
-    if (ret)
-        goto out;
-
-    ret = syncop_xattrop(priv->children[THIN_ARBITER_BRICK_INDEX], &loc,
-                         GF_XATTROP_ADD_ARRAY, xattr, NULL, NULL, NULL);
-
-    if (ret == -EINVAL) {
-        gf_msg(this->name, GF_LOG_INFO, -ret, AFR_MSG_THIN_ARB,
-               "Thin-arbiter has denied post-op on %s for gfid %s.",
-               priv->pending_key[THIN_ARBITER_BRICK_INDEX],
-               uuid_utoa(local->inode->gfid));
-
-    } else if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_THIN_ARB,
-               "Post-op on thin-arbiter id file %s failed for gfid %s.",
-               priv->pending_key[THIN_ARBITER_BRICK_INDEX],
-               uuid_utoa(local->inode->gfid));
-    }
-    flock.l_type = F_UNLCK;
-    syncop_inodelk(priv->children[THIN_ARBITER_BRICK_INDEX], AFR_TA_DOM_NOTIFY,
-                   &loc, F_SETLK, &flock, NULL, NULL);
-out:
-    if (xattr)
-        dict_unref(xattr);
-
-    return ret;
 }
 
 static int
@@ -1264,9 +1145,9 @@ afr_ta_post_op_do(void *opaque)
     this = local->transaction.frame->this;
     priv = this->private;
 
-    ret = afr_fill_ta_loc(this, &loc);
+    ret = afr_fill_ta_loc(this, &loc, _gf_true);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, AFR_MSG_THIN_ARB,
+        gf_msg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_THIN_ARB,
                "Failed to populate loc for thin-arbiter.");
         goto out;
     }
@@ -2466,8 +2347,13 @@ afr_is_delayed_changelog_post_op_needed(call_frame_t *frame, xlator_t *this,
         goto out;
     }
 
-    if ((local->op != GF_FOP_WRITE) && (local->op != GF_FOP_FXATTROP)) {
-        /*Only allow writes but shard does [f]xattrops on writes, so
+    if (local->transaction.disable_delayed_post_op) {
+        goto out;
+    }
+
+    if ((local->op != GF_FOP_WRITE) && (local->op != GF_FOP_FXATTROP) &&
+        (local->op != GF_FOP_FSYNC)) {
+        /*Only allow writes/fsyncs but shard does [f]xattrops on writes, so
          * they are fine too*/
         goto out;
     }

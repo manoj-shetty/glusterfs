@@ -406,8 +406,11 @@ gd_syncop_mgmt_v3_lock(glusterd_op_t op, dict_t *op_ctx,
 
     ret = dict_allocate_and_serialize(op_ctx, &req.dict.dict_val,
                                       &req.dict.dict_len);
-    if (ret)
+    if (ret) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno,
+                GD_MSG_DICT_ALLOC_AND_SERL_LENGTH_GET_FAIL, NULL);
         goto out;
+    }
 
     gf_uuid_copy(req.uuid, my_uuid);
     gf_uuid_copy(req.txn_id, txn_id);
@@ -507,8 +510,11 @@ gd_syncop_mgmt_v3_unlock(dict_t *op_ctx, glusterd_peerinfo_t *peerinfo,
 
     ret = dict_allocate_and_serialize(op_ctx, &req.dict.dict_val,
                                       &req.dict.dict_len);
-    if (ret)
+    if (ret) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno,
+                GD_MSG_DICT_ALLOC_AND_SERL_LENGTH_GET_FAIL, NULL);
         goto out;
+    }
 
     gf_uuid_copy(req.uuid, my_uuid);
     gf_uuid_copy(req.txn_id, txn_id);
@@ -842,16 +848,21 @@ gd_syncop_mgmt_stage_op(glusterd_peerinfo_t *peerinfo, struct syncargs *args,
     uuid_t *peerid = NULL;
 
     req = GF_CALLOC(1, sizeof(*req), gf_gld_mt_mop_stage_req_t);
-    if (!req)
+    if (!req) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     gf_uuid_copy(req->uuid, my_uuid);
     req->op = op;
 
     ret = dict_allocate_and_serialize(dict_out, &req->buf.buf_val,
                                       &req->buf.buf_len);
-    if (ret)
+    if (ret) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno,
+                GD_MSG_DICT_ALLOC_AND_SERL_LENGTH_GET_FAIL, NULL);
         goto out;
+    }
 
     GD_ALLOC_COPY_UUID(peerid, peerinfo->uuid, ret);
     if (ret)
@@ -903,6 +914,8 @@ _gd_syncop_brick_op_cbk(struct rpc_req *req, struct iovec *iov, int count,
     if (rsp.output.output_len) {
         args->dict = dict_new();
         if (!args->dict) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL,
+                    NULL);
             ret = -1;
             args->op_errno = ENOMEM;
             goto out;
@@ -910,8 +923,11 @@ _gd_syncop_brick_op_cbk(struct rpc_req *req, struct iovec *iov, int count,
 
         ret = dict_unserialize(rsp.output.output_val, rsp.output.output_len,
                                &args->dict);
-        if (ret < 0)
+        if (ret < 0) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    GD_MSG_DICT_UNSERIALIZE_FAIL, NULL);
             goto out;
+        }
     }
 
     args->op_ret = rsp.op_ret;
@@ -1152,16 +1168,21 @@ gd_syncop_mgmt_commit_op(glusterd_peerinfo_t *peerinfo, struct syncargs *args,
     uuid_t *peerid = NULL;
 
     req = GF_CALLOC(1, sizeof(*req), gf_gld_mt_mop_commit_req_t);
-    if (!req)
+    if (!req) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     gf_uuid_copy(req->uuid, my_uuid);
     req->op = op;
 
     ret = dict_allocate_and_serialize(dict_out, &req->buf.buf_val,
                                       &req->buf.buf_len);
-    if (ret)
+    if (ret) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno,
+                GD_MSG_DICT_ALLOC_AND_SERL_LENGTH_GET_FAIL, NULL);
         goto out;
+    }
 
     GD_ALLOC_COPY_UUID(peerid, peerinfo->uuid, ret);
     if (ret)
@@ -1278,8 +1299,10 @@ gd_stage_op_phase(glusterd_op_t op, dict_t *op_ctx, dict_t *req_dict,
     GF_ASSERT(conf);
 
     rsp_dict = dict_new();
-    if (!rsp_dict)
+    if (!rsp_dict) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL, NULL);
         goto out;
+    }
 
     if ((op == GD_OP_CREATE_VOLUME) || (op == GD_OP_ADD_BRICK) ||
         (op == GD_OP_START_VOLUME))
@@ -1408,6 +1431,7 @@ gd_commit_op_phase(glusterd_op_t op, dict_t *op_ctx, dict_t *req_dict,
 
     rsp_dict = dict_new();
     if (!rsp_dict) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL, NULL);
         ret = -1;
         goto out;
     }
@@ -1464,8 +1488,11 @@ commit_done:
 
     if (op == GD_OP_STATUS_VOLUME) {
         ret = dict_get_uint32(req_dict, "cmd", &cmd);
-        if (ret)
+        if (ret) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_GET_FAILED,
+                    "Key=cmd", NULL);
             goto out;
+        }
 
         if (origin_glusterd) {
             if ((cmd & GF_CLI_STATUS_ALL)) {
@@ -1691,10 +1718,12 @@ gd_brick_op_phase(glusterd_op_t op, dict_t *op_ctx, dict_t *req_dict,
     rpc_clnt_t *rpc = NULL;
     dict_t *rsp_dict = NULL;
     int32_t cmd = GF_OP_CMD_NONE;
+    glusterd_volinfo_t *volinfo = NULL;
 
     this = THIS;
     rsp_dict = dict_new();
     if (!rsp_dict) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL, NULL);
         ret = -1;
         goto out;
     }
@@ -1722,18 +1751,28 @@ gd_brick_op_phase(glusterd_op_t op, dict_t *op_ctx, dict_t *req_dict,
     cds_list_for_each_entry_safe(pending_node, tmp, &selected, list)
     {
         rpc = glusterd_pending_node_get_rpc(pending_node);
+        /* In the case of rebalance if the rpc object is null, we try to
+         * create the rpc object. if the rebalance daemon is down, it returns
+         * -1. otherwise, rpc object will be created and referenced.
+         */
         if (!rpc) {
-            if (pending_node->type == GD_NODE_REBALANCE) {
-                ret = 0;
-                glusterd_defrag_volume_node_rsp(req_dict, NULL, op_ctx);
+            if (pending_node->type == GD_NODE_REBALANCE && pending_node->node) {
+                volinfo = pending_node->node;
+                ret = glusterd_rebalance_rpc_create(volinfo);
+                if (ret) {
+                    ret = 0;
+                    glusterd_defrag_volume_node_rsp(req_dict, NULL, op_ctx);
+                    goto out;
+                } else {
+                    rpc = glusterd_defrag_rpc_get(volinfo->rebal.defrag);
+                }
+            } else {
+                ret = -1;
+                gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_RPC_FAILURE,
+                       "Brick Op failed "
+                       "due to rpc failure.");
                 goto out;
             }
-
-            ret = -1;
-            gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_RPC_FAILURE,
-                   "Brick Op failed "
-                   "due to rpc failure.");
-            goto out;
         }
 
         ret = gd_syncop_mgmt_brick_op(rpc, pending_node, op, req_dict, op_ctx,
@@ -1759,7 +1798,7 @@ gd_brick_op_phase(glusterd_op_t op, dict_t *op_ctx, dict_t *req_dict,
     pending_node = NULL;
     ret = 0;
 out:
-    if (pending_node)
+    if (pending_node && pending_node->node)
         glusterd_pending_node_put_rpc(pending_node);
 
     if (rsp_dict)

@@ -74,7 +74,7 @@ glusterd_replace_slash_with_hyphen(char *str)
 
     while (ptr) {
         *ptr = '-';
-        ptr = strchr(str, '/');
+        ptr = strchr(ptr, '/');
     }
 }
 
@@ -660,85 +660,72 @@ out:
 }
 
 static int
-_storeslaves(dict_t *this, char *key, data_t *value, void *data)
-{
-    int32_t ret = 0;
-    gf_store_handle_t *shandle = NULL;
-    xlator_t *xl = NULL;
-
-    xl = THIS;
-    GF_ASSERT(xl);
-
-    shandle = (gf_store_handle_t *)data;
-
-    GF_ASSERT(shandle);
-    GF_ASSERT(shandle->fd > 0);
-    GF_ASSERT(shandle->path);
-    GF_ASSERT(key);
-    GF_ASSERT(value);
-    GF_ASSERT(value->data);
-
-    gf_msg_debug(xl->name, 0, "Storing in volinfo:key= %s, val=%s", key,
-                 value->data);
-
-    ret = gf_store_save_value(shandle->fd, key, (char *)value->data);
-    if (ret) {
-        gf_msg(xl->name, GF_LOG_ERROR, 0, GD_MSG_STORE_HANDLE_WRITE_FAIL,
-               "Unable to write into store"
-               " handle for path: %s",
-               shandle->path);
-        return -1;
-    }
-    return 0;
-}
-
-int
-_storeopts(dict_t *this, char *key, data_t *value, void *data)
+_storeopts(dict_t *dict_value, char *key, data_t *value, void *data)
 {
     int32_t ret = 0;
     int32_t exists = 0;
+    int32_t option_len = 0;
     gf_store_handle_t *shandle = NULL;
-    xlator_t *xl = NULL;
+    glusterd_volinfo_data_store_t *dict_data = NULL;
+    xlator_t *this = NULL;
 
-    xl = THIS;
-    GF_ASSERT(xl);
+    this = THIS;
+    GF_ASSERT(this);
 
-    shandle = (gf_store_handle_t *)data;
+    dict_data = (glusterd_volinfo_data_store_t *)data;
+    shandle = dict_data->shandle;
 
     GF_ASSERT(shandle);
     GF_ASSERT(shandle->fd > 0);
-    GF_ASSERT(shandle->path);
     GF_ASSERT(key);
     GF_ASSERT(value);
     GF_ASSERT(value->data);
 
-    if (is_key_glusterd_hooks_friendly(key)) {
-        exists = 1;
+    if (dict_data->key_check == 1) {
+        if (is_key_glusterd_hooks_friendly(key)) {
+            exists = 1;
 
-    } else {
-        exists = glusterd_check_option_exists(key, NULL);
+        } else {
+            exists = glusterd_check_option_exists(key, NULL);
+        }
     }
-
-    if (1 == exists) {
-        gf_msg_debug(xl->name, 0,
-                     "Storing in volinfo:key= %s, "
+    if (exists == 1 || dict_data->key_check == 0) {
+        gf_msg_debug(this->name, 0,
+                     "Storing in buffer for volinfo:key= %s, "
                      "val=%s",
                      key, value->data);
-
     } else {
-        gf_msg_debug(xl->name, 0, "Discarding:key= %s, val=%s", key,
+        gf_msg_debug(this->name, 0, "Discarding:key= %s, val=%s", key,
                      value->data);
         return 0;
     }
 
-    ret = gf_store_save_value(shandle->fd, key, (char *)value->data);
-    if (ret) {
-        gf_msg(xl->name, GF_LOG_ERROR, 0, GD_MSG_STORE_HANDLE_WRITE_FAIL,
-               "Unable to write into store"
-               " handle for path: %s",
-               shandle->path);
+    /*
+     * The option_len considers the length of the key value
+     * pair and along with that '=' and '\n', but as value->len
+     * already considers a NULL at the end of the data, adding
+     * just 1.
+     */
+    option_len = strlen(key) + value->len + 1;
+
+    if ((VOLINFO_BUFFER_SIZE - dict_data->buffer_len - 1) < option_len) {
+        ret = gf_store_save_items(shandle->fd, dict_data->buffer);
+        if (ret) {
+            gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_FILE_OP_FAILED, NULL);
+            return -1;
+        }
+        dict_data->buffer_len = 0;
+        dict_data->buffer[0] = '\0';
+    }
+    ret = snprintf(dict_data->buffer + dict_data->buffer_len, option_len + 1,
+                   "%s=%s\n", key, value->data);
+    if (ret < 0 || ret > option_len + 1) {
+        gf_smsg(this->name, GF_LOG_ERROR, EINVAL, GD_MSG_COPY_FAIL, NULL);
         return -1;
     }
+
+    dict_data->buffer_len += ret;
+
     return 0;
 }
 
@@ -1013,7 +1000,7 @@ glusterd_store_create_snap_dir(glusterd_snap_t *snap)
     return ret;
 }
 
-int32_t
+static int32_t
 glusterd_store_volinfo_write(int fd, glusterd_volinfo_t *volinfo)
 {
     int32_t ret = -1;
@@ -1021,19 +1008,47 @@ glusterd_store_volinfo_write(int fd, glusterd_volinfo_t *volinfo)
     GF_ASSERT(fd > 0);
     GF_ASSERT(volinfo);
     GF_ASSERT(volinfo->shandle);
+    xlator_t *this = NULL;
+    glusterd_volinfo_data_store_t *dict_data = NULL;
+
+    this = THIS;
+    GF_ASSERT(this);
 
     shandle = volinfo->shandle;
+
+    dict_data = GF_CALLOC(1, sizeof(glusterd_volinfo_data_store_t),
+                          gf_gld_mt_volinfo_dict_data_t);
+    if (dict_data == NULL) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_NO_MEMORY, NULL);
+        return -1;
+    }
+
     ret = glusterd_volume_exclude_options_write(fd, volinfo);
-    if (ret)
+    if (ret) {
         goto out;
+    }
+
+    dict_data->shandle = shandle;
+    dict_data->key_check = 1;
 
     shandle->fd = fd;
-    dict_foreach(volinfo->dict, _storeopts, shandle);
+    dict_foreach(volinfo->dict, _storeopts, (void *)dict_data);
 
-    dict_foreach(volinfo->gsync_slaves, _storeslaves, shandle);
+    dict_data->key_check = 0;
+    dict_foreach(volinfo->gsync_slaves, _storeopts, (void *)dict_data);
+
+    if (dict_data->buffer_len > 0) {
+        ret = gf_store_save_items(fd, dict_data->buffer);
+        if (ret) {
+            gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_FILE_OP_FAILED, NULL);
+            goto out;
+        }
+    }
+
     shandle->fd = 0;
 out:
-    gf_msg_debug(THIS->name, 0, "Returning %d", ret);
+    GF_FREE(dict_data);
+    gf_msg_debug(this->name, 0, "Returning %d", ret);
     return ret;
 }
 
@@ -1274,14 +1289,6 @@ out:
     return ret;
 }
 
-static int
-_gd_store_rebalance_dict(dict_t *dict, char *key, data_t *value, void *data)
-{
-    int fd = *(int *)data;
-
-    return gf_store_save_value(fd, key, value->data);
-}
-
 int32_t
 glusterd_store_node_state_write(int fd, glusterd_volinfo_t *volinfo)
 {
@@ -1289,6 +1296,12 @@ glusterd_store_node_state_write(int fd, glusterd_volinfo_t *volinfo)
     char buf[PATH_MAX];
     char uuid[UUID_SIZE + 1];
     uint total_len = 0;
+    glusterd_volinfo_data_store_t *dict_data = NULL;
+    gf_store_handle_t shandle;
+    xlator_t *this = NULL;
+
+    this = THIS;
+    GF_ASSERT(this);
 
     GF_ASSERT(fd > 0);
     GF_ASSERT(volinfo);
@@ -1328,14 +1341,33 @@ glusterd_store_node_state_write(int fd, glusterd_volinfo_t *volinfo)
     }
 
     ret = gf_store_save_items(fd, buf);
-    if (ret)
+    if (ret) {
         goto out;
+    }
 
     if (volinfo->rebal.dict) {
-        dict_foreach(volinfo->rebal.dict, _gd_store_rebalance_dict, &fd);
+        dict_data = GF_CALLOC(1, sizeof(glusterd_volinfo_data_store_t),
+                              gf_gld_mt_volinfo_dict_data_t);
+        if (dict_data == NULL) {
+            gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_NO_MEMORY, NULL);
+            return -1;
+        }
+        dict_data->shandle = &shandle;
+        shandle.fd = fd;
+        dict_foreach(volinfo->rebal.dict, _storeopts, (void *)dict_data);
+        if (dict_data->buffer_len > 0) {
+            ret = gf_store_save_items(fd, dict_data->buffer);
+            if (ret) {
+                gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_FILE_OP_FAILED,
+                        NULL);
+                goto out;
+                ;
+            }
+        }
     }
 out:
-    gf_msg_debug(THIS->name, 0, "Returning %d", ret);
+    GF_FREE(dict_data);
+    gf_msg_debug(this->name, 0, "Returning %d", ret);
     return ret;
 }
 
@@ -1781,8 +1813,9 @@ glusterd_store_delete_snap(glusterd_snap_t *snap)
         goto out;
     }
 
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-    while (entry) {
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         len = snprintf(path, PATH_MAX, "%s/%s", delete_path, entry->d_name);
         if ((len < 0) || (len >= PATH_MAX)) {
             goto stat_failed;
@@ -1812,7 +1845,6 @@ glusterd_store_delete_snap(glusterd_snap_t *snap)
                      ret ? "Failed to remove" : "Removed", entry->d_name);
     stat_failed:
         memset(path, 0, sizeof(path));
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
     }
 
     ret = sys_closedir(dir);
@@ -2309,7 +2341,7 @@ glusterd_store_retrieve_snapd(glusterd_volinfo_t *volinfo)
     ret = 0;
 
 out:
-    if (gf_store_iter_destroy(iter)) {
+    if (gf_store_iter_destroy(&iter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
@@ -2336,7 +2368,7 @@ glusterd_store_retrieve_bricks(glusterd_volinfo_t *volinfo)
     glusterd_conf_t *priv = NULL;
     int32_t brick_count = 0;
     int32_t ta_brick_count = 0;
-    char tmpkey[4096] = {
+    char tmpkey[32] = {
         0,
     };
     gf_store_iter_t *tmpiter = NULL;
@@ -2642,23 +2674,31 @@ glusterd_store_retrieve_bricks(glusterd_volinfo_t *volinfo)
         brick_count++;
     }
 
+    if (gf_store_iter_destroy(&tmpiter)) {
+        gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
+               "Failed to destroy store iter");
+        ret = -1;
+        goto out;
+    }
+
     ret = gf_store_iter_new(volinfo->shandle, &tmpiter);
 
     if (ret)
         goto out;
 
     if (volinfo->thin_arbiter_count == 1) {
+        snprintf(tmpkey, sizeof(tmpkey), "%s-%d",
+                 GLUSTERD_STORE_KEY_VOL_TA_BRICK, 0);
         while (ta_brick_count < volinfo->subvol_count) {
             ret = glusterd_brickinfo_new(&ta_brickinfo);
             if (ret)
                 goto out;
 
-            snprintf(tmpkey, sizeof(tmpkey), "%s-%d",
-                     GLUSTERD_STORE_KEY_VOL_TA_BRICK, 0);
-
             ret = gf_store_iter_get_matching(tmpiter, tmpkey, &tmpvalue);
 
             len = snprintf(path, sizeof(path), "%s/%s", brickdir, tmpvalue);
+            GF_FREE(tmpvalue);
+            tmpvalue = NULL;
             if ((len < 0) || (len >= sizeof(path))) {
                 ret = -1;
                 goto out;
@@ -2815,13 +2855,13 @@ glusterd_store_retrieve_bricks(glusterd_volinfo_t *volinfo)
     ret = 0;
 
 out:
-    if (gf_store_iter_destroy(tmpiter)) {
+    if (gf_store_iter_destroy(&tmpiter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
     }
 
-    if (gf_store_iter_destroy(iter)) {
+    if (gf_store_iter_destroy(&iter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
@@ -2954,7 +2994,7 @@ glusterd_store_retrieve_node_state(glusterd_volinfo_t *volinfo)
     ret = 0;
 
 out:
-    if (gf_store_iter_destroy(iter)) {
+    if (gf_store_iter_destroy(&iter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
@@ -3230,7 +3270,7 @@ glusterd_store_update_volinfo(glusterd_volinfo_t *volinfo)
     ret = 0;
 
 out:
-    if (gf_store_iter_destroy(iter)) {
+    if (gf_store_iter_destroy(&iter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
@@ -3335,20 +3375,6 @@ glusterd_store_set_options_path(glusterd_conf_t *conf, char *path, size_t len)
     snprintf(path, len, "%s/options", conf->workdir);
 }
 
-int
-_store_global_opts(dict_t *this, char *key, data_t *value, void *data)
-{
-    gf_store_handle_t *shandle = data;
-
-    if (gf_store_save_value(shandle->fd, key, (char *)value->data)) {
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, GD_MSG_STORE_HANDLE_WRITE_FAIL,
-               "Unable to write into store handle for key : %s, value %s", key,
-               (char *)value->data);
-    }
-
-    return 0;
-}
-
 int32_t
 glusterd_store_options(xlator_t *this, dict_t *opts)
 {
@@ -3357,13 +3383,15 @@ glusterd_store_options(xlator_t *this, dict_t *opts)
     char path[PATH_MAX] = {0};
     int fd = -1;
     int32_t ret = -1;
+    glusterd_volinfo_data_store_t *dict_data = NULL;
 
     conf = this->private;
     glusterd_store_set_options_path(conf, path, sizeof(path));
 
     ret = gf_store_handle_new(path, &shandle);
-    if (ret)
+    if (ret) {
         goto out;
+    }
 
     fd = gf_store_mkstemp(shandle);
     if (fd <= 0) {
@@ -3371,15 +3399,30 @@ glusterd_store_options(xlator_t *this, dict_t *opts)
         goto out;
     }
 
+    dict_data = GF_CALLOC(1, sizeof(glusterd_volinfo_data_store_t),
+                          gf_gld_mt_volinfo_dict_data_t);
+    if (dict_data == NULL) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_NO_MEMORY, NULL);
+        return -1;
+    }
+    dict_data->shandle = shandle;
     shandle->fd = fd;
-    dict_foreach(opts, _store_global_opts, shandle);
-    shandle->fd = 0;
+    dict_foreach(opts, _storeopts, (void *)dict_data);
+    if (dict_data->buffer_len > 0) {
+        ret = gf_store_save_items(fd, dict_data->buffer);
+        if (ret) {
+            gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_FILE_OP_FAILED, NULL);
+            goto out;
+        }
+    }
+
     ret = gf_store_rename_tmppath(shandle);
-    if (ret)
-        goto out;
 out:
-    if ((ret < 0) && (fd > 0))
+    shandle->fd = 0;
+    GF_FREE(dict_data);
+    if ((ret < 0) && (fd > 0)) {
         gf_store_unlink_tmppath(shandle);
+    }
     gf_store_handle_destroy(shandle);
     return ret;
 }
@@ -3425,7 +3468,7 @@ glusterd_store_retrieve_options(xlator_t *this)
         goto out;
     ret = 0;
 out:
-    (void)gf_store_iter_destroy(iter);
+    (void)gf_store_iter_destroy(&iter);
     gf_store_handle_destroy(shandle);
     return ret;
 }
@@ -3477,28 +3520,28 @@ glusterd_store_retrieve_volumes(xlator_t *this, glusterd_snap_t *snap)
         goto out;
     }
 
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-
-    while (entry) {
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         if (snap && ((!strcmp(entry->d_name, "geo-replication")) ||
                      (!strcmp(entry->d_name, "info"))))
-            goto next;
+            continue;
 
         len = snprintf(entry_path, PATH_MAX, "%s/%s", path, entry->d_name);
-        if ((len < 0) || (len >= PATH_MAX)) {
-            goto next;
-        }
+        if ((len < 0) || (len >= PATH_MAX))
+            continue;
+
         ret = sys_lstat(entry_path, &st);
         if (ret == -1) {
             gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_INVALID_ENTRY,
                    "Failed to stat entry %s : %s", path, strerror(errno));
-            goto next;
+            continue;
         }
 
         if (!S_ISDIR(st.st_mode)) {
             gf_msg_debug(this->name, 0, "%s is not a valid volume",
                          entry->d_name);
-            goto next;
+            continue;
         }
 
         volinfo = glusterd_store_retrieve_volume(entry->d_name, snap);
@@ -3521,8 +3564,6 @@ glusterd_store_retrieve_volumes(xlator_t *this, glusterd_snap_t *snap)
             glusterd_store_create_nodestate_sh_on_absence(volinfo);
             glusterd_store_perform_node_state_store(volinfo);
         }
-    next:
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
     }
 
     ret = 0;
@@ -3877,7 +3918,7 @@ glusterd_store_update_snap(glusterd_snap_t *snap)
     ret = 0;
 
 out:
-    if (gf_store_iter_destroy(iter)) {
+    if (gf_store_iter_destroy(&iter)) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_STORE_ITER_DESTROY_FAIL,
                "Failed to destroy store iter");
         ret = -1;
@@ -4072,9 +4113,9 @@ glusterd_store_retrieve_snaps(xlator_t *this)
         goto out;
     }
 
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-
-    while (entry) {
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         if (strcmp(entry->d_name, GLUSTERD_MISSED_SNAPS_LIST_FILE)) {
             ret = glusterd_store_retrieve_snap(entry->d_name);
             if (ret) {
@@ -4083,7 +4124,6 @@ glusterd_store_retrieve_snaps(xlator_t *this)
                 goto out;
             }
         }
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
     }
 
     /* Retrieve missed_snaps_list */
@@ -4398,7 +4438,7 @@ glusterd_store_create_peer_shandle(glusterd_peerinfo_t *peerinfo)
 static int32_t
 glusterd_store_peer_write(int fd, glusterd_peerinfo_t *peerinfo)
 {
-    char buf[128];
+    char buf[PATH_MAX];
     uint total_len = 0;
     int32_t ret = 0;
     int32_t i = 1;
@@ -4407,7 +4447,7 @@ glusterd_store_peer_write(int fd, glusterd_peerinfo_t *peerinfo)
     ret = snprintf(buf + total_len, sizeof(buf) - total_len, "%s=%s\n%s=%d\n",
                    GLUSTERD_STORE_KEY_PEER_UUID, uuid_utoa(peerinfo->uuid),
                    GLUSTERD_STORE_KEY_PEER_STATE, peerinfo->state.state);
-    if (ret < 0 || ret >= sizeof(buf)) {
+    if (ret < 0 || ret >= sizeof(buf) - total_len) {
         ret = -1;
         goto out;
     }
@@ -4418,7 +4458,7 @@ glusterd_store_peer_write(int fd, glusterd_peerinfo_t *peerinfo)
         ret = snprintf(buf + total_len, sizeof(buf) - total_len,
                        GLUSTERD_STORE_KEY_PEER_HOSTNAME "%d=%s\n", i,
                        hostname->hostname);
-        if (ret < 0 || ret >= sizeof(buf)) {
+        if (ret < 0 || ret >= sizeof(buf) - total_len) {
             ret = -1;
             goto out;
         }
@@ -4530,11 +4570,9 @@ glusterd_store_retrieve_peers(xlator_t *this)
         goto out;
     }
 
-    for (;;) {
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-        if (!entry) {
-            break;
-        }
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         if (gf_uuid_parse(entry->d_name, tmp_uuid) != 0) {
             gf_log(this->name, GF_LOG_WARNING, "skipping non-peer file %s",
                    entry->d_name);
@@ -4622,7 +4660,7 @@ glusterd_store_retrieve_peers(xlator_t *this)
         is_ok = _gf_true;
 
     next:
-        (void)gf_store_iter_destroy(iter);
+        (void)gf_store_iter_destroy(&iter);
 
         if (!is_ok) {
             gf_log(this->name, GF_LOG_WARNING,

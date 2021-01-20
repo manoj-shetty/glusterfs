@@ -8,6 +8,8 @@
   cases as published by the Free Software Foundation.
 */
 
+#include <config.h>
+
 #include <sys/wait.h>
 #include "fuse-bridge.h"
 #include <glusterfs/glusterfs.h>
@@ -177,7 +179,7 @@ fusedump_gettime(struct fusedump_timespec *fts)
         0,
     };
 
-    clock_gettime(CLOCK_REALTIME, &ts);
+    timespec_now_realtime(&ts);
 
     fts->sec = ts.tv_sec;
     fts->nsec = ts.tv_nsec;
@@ -205,7 +207,7 @@ fusedump_setup_meta(struct iovec *iovs, char *dir,
 
 static int
 check_and_dump_fuse_W(fuse_private_t *priv, struct iovec *iov_out, int count,
-                      ssize_t res)
+                      ssize_t res, errnomask_t errnomask)
 {
     char w = 'W';
     struct iovec diov[4] = {
@@ -223,9 +225,92 @@ check_and_dump_fuse_W(fuse_private_t *priv, struct iovec *iov_out, int count,
     struct fuse_out_header *fouh = NULL;
 
     if (res == -1) {
-        gf_log_callingfn("glusterfs-fuse", GF_LOG_ERROR,
-                         "writing to fuse device failed: %s", strerror(errno));
+        const char *errdesc = NULL;
+        gf_loglevel_t loglevel = GF_LOG_ERROR;
+        gf_boolean_t errno_degraded = _gf_false;
+        gf_boolean_t errno_promoted = _gf_false;
+
+#define ACCOUNT_ERRNO(eno)                                                     \
+    do {                                                                       \
+        if (errno_degraded) {                                                  \
+            pthread_mutex_lock(&priv->fusedev_errno_cnt_mutex);                \
+            {                                                                  \
+                if (!++priv->fusedev_errno_cnt[FUSEDEV_##eno])                 \
+                    errno_promoted = _gf_true;                                 \
+            }                                                                  \
+            pthread_mutex_unlock(&priv->fusedev_errno_cnt_mutex);              \
+        }                                                                      \
+    } while (0)
+
+        /* If caller masked the errno, then it
+         * does not indicate an error at the application
+         * level, so we degrade the log severity to DEBUG.
+         */
+        if (errnomask && errno < ERRNOMASK_MAX &&
+            GET_ERRNO_MASK(errnomask, errno)) {
+            loglevel = GF_LOG_DEBUG;
+            errno_degraded = _gf_true;
+        }
+
+        switch (errno) {
+            /* The listed errnos are FUSE status indicators,
+             * not legit values according to POSIX (see write(3p)),
+             * so resolving them according to the standard
+             * POSIX interpretation would be misleading.
+             */
+            case ENOENT:
+                errdesc = "ENOENT";
+                ACCOUNT_ERRNO(ENOENT);
+                break;
+            case ENOTDIR:
+                errdesc = "ENOTDIR";
+                ACCOUNT_ERRNO(ENOTDIR);
+                break;
+            case ENODEV:
+                errdesc = "ENODEV";
+                ACCOUNT_ERRNO(ENODEV);
+                break;
+            case EPERM:
+                errdesc = "EPERM";
+                ACCOUNT_ERRNO(EPERM);
+                break;
+            case ENOMEM:
+                errdesc = "ENOMEM";
+                ACCOUNT_ERRNO(ENOMEM);
+                break;
+            case ENOTCONN:
+                errdesc = "ENOTCONN";
+                ACCOUNT_ERRNO(ENOTCONN);
+                break;
+            case ECONNREFUSED:
+                errdesc = "ECONNREFUSED";
+                ACCOUNT_ERRNO(ECONNREFUSED);
+                break;
+            case EOVERFLOW:
+                errdesc = "EOVERFLOW";
+                ACCOUNT_ERRNO(EOVERFLOW);
+                break;
+            case EBUSY:
+                errdesc = "EBUSY";
+                ACCOUNT_ERRNO(EBUSY);
+                break;
+            case ENOTEMPTY:
+                errdesc = "ENOTEMPTY";
+                ACCOUNT_ERRNO(ENOTEMPTY);
+                break;
+            default:
+                errdesc = strerror(errno);
+        }
+
+        gf_log_callingfn("glusterfs-fuse", loglevel,
+                         "writing to fuse device failed: %s", errdesc);
+        if (errno_promoted)
+            gf_log("glusterfs-fuse", GF_LOG_WARNING,
+                   "writing to fuse device yielded %s %d times", errdesc,
+                   UINT8_MAX + 1);
         return errno;
+
+#undef ACCOUNT_ERRNO
     }
 
     fouh = iov_out[0].iov_base;
@@ -289,7 +374,7 @@ send_fuse_iov(xlator_t *this, fuse_in_header_t *finh, struct iovec *iov_out,
     gf_log("glusterfs-fuse", GF_LOG_TRACE, "writev() result %d/%d %s", res,
            fouh->len, res == -1 ? strerror(errno) : "");
 
-    return check_and_dump_fuse_W(priv, iov_out, count, res);
+    return check_and_dump_fuse_W(priv, iov_out, count, res, NULL);
 }
 
 static int
@@ -322,7 +407,7 @@ send_fuse_data(xlator_t *this, fuse_in_header_t *finh, void *data, size_t size)
 static int32_t
 fuse_invalidate_entry(xlator_t *this, uint64_t fuse_ino)
 {
-#if FUSE_KERNEL_MINOR_VERSION >= 11
+#if (FUSE_KERNEL_MINOR_VERSION >= 11 && defined(HAVE_FUSE_NOTIFICATIONS))
     struct fuse_out_header *fouh = NULL;
     struct fuse_notify_inval_entry_out *fnieo = NULL;
     fuse_private_t *priv = NULL;
@@ -359,6 +444,15 @@ fuse_invalidate_entry(xlator_t *this, uint64_t fuse_ino)
 
         fouh->unique = 0;
         fouh->error = FUSE_NOTIFY_INVAL_ENTRY;
+
+        if (ENOENT < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOENT);
+        if (ENOTDIR < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOTDIR);
+        if (EBUSY < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, EBUSY);
+        if (ENOTEMPTY < ERRNOMASK_MAX)
+            MASK_ERRNO(node->errnomask, ENOTEMPTY);
 
         if (dentry->name) {
             nlen = strlen(dentry->name);
@@ -404,7 +498,7 @@ fuse_invalidate_entry(xlator_t *this, uint64_t fuse_ino)
 static int32_t
 fuse_invalidate_inode(xlator_t *this, uint64_t fuse_ino)
 {
-#if FUSE_KERNEL_MINOR_VERSION >= 11
+#if (FUSE_KERNEL_MINOR_VERSION >= 11 && defined(HAVE_FUSE_NOTIFICATIONS))
     struct fuse_out_header *fouh = NULL;
     struct fuse_notify_inval_inode_out *fniio = NULL;
     fuse_private_t *priv = NULL;
@@ -443,6 +537,9 @@ fuse_invalidate_inode(xlator_t *this, uint64_t fuse_ino)
     fniio->ino = fuse_ino;
     fniio->off = 0;
     fniio->len = -1;
+
+    if (ENOENT < ERRNOMASK_MAX)
+        MASK_ERRNO(node->errnomask, ENOENT);
 
     fuse_log_eh(this, "Invalidated inode %" PRIu64 " (gfid: %s)", fuse_ino,
                 uuid_utoa(inode->gfid));
@@ -489,6 +586,7 @@ fuse_timed_message_new(void)
     /* should be NULL if not set */
     dmsg->fuse_message_body = NULL;
     INIT_LIST_HEAD(&dmsg->next);
+    memset(dmsg->errnomask, 0, sizeof(dmsg->errnomask));
 
     return dmsg;
 }
@@ -687,6 +785,8 @@ fuse_interrupt(xlator_t *this, fuse_in_header_t *finh, void *msg,
         dmsg->fuse_out_header.unique = finh->unique;
         dmsg->fuse_out_header.len = sizeof(dmsg->fuse_out_header);
         dmsg->fuse_out_header.error = -EAGAIN;
+        if (ENOENT < ERRNOMASK_MAX)
+            MASK_ERRNO(dmsg->errnomask, ENOENT);
         timespec_now(&dmsg->scheduled_ts);
         timespec_adjust_delta(&dmsg->scheduled_ts,
                               (struct timespec){0, 10000000});
@@ -733,18 +833,22 @@ fuse_interrupt_finish_fop(call_frame_t *frame, xlator_t *this,
         {
             intstat_orig = fir->interrupt_state;
             if (fir->interrupt_state == INTERRUPT_NONE) {
-                fir->interrupt_state = INTERRUPT_SQUELCHED;
                 if (sync) {
-                    while (fir->interrupt_state == INTERRUPT_NONE) {
+                    fir->interrupt_state = INTERRUPT_WAITING_HANDLER;
+                    while (fir->interrupt_state != INTERRUPT_SQUELCHED) {
                         pthread_cond_wait(&fir->handler_cond,
                                           &fir->handler_mutex);
                     }
-                }
+                } else
+                    fir->interrupt_state = INTERRUPT_SQUELCHED;
             }
         }
         pthread_mutex_unlock(&fir->handler_mutex);
     }
 
+    GF_ASSERT(intstat_orig == INTERRUPT_NONE ||
+              intstat_orig == INTERRUPT_HANDLED ||
+              intstat_orig == INTERRUPT_SQUELCHED);
     gf_log("glusterfs-fuse", GF_LOG_DEBUG, "intstat_orig=%d", intstat_orig);
 
     /*
@@ -794,19 +898,29 @@ fuse_interrupt_finish_interrupt(xlator_t *this, fuse_interrupt_record_t *fir,
     };
     fuse_interrupt_state_t intstat_orig = INTERRUPT_NONE;
 
+    GF_ASSERT(intstat == INTERRUPT_HANDLED || intstat == INTERRUPT_SQUELCHED);
+
     pthread_mutex_lock(&fir->handler_mutex);
     {
         intstat_orig = fir->interrupt_state;
-        if (fir->interrupt_state == INTERRUPT_NONE) {
-            fir->interrupt_state = intstat;
-            if (sync) {
+        switch (intstat_orig) {
+            case INTERRUPT_NONE:
+                fir->interrupt_state = intstat;
+                break;
+            case INTERRUPT_WAITING_HANDLER:
+                fir->interrupt_state = INTERRUPT_SQUELCHED;
                 pthread_cond_signal(&fir->handler_cond);
-            }
+                break;
+            default:
+                break;
         }
         finh = fir->fuse_in_header;
     }
     pthread_mutex_unlock(&fir->handler_mutex);
 
+    GF_ASSERT(intstat_orig == INTERRUPT_NONE ||
+              (sync && intstat_orig == INTERRUPT_WAITING_HANDLER) ||
+              (!sync && intstat_orig == INTERRUPT_SQUELCHED));
     gf_log("glusterfs-fuse", GF_LOG_DEBUG, "intstat_orig=%d", intstat_orig);
 
     /*
@@ -1647,6 +1761,14 @@ fattr_to_gf_set_attr(int32_t valid)
         gf_valid |= GF_SET_ATTR_CTIME;
 #endif
 
+#if FUSE_KERNEL_MINOR_VERSION >= 9
+    if (valid & FATTR_ATIME_NOW)
+        gf_valid |= GF_ATTR_ATIME_NOW;
+
+    if (valid & FATTR_MTIME_NOW)
+        gf_valid |= GF_ATTR_MTIME_NOW;
+#endif
+
     if (valid & FATTR_SIZE)
         gf_valid |= GF_SET_ATTR_SIZE;
 
@@ -2111,7 +2233,6 @@ fuse_mknod(xlator_t *this, fuse_in_header_t *finh, void *msg,
     fuse_state_t *state = NULL;
 #if FUSE_KERNEL_MINOR_VERSION >= 12
     fuse_private_t *priv = NULL;
-    int32_t ret = -1;
 
     priv = this->private;
     if (priv->proto_minor < 12)
@@ -2183,7 +2304,6 @@ fuse_mkdir(xlator_t *this, fuse_in_header_t *finh, void *msg,
     char *name = (char *)(fmi + 1);
 #if FUSE_KERNEL_MINOR_VERSION >= 12
     fuse_private_t *priv = NULL;
-    int32_t ret = -1;
 #endif
 
     fuse_state_t *state;
@@ -2346,21 +2466,26 @@ fuse_rename_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 {
     fuse_state_t *state = NULL;
     fuse_in_header_t *finh = NULL;
+    char loc_uuid_str[64] = {0}, loc2_uuid_str[64] = {0};
 
     state = frame->root->state;
     finh = state->finh;
 
-    fuse_log_eh(this,
-                "op_ret: %d, op_errno: %d, %" PRIu64
-                ": %s() "
-                "path: %s parent: %s ==> path: %s parent: %s"
-                "gfid: %s",
-                op_ret, op_errno, frame->root->unique,
-                gf_fop_list[frame->root->op], state->loc.path,
-                state->loc.parent ? uuid_utoa(state->loc.parent->gfid) : "",
-                state->loc2.path,
-                state->loc2.parent ? uuid_utoa(state->loc2.parent->gfid) : "",
-                state->loc.inode ? uuid_utoa(state->loc.inode->gfid) : "");
+    fuse_log_eh(
+        this,
+        "op_ret: %d, op_errno: %d, %" PRIu64
+        ": %s() "
+        "path: %s parent: %s ==> path: %s parent: %s"
+        "gfid: %s",
+        op_ret, op_errno, frame->root->unique, gf_fop_list[frame->root->op],
+        state->loc.path,
+        (state->loc.parent ? uuid_utoa_r(state->loc.parent->gfid, loc_uuid_str)
+                           : ""),
+        state->loc2.path,
+        (state->loc2.parent
+             ? uuid_utoa_r(state->loc2.parent->gfid, loc2_uuid_str)
+             : ""),
+        state->loc.inode ? uuid_utoa(state->loc.inode->gfid) : "");
 
     /* need to check for loc->parent to keep clang-scan happy.
        It gets dereferenced below, and is checked for NULL above. */
@@ -2704,7 +2829,6 @@ fuse_create(xlator_t *this, fuse_in_header_t *finh, void *msg,
 #if FUSE_KERNEL_MINOR_VERSION >= 12
     struct fuse_create_in *fci = msg;
     fuse_private_t *priv = NULL;
-    int32_t ret = -1;
 #else
     struct fuse_open_in *fci = msg;
 #endif
@@ -3093,15 +3217,18 @@ fuse_copy_file_range_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 void
 fuse_copy_file_range_resume(fuse_state_t *state)
 {
+    char fd_uuid_str[64] = {0}, fd_dst_uuid_str[64] = {0};
+
     gf_log("glusterfs-fuse", GF_LOG_TRACE,
            "%" PRIu64
            ": COPY_FILE_RANGE "
            "(input fd: %p (gfid: %s), "
            "output fd: %p (gfid: %s) size=%zu, "
            "offset_in=%" PRIu64 ", offset_out=%" PRIu64 ")",
-           state->finh->unique, state->fd, uuid_utoa(state->fd->inode->gfid),
-           state->fd_dst, uuid_utoa(state->fd_dst->inode->gfid), state->size,
-           state->off_in, state->off_out);
+           state->finh->unique, state->fd,
+           uuid_utoa_r(state->fd->inode->gfid, fd_uuid_str), state->fd_dst,
+           uuid_utoa_r(state->fd_dst->inode->gfid, fd_dst_uuid_str),
+           state->size, state->off_in, state->off_out);
 
     FUSE_FOP(state, fuse_copy_file_range_cbk, GF_FOP_COPY_FILE_RANGE,
              copy_file_range, state->fd, state->off_in, state->fd_dst,
@@ -3298,6 +3425,8 @@ fuse_release(xlator_t *this, fuse_in_header_t *finh, void *msg,
 
     gf_log("glusterfs-fuse", GF_LOG_TRACE,
            "finh->unique: %" PRIu64 ": RELEASE %p", finh->unique, state->fd);
+
+    fd_close(state->fd);
 
     fuse_fd_ctx_destroy(this, state->fd);
     fd_unref(fd);
@@ -4608,12 +4737,10 @@ fuse_setlk_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
     fuse_state_t *state = NULL;
     int ret = 0;
 
-    ret = fuse_interrupt_finish_fop(frame, this, _gf_false, (void **)&state);
-    if (state) {
-        GF_FREE(state->name);
-        dict_unref(state->xdata);
-        GF_FREE(state);
-    }
+    ret = fuse_interrupt_finish_fop(frame, this, _gf_true, (void **)&state);
+    GF_FREE(state->name);
+    dict_unref(state->xdata);
+    GF_FREE(state);
     if (ret) {
         return 0;
     }
@@ -4669,28 +4796,12 @@ fuse_setlk_interrupt_handler_cbk(call_frame_t *frame, void *cookie,
                                  int32_t op_errno, dict_t *dict, dict_t *xdata)
 {
     fuse_interrupt_state_t intstat = INTERRUPT_NONE;
-    fuse_interrupt_record_t *fir;
-    fuse_state_t *state = NULL;
-    int ret = 0;
-
-    ret = dict_get_bin(xdata, "fuse-interrupt-record", (void **)&fir);
-    if (ret < 0) {
-        gf_log("glusterfs-fuse", GF_LOG_ERROR, "interrupt record not found");
-
-        goto out;
-    }
+    fuse_interrupt_record_t *fir = cookie;
 
     intstat = op_ret >= 0 ? INTERRUPT_HANDLED : INTERRUPT_SQUELCHED;
 
-    fuse_interrupt_finish_interrupt(this, fir, intstat, _gf_false,
-                                    (void **)&state);
-    if (state) {
-        GF_FREE(state->name);
-        dict_unref(state->xdata);
-        GF_FREE(state);
-    }
+    fuse_interrupt_finish_interrupt(this, fir, intstat, _gf_true, NULL);
 
-out:
     STACK_DESTROY(frame->root);
 
     return 0;
@@ -4728,9 +4839,10 @@ fuse_setlk_interrupt_handler(xlator_t *this, fuse_interrupt_record_t *fir)
     frame->op = GF_FOP_GETXATTR;
     state->name = xattr_name;
 
-    STACK_WIND(frame, fuse_setlk_interrupt_handler_cbk, state->active_subvol,
-               state->active_subvol->fops->fgetxattr, state->fd, xattr_name,
-               state->xdata);
+    STACK_WIND_COOKIE(frame, fuse_setlk_interrupt_handler_cbk, fir,
+                      state->active_subvol,
+                      state->active_subvol->fops->fgetxattr, state->fd,
+                      xattr_name, state->xdata);
 
     return;
 
@@ -4753,15 +4865,9 @@ fuse_setlk_resume(fuse_state_t *state)
     fir = fuse_interrupt_record_new(state->finh, fuse_setlk_interrupt_handler);
     state_clone = gf_memdup(state, sizeof(*state));
     if (state_clone) {
-        /*
-         * Calling this allocator with fir casted to (char *) seems like
-         * an abuse of this API, but in fact the API is stupid to assume
-         * a (char *) argument (in the funcion it's casted to (void *)
-         * anyway).
-         */
-        state_clone->xdata = dict_for_key_value(
-            "fuse-interrupt-record", (char *)fir, sizeof(*fir), _gf_true);
+        state_clone->xdata = dict_new();
     }
+
     if (!fir || !state_clone || !state_clone->xdata) {
         if (fir) {
             GF_FREE(fir);
@@ -4819,7 +4925,7 @@ fuse_setlk(xlator_t *this, fuse_in_header_t *finh, void *msg,
     return;
 }
 
-#if FUSE_KERNEL_MINOR_VERSION >= 11
+#if FUSE_KERNEL_MINOR_VERSION >= 11 && defined(HAVE_FUSE_NOTIFICATIONS)
 static void *
 notify_kernel_loop(void *data)
 {
@@ -4869,7 +4975,7 @@ notify_kernel_loop(void *data)
         iov_out.iov_base = node->inval_buf;
         iov_out.iov_len = len;
         rv = sys_writev(priv->fd, &iov_out, 1);
-        check_and_dump_fuse_W(priv, &iov_out, 1, rv);
+        check_and_dump_fuse_W(priv, &iov_out, 1, rv, node->errnomask);
 
         GF_FREE(node);
 
@@ -4961,7 +5067,7 @@ timed_response_loop(void *data)
         iovs[1] = (struct iovec){dmsg->fuse_message_body,
                                  len - sizeof(struct fuse_out_header)};
         rv = sys_writev(priv->fd, iovs, 2);
-        check_and_dump_fuse_W(priv, iovs, 2, rv);
+        check_and_dump_fuse_W(priv, iovs, 2, rv, dmsg->errnomask);
 
         fuse_timed_message_free(dmsg);
 
@@ -5066,6 +5172,7 @@ fuse_init(xlator_t *this, fuse_in_header_t *finh, void *msg,
     priv->timed_response_fuse_thread_started = _gf_true;
 
     /* Used for 'reverse invalidation of inode' */
+#ifdef HAVE_FUSE_NOTIFICATIONS
     if (fini->minor >= 12) {
         ret = gf_thread_create(&messenger, NULL, notify_kernel_loop, this,
                                "fusenoti");
@@ -5077,7 +5184,9 @@ fuse_init(xlator_t *this, fuse_in_header_t *finh, void *msg,
             goto out;
         }
         priv->reverse_fuse_thread_started = _gf_true;
-    } else {
+    } else
+#endif
+    {
         /*
          * FUSE minor < 12 does not implement invalidate notifications.
          * This mechanism is required for fopen-keep-cache to operate
@@ -5504,6 +5613,7 @@ fuse_migrate_fd(xlator_t *this, fd_t *basefd, xlator_t *old_subvol,
     char create_in_progress = 0;
     fuse_fd_ctx_t *basefd_ctx = NULL;
     fd_t *oldfd = NULL;
+    dict_t *xdata = NULL;
 
     basefd_ctx = fuse_fd_ctx_get(this, basefd);
     GF_VALIDATE_OR_GOTO("glusterfs-fuse", basefd_ctx, out);
@@ -5540,10 +5650,23 @@ fuse_migrate_fd(xlator_t *this, fd_t *basefd, xlator_t *old_subvol,
     }
 
     if (oldfd->inode->table->xl == old_subvol) {
-        if (IA_ISDIR(oldfd->inode->ia_type))
+        if (IA_ISDIR(oldfd->inode->ia_type)) {
             ret = syncop_fsyncdir(old_subvol, oldfd, 0, NULL, NULL);
-        else
-            ret = syncop_fsync(old_subvol, oldfd, 0, NULL, NULL, NULL, NULL);
+        } else {
+            xdata = dict_new();
+            if (!xdata || dict_set_int8(xdata, "last-fsync", 1)) {
+                gf_log("glusterfs-fuse", GF_LOG_WARNING,
+                       "last-fsync set failed (%s) on fd (%p)"
+                       "(basefd:%p basefd-inode.gfid:%s) "
+                       "(old-subvolume:%s-%d new-subvolume:%s-%d)",
+                       strerror(ENOMEM), oldfd, basefd,
+                       uuid_utoa(basefd->inode->gfid), old_subvol->name,
+                       old_subvol->graph->id, new_subvol->name,
+                       new_subvol->graph->id);
+            }
+
+            ret = syncop_fsync(old_subvol, oldfd, 0, NULL, NULL, xdata, NULL);
+        }
 
         if (ret < 0) {
             gf_log("glusterfs-fuse", GF_LOG_WARNING,
@@ -5597,6 +5720,9 @@ out:
     }
 
     fd_unref(oldfd);
+
+    if (xdata)
+        dict_unref(xdata);
 
     return ret;
 }
@@ -5773,7 +5899,9 @@ fuse_graph_sync(xlator_t *this)
         new_graph_id = priv->next_graph->id;
         priv->next_graph = NULL;
         need_first_lookup = 1;
-        priv->handle_graph_switch = _gf_true;
+        if (old_subvol) {
+            priv->handle_graph_switch = _gf_true;
+        }
 
         while (!priv->event_recvd) {
             ret = pthread_cond_wait(&priv->sync_cond, &priv->sync_mutex);
@@ -5809,13 +5937,6 @@ unlock:
         if (winds_on_old_subvol == 0) {
             xlator_notify(old_subvol, GF_EVENT_PARENT_DOWN, old_subvol, NULL);
         }
-    } else {
-        pthread_mutex_lock(&priv->sync_mutex);
-        {
-            priv->handle_graph_switch = _gf_false;
-            pthread_cond_broadcast(&priv->migrate_cond);
-        }
-        pthread_mutex_unlock(&priv->sync_mutex);
     }
 
     return 0;
@@ -6202,14 +6323,12 @@ out:
 int
 dump_history_fuse(circular_buffer_t *cb, void *data)
 {
-    char timestr[256] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
 
-    gf_time_fmt(timestr, sizeof timestr, cb->tv.tv_sec, gf_timefmt_F_HMS);
+    gf_time_fmt_tv(timestr, sizeof timestr, &cb->tv, gf_timefmt_F_HMS);
 
-    snprintf(timestr + strlen(timestr), 256 - strlen(timestr),
-             ".%" GF_PRI_SUSECONDS, cb->tv.tv_usec);
     gf_proc_dump_write("TIME", "%s", timestr);
 
     gf_proc_dump_write("message", "%s\n", (char *)cb->data);
@@ -6292,6 +6411,7 @@ notify(xlator_t *this, int32_t event, void *data, ...)
     fuse_private_t *private = NULL;
     gf_boolean_t start_thread = _gf_false;
     glusterfs_graph_t *graph = NULL;
+    struct pollfd pfd = {0};
 
    private
     = this->private;
@@ -6359,6 +6479,32 @@ notify(xlator_t *this, int32_t event, void *data, ...)
             /* Authentication failure is an error and glusterfs should stop */
             gf_log(this->name, GF_LOG_ERROR,
                    "Server authenication failed. Shutting down.");
+            pthread_mutex_lock(&private->sync_mutex);
+            {
+                /*Wait for mount to finish*/
+                if (!private->mount_finished) {
+                    pfd.fd = private->status_pipe[0];
+                    pfd.events = POLLIN | POLLHUP | POLLERR;
+                    if (poll(&pfd, 1, -1) < 0) {
+                        gf_log(this->name, GF_LOG_ERROR, "poll error %s",
+                               strerror(errno));
+                        goto auth_fail_unlock;
+                    }
+                    if (pfd.revents & POLLIN) {
+                        if (fuse_get_mount_status(this) != 0) {
+                            goto auth_fail_unlock;
+                        }
+                       private
+                        ->mount_finished = _gf_true;
+                    } else if (pfd.revents) {
+                        gf_log(this->name, GF_LOG_ERROR,
+                               "mount pipe closed without status");
+                        goto auth_fail_unlock;
+                    }
+                }
+            }
+        auth_fail_unlock:
+            pthread_mutex_unlock(&private->sync_mutex);
             fini(this);
             break;
         }
@@ -6561,6 +6707,8 @@ init(xlator_t *this_xl)
 
     INIT_LIST_HEAD(&priv->interrupt_list);
     pthread_mutex_init(&priv->interrupt_mutex, NULL);
+
+    pthread_mutex_init(&priv->fusedev_errno_cnt_mutex, NULL);
 
     /* get options from option dictionary */
     ret = dict_get_str(options, ZR_MOUNTPOINT_OPT, &value_string);

@@ -185,8 +185,7 @@ struct gf_sock_incoming {
     uint32_t fraghdr;
     msg_type_t msg_type;
     sp_rpcrecord_state_t record_state;
-    char complete_record;
-    char _pad[3];
+    char _pad[4];
 };
 
 typedef struct {
@@ -200,7 +199,6 @@ typedef struct {
     pthread_mutex_t out_lock;
     pthread_mutex_t cond_lock;
     pthread_cond_t cond;
-    pthread_t thread;
     int windowsize;
     int keepalive;
     int keepaliveidle;
@@ -236,7 +234,6 @@ typedef struct {
     char *ssl_private_key;
     char *ssl_ca_list;
     char *crl_path;
-    int pipe[2];
     struct gf_sock_incoming incoming;
     mgmt_ssl_t srvr_ssl;
     /* -1 = not connected. 0 = in progress. 1 = connected */
@@ -247,7 +244,6 @@ typedef struct {
     char bio;
     char connect_finish_log;
     char submit_log;
-    char lowlat;
     char nodelay;
     gf_boolean_t read_fail_log;
     gf_boolean_t ssl_enabled; /* outbound I/O */

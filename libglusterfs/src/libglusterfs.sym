@@ -451,6 +451,7 @@ gf_event_unregister_close
 fd_anonymous
 fd_anonymous_with_flags
 fd_bind
+fd_close
 fd_create
 fd_create_uint64
 __fd_ctx_del
@@ -584,6 +585,7 @@ gf_dirent_free
 gf_dirent_orig_offset
 gf_dm_hashfn
 gf_dnscache_init
+gf_dnscache_deinit
 gf_errno_to_error
 gf_error_to_errno
 _gf_event
@@ -937,6 +939,12 @@ syncbarrier_destroy
 syncbarrier_init
 syncbarrier_wait
 syncbarrier_wake
+synccond_init
+synccond_destroy
+synccond_wait
+synccond_timedwait
+synccond_signal
+synccond_broadcast
 syncenv_destroy
 syncenv_new
 synclock_destroy
@@ -1014,6 +1022,7 @@ synctask_new
 synctask_new1
 synctask_set
 synctask_setid
+synctask_sleep
 synctask_wake
 synctask_yield
 sys_access
@@ -1039,6 +1048,7 @@ sys_futimes
 sys_lchown
 sys_lgetxattr
 sys_link
+sys_linkat
 sys_llistxattr
 sys_lremovexattr
 sys_lseek
@@ -1062,13 +1072,17 @@ sys_rmdir
 sys_stat
 sys_statvfs
 sys_symlink
+sys_symlinkat
 sys_truncate
 sys_unlink
+sys_unlinkat
 sys_utimensat
 sys_write
 sys_writev
 sys_socket
 sys_accept
+sys_kill
+sys_sysctl
 tbf_init
 tbf_throttle
 timespec_now
@@ -1169,4 +1183,11 @@ glusterfs_process_svc_detach
 mgmt_is_multiplexed_daemon
 xlator_is_cleanup_starting
 gf_nanosleep
+gf_syncfs
 graph_total_client_xlator
+get_xattrs_to_heal
+gf_latency_statedump_and_reset
+gf_latency_new
+gf_latency_reset
+gf_latency_update
+gf_frame_latency_update

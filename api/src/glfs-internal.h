@@ -16,6 +16,7 @@
 #include <glusterfs/upcall-utils.h>
 #include "glfs-handles.h"
 #include <glusterfs/refcount.h>
+#include <glusterfs/syncop.h>
 
 #define GLFS_SYMLINK_MAX_FOLLOW 2048
 
@@ -80,25 +81,40 @@
 #ifndef GFAPI_PRIVATE
 #define GFAPI_PRIVATE(sym, ver) /**/
 #endif
+#if __GNUC__ >= 10
 #define GFAPI_SYMVER_PUBLIC_DEFAULT(fn, ver)                                   \
-    asm(".symver pub_" STR(fn) ", " STR(fn) "@@GFAPI_" STR(ver))
+    __attribute__((__symver__(STR(fn) "@@GFAPI_" STR(ver))))
 
 #define GFAPI_SYMVER_PRIVATE_DEFAULT(fn, ver)                                  \
-    asm(".symver priv_" STR(fn) ", " STR(fn) "@@GFAPI_PRIVATE_" STR(ver))
+    __attribute__((__symver__(STR(fn) "@@GFAPI_PRIVATE_" STR(ver))))
 
 #define GFAPI_SYMVER_PUBLIC(fn1, fn2, ver)                                     \
-    asm(".symver pub_" STR(fn1) ", " STR(fn2) "@GFAPI_" STR(ver))
+    __attribute__((__symver__(STR(fn2) "@GFAPI_" STR(ver))))
 
 #define GFAPI_SYMVER_PRIVATE(fn1, fn2, ver)                                    \
-    asm(".symver priv_" STR(fn1) ", " STR(fn2) "@GFAPI_PRIVATE_" STR(ver))
+    __attribute__((__symver__(STR(fn2) "@GFAPI_PRIVATE_" STR(ver))))
+
+#else
+#define GFAPI_SYMVER_PUBLIC_DEFAULT(fn, ver)                                   \
+    asm(".symver pub_" STR(fn) ", " STR(fn) "@@GFAPI_" STR(ver));
+
+#define GFAPI_SYMVER_PRIVATE_DEFAULT(fn, ver)                                  \
+    asm(".symver priv_" STR(fn) ", " STR(fn) "@@GFAPI_PRIVATE_" STR(ver));
+
+#define GFAPI_SYMVER_PUBLIC(fn1, fn2, ver)                                     \
+    asm(".symver pub_" STR(fn1) ", " STR(fn2) "@GFAPI_" STR(ver));
+
+#define GFAPI_SYMVER_PRIVATE(fn1, fn2, ver)                                    \
+    asm(".symver priv_" STR(fn1) ", " STR(fn2) "@GFAPI_PRIVATE_" STR(ver));
+#endif
 #define STR(str) #str
 #else
 #ifndef GFAPI_PUBLIC
-#define GFAPI_PUBLIC(sym, ver) __asm("_" __STRING(sym) "$GFAPI_" __STRING(ver))
+#define GFAPI_PUBLIC(sym, ver) __asm("_" __STRING(sym) "$GFAPI_" __STRING(ver));
 #endif
 #ifndef GFAPI_PRIVATE
 #define GFAPI_PRIVATE(sym, ver)                                                \
-    __asm("_" __STRING(sym) "$GFAPI_PRIVATE_" __STRING(ver))
+    __asm("_" __STRING(sym) "$GFAPI_PRIVATE_" __STRING(ver));
 #endif
 #define GFAPI_SYMVER_PUBLIC_DEFAULT(fn, dotver)  /**/
 #define GFAPI_SYMVER_PRIVATE_DEFAULT(fn, dotver) /**/
@@ -207,6 +223,7 @@ struct glfs {
     glfs_upcall_cbk up_cbk; /* upcall cbk function to be registered */
     void *up_data;          /* Opaque data provided by application
                              * during upcall registration */
+    struct list_head waitq; /* waiting synctasks */
 };
 
 /* This enum is used to maintain the state of glfd. In case of async fops
@@ -442,6 +459,34 @@ glfs_process_upcall_event(struct glfs *fs, void *data)
         THIS = glfd->fd->inode->table->xl->ctx->master;                        \
     } while (0)
 
+#define __GLFS_LOCK_WAIT(fs)                                                   \
+    do {                                                                       \
+        struct synctask *task = NULL;                                          \
+                                                                               \
+        task = synctask_get();                                                 \
+                                                                               \
+        if (task) {                                                            \
+            list_add_tail(&task->waitq, &fs->waitq);                           \
+            pthread_mutex_unlock(&fs->mutex);                                  \
+            synctask_yield(task, NULL);                                        \
+            pthread_mutex_lock(&fs->mutex);                                    \
+        } else {                                                               \
+            /* non-synctask */                                                 \
+            pthread_cond_wait(&fs->cond, &fs->mutex);                          \
+        }                                                                      \
+    } while (0)
+
+#define __GLFS_SYNCTASK_WAKE(fs)                                               \
+    do {                                                                       \
+        struct synctask *waittask = NULL;                                      \
+                                                                               \
+        while (!list_empty(&fs->waitq)) {                                      \
+            waittask = list_entry(fs->waitq.next, struct synctask, waitq);     \
+            list_del_init(&waittask->waitq);                                   \
+            synctask_wake(waittask);                                           \
+        }                                                                      \
+    } while (0)
+
 /*
   By default all lock attempts from user context must
   use glfs_lock() and glfs_unlock(). This allows
@@ -466,10 +511,10 @@ glfs_lock(struct glfs *fs, gf_boolean_t wait_for_migration)
     pthread_mutex_lock(&fs->mutex);
 
     while (!fs->init)
-        pthread_cond_wait(&fs->cond, &fs->mutex);
+        __GLFS_LOCK_WAIT(fs);
 
     while (wait_for_migration && fs->migration_in_progress)
-        pthread_cond_wait(&fs->cond, &fs->mutex);
+        __GLFS_LOCK_WAIT(fs);
 
     return 0;
 }

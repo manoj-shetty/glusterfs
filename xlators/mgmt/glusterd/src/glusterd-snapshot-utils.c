@@ -200,7 +200,7 @@ glusterd_snap_volinfo_restore(dict_t *dict, dict_t *rsp_dict,
                               int32_t volcount)
 {
     char *value = NULL;
-    char key[PATH_MAX] = "";
+    char key[64] = "";
     int32_t brick_count = -1;
     int32_t ret = -1;
     xlator_t *this = NULL;
@@ -282,12 +282,10 @@ glusterd_snap_volinfo_restore(dict_t *dict, dict_t *rsp_dict,
                                 new_volinfo->volume_id,
                                 sizeof(new_volinfo->volume_id), XATTR_REPLACE);
             if (ret == -1) {
-                gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_SETXATTR_FAIL,
-                       "Failed to "
-                       "set extended attribute %s on %s. "
-                       "Reason: %s, snap: %s",
-                       GF_XATTR_VOL_ID_KEY, new_brickinfo->path,
-                       strerror(errno), new_volinfo->volname);
+                gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_SET_XATTR_FAIL,
+                        "Attribute=%s, Path=%s, Reason=%s, Snap=%s",
+                        GF_XATTR_VOL_ID_KEY, new_brickinfo->path,
+                        strerror(errno), new_volinfo->volname, NULL);
                 goto out;
             }
         }
@@ -1961,9 +1959,7 @@ glusterd_update_snaps_synctask(void *opaque)
     synclock_lock(&conf->big_lock);
 
     while (conf->restart_bricks) {
-        synclock_unlock(&conf->big_lock);
-        sleep(2);
-        synclock_lock(&conf->big_lock);
+        synccond_wait(&conf->cond_restart_bricks, &conf->big_lock);
     }
     conf->restart_bricks = _gf_true;
 
@@ -2041,8 +2037,9 @@ glusterd_update_snaps_synctask(void *opaque)
                        "Failed to remove snap %s", snap->snapname);
                 goto out;
             }
-            if (dict)
-                dict_unref(dict);
+
+            dict_unref(dict);
+            dict = NULL;
         }
         snprintf(buf, sizeof(buf), "%s.accept_peer_data", prefix);
         ret = dict_get_int32(peer_data, buf, &val);
@@ -2070,6 +2067,7 @@ out:
     if (dict)
         dict_unref(dict);
     conf->restart_bricks = _gf_false;
+    synccond_broadcast(&conf->cond_restart_bricks);
 
     return ret;
 }
@@ -2149,18 +2147,27 @@ glusterd_add_snapd_to_dict(glusterd_volinfo_t *volinfo, dict_t *dict,
     snprintf(base_key, sizeof(base_key), "brick%d", count);
     snprintf(key, sizeof(key), "%s.hostname", base_key);
     ret = dict_set_str(dict, key, "Snapshot Daemon");
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_SET_FAILED, "Key=%s",
+                key, NULL);
         goto out;
+    }
 
     snprintf(key, sizeof(key), "%s.path", base_key);
     ret = dict_set_dynstr(dict, key, gf_strdup(uuid_utoa(MY_UUID)));
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_SET_FAILED, "Key=%s",
+                key, NULL);
         goto out;
+    }
 
     snprintf(key, sizeof(key), "%s.port", base_key);
     ret = dict_set_int32(dict, key, volinfo->snapd.port);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_SET_FAILED, "Key=%s",
+                key, NULL);
         goto out;
+    }
 
     glusterd_svc_build_snapd_pidfile(volinfo, pidfile, sizeof(pidfile));
 
@@ -2170,8 +2177,11 @@ glusterd_add_snapd_to_dict(glusterd_volinfo_t *volinfo, dict_t *dict,
 
     snprintf(key, sizeof(key), "%s.pid", base_key);
     ret = dict_set_int32(dict, key, pid);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_SET_FAILED, "Key=%s",
+                key, NULL);
         goto out;
+    }
 
     snprintf(key, sizeof(key), "%s.status", base_key);
     ret = dict_set_int32(dict, key, brick_online);
@@ -2672,8 +2682,10 @@ glusterd_missed_snapinfo_new(glusterd_missed_snap_info **missed_snapinfo)
     new_missed_snapinfo = GF_CALLOC(1, sizeof(*new_missed_snapinfo),
                                     gf_gld_mt_missed_snapinfo_t);
 
-    if (!new_missed_snapinfo)
+    if (!new_missed_snapinfo) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     CDS_INIT_LIST_HEAD(&new_missed_snapinfo->missed_snaps);
     CDS_INIT_LIST_HEAD(&new_missed_snapinfo->snap_ops);
@@ -2701,8 +2713,10 @@ glusterd_missed_snap_op_new(glusterd_snap_op_t **snap_op)
     new_snap_op = GF_CALLOC(1, sizeof(*new_snap_op),
                             gf_gld_mt_missed_snapinfo_t);
 
-    if (!new_snap_op)
+    if (!new_snap_op) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     new_snap_op->brick_num = -1;
     new_snap_op->op = -1;
@@ -2854,19 +2868,21 @@ out:
     return quorum_met;
 }
 
-int32_t
+static int32_t
 glusterd_volume_quorum_check(glusterd_volinfo_t *volinfo, int64_t index,
-                             dict_t *dict, char *key_prefix, int8_t snap_force,
-                             int quorum_count, char *quorum_type,
-                             char **op_errstr, uint32_t *op_errno)
+                             dict_t *dict, const char *key_prefix,
+                             int8_t snap_force, int quorum_count,
+                             char *quorum_type, char **op_errstr,
+                             uint32_t *op_errno)
 {
     int ret = 0;
     xlator_t *this = NULL;
     int64_t i = 0;
     int64_t j = 0;
-    char key[1024] = {
+    char key[128] = {
         0,
-    };
+    }; /* key_prefix is passed from above, but is really quite small */
+    int keylen;
     int down_count = 0;
     gf_boolean_t first_brick_on = _gf_true;
     glusterd_conf_t *priv = NULL;
@@ -2895,9 +2911,10 @@ glusterd_volume_quorum_check(glusterd_volinfo_t *volinfo, int64_t index,
                with replica count 2, quorum is not met if even
                one of its subvolumes is down
             */
-            snprintf(key, sizeof(key), "%s%" PRId64 ".brick%" PRId64 ".status",
-                     key_prefix, index, i);
-            ret = dict_get_int32(dict, key, &brick_online);
+            keylen = snprintf(key, sizeof(key),
+                              "%s%" PRId64 ".brick%" PRId64 ".status",
+                              key_prefix, index, i);
+            ret = dict_get_int32n(dict, key, keylen, &brick_online);
             if (ret || !brick_online) {
                 ret = 1;
                 gf_msg(this->name, GF_LOG_ERROR, 0,
@@ -2920,10 +2937,10 @@ glusterd_volume_quorum_check(glusterd_volinfo_t *volinfo, int64_t index,
             ret = 1;
             quorum_met = _gf_false;
             for (i = 0; i < volinfo->dist_leaf_count; i++) {
-                snprintf(key, sizeof(key),
-                         "%s%" PRId64 ".brick%" PRId64 ".status", key_prefix,
-                         index, (j * volinfo->dist_leaf_count) + i);
-                ret = dict_get_int32(dict, key, &brick_online);
+                keylen = snprintf(
+                    key, sizeof(key), "%s%" PRId64 ".brick%" PRId64 ".status",
+                    key_prefix, index, (j * volinfo->dist_leaf_count) + i);
+                ret = dict_get_int32n(dict, key, keylen, &brick_online);
                 if (ret || !brick_online) {
                     if (i == 0)
                         first_brick_on = _gf_false;
@@ -2954,9 +2971,9 @@ out:
     return ret;
 }
 
-int32_t
+static int32_t
 glusterd_snap_common_quorum_calculate(glusterd_volinfo_t *volinfo, dict_t *dict,
-                                      int64_t index, char *key_prefix,
+                                      int64_t index, const char *key_prefix,
                                       int8_t snap_force,
                                       gf_boolean_t snap_volume,
                                       char **op_errstr, uint32_t *op_errno)
@@ -3005,9 +3022,10 @@ glusterd_snap_common_quorum_calculate(glusterd_volinfo_t *volinfo, dict_t *dict,
         quorum_count = volinfo->brick_count;
     }
 
-    ret = dict_get_str(volinfo->dict, "cluster.quorum-type", &quorum_type);
+    ret = dict_get_str_sizen(volinfo->dict, "cluster.quorum-type",
+                             &quorum_type);
     if (!ret && !strcmp(quorum_type, "fixed")) {
-        ret = dict_get_int32(volinfo->dict, "cluster.quorum-count", &tmp);
+        ret = dict_get_int32_sizen(volinfo->dict, "cluster.quorum-count", &tmp);
         /* if quorum-type option is not found in the
            dict assume auto quorum type. i.e n/2 + 1.
            The same assumption is made when quorum-count
@@ -3049,12 +3067,12 @@ out:
     return ret;
 }
 
-int32_t
+static int32_t
 glusterd_snap_quorum_check_for_clone(dict_t *dict, gf_boolean_t snap_volume,
                                      char **op_errstr, uint32_t *op_errno)
 {
     const char err_str[] = "glusterds are not in quorum";
-    char key_prefix[PATH_MAX] = {
+    char key_prefix[16] = {
         0,
     };
     char *snapname = NULL;
@@ -3063,9 +3081,6 @@ glusterd_snap_quorum_check_for_clone(dict_t *dict, gf_boolean_t snap_volume,
     glusterd_volinfo_t *tmp_volinfo = NULL;
     char *volname = NULL;
     int64_t volcount = 0;
-    char key[PATH_MAX] = {
-        0,
-    };
     int64_t i = 0;
     int32_t ret = -1;
     xlator_t *this = NULL;
@@ -3080,7 +3095,7 @@ glusterd_snap_quorum_check_for_clone(dict_t *dict, gf_boolean_t snap_volume,
     }
 
     if (snap_volume) {
-        ret = dict_get_str(dict, "snapname", &snapname);
+        ret = dict_get_str_sizen(dict, "snapname", &snapname);
         if (ret) {
             gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_GET_FAILED,
                    "failed to "
@@ -3122,9 +3137,7 @@ glusterd_snap_quorum_check_for_clone(dict_t *dict, gf_boolean_t snap_volume,
     }
 
     for (i = 1; i <= volcount; i++) {
-        snprintf(key, sizeof(key), "%s%" PRId64,
-                 snap_volume ? "snap-volname" : "volname", i);
-        ret = dict_get_str(dict, "clonename", &volname);
+        ret = dict_get_str_sizen(dict, "clonename", &volname);
         if (ret) {
             gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_GET_FAILED,
                    "failed to "
@@ -3171,14 +3184,14 @@ out:
     return ret;
 }
 
-int32_t
+static int32_t
 glusterd_snap_quorum_check_for_create(dict_t *dict, gf_boolean_t snap_volume,
                                       char **op_errstr, uint32_t *op_errno)
 {
     int8_t snap_force = 0;
     int32_t force = 0;
     const char err_str[] = "glusterds are not in quorum";
-    char key_prefix[PATH_MAX] = {
+    char key_prefix[16] = {
         0,
     };
     char *snapname = NULL;
@@ -3186,7 +3199,7 @@ glusterd_snap_quorum_check_for_create(dict_t *dict, gf_boolean_t snap_volume,
     glusterd_volinfo_t *volinfo = NULL;
     char *volname = NULL;
     int64_t volcount = 0;
-    char key[PATH_MAX] = {
+    char key[32] = {
         0,
     };
     int64_t i = 0;
@@ -3313,7 +3326,7 @@ glusterd_snap_quorum_check(dict_t *dict, gf_boolean_t snap_volume,
         goto out;
     }
 
-    ret = dict_get_int32(dict, "type", &snap_command);
+    ret = dict_get_int32_sizen(dict, "type", &snap_command);
     if (ret) {
         gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_DICT_GET_FAILED,
                "unable to get the type of "
@@ -3595,13 +3608,17 @@ glusterd_copy_folder(const char *source, const char *destination)
             continue;
         ret = snprintf(src_path, sizeof(src_path), "%s/%s", source,
                        entry->d_name);
-        if (ret < 0)
+        if (ret < 0) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
             goto out;
+        }
 
         ret = snprintf(dest_path, sizeof(dest_path), "%s/%s", destination,
                        entry->d_name);
-        if (ret < 0)
+        if (ret < 0) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
             goto out;
+        }
 
         ret = glusterd_copy_file(src_path, dest_path);
         if (ret) {
@@ -3757,8 +3774,10 @@ glusterd_copy_quota_files(glusterd_volinfo_t *src_vol,
     GLUSTERD_GET_VOLUME_DIR(dest_dir, dest_vol, priv);
 
     ret = snprintf(src_path, sizeof(src_path), "%s/quota.conf", src_dir);
-    if (ret < 0)
+    if (ret < 0) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         goto out;
+    }
 
     /* quota.conf is not present if quota is not enabled, Hence ignoring
      * the absence of this file
@@ -3771,8 +3790,10 @@ glusterd_copy_quota_files(glusterd_volinfo_t *src_vol,
     }
 
     ret = snprintf(dest_path, sizeof(dest_path), "%s/quota.conf", dest_dir);
-    if (ret < 0)
+    if (ret < 0) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         goto out;
+    }
 
     ret = glusterd_copy_file(src_path, dest_path);
     if (ret) {
@@ -3796,8 +3817,10 @@ glusterd_copy_quota_files(glusterd_volinfo_t *src_vol,
     }
 
     ret = snprintf(dest_path, sizeof(dest_path), "%s/quota.cksum", dest_dir);
-    if (ret < 0)
+    if (ret < 0) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         goto out;
+    }
 
     ret = glusterd_copy_file(src_path, dest_path);
     if (ret) {
@@ -3963,7 +3986,7 @@ glusterd_restore_geo_rep_files(glusterd_volinfo_t *snap_vol)
     char *origin_volname = NULL;
     glusterd_volinfo_t *origin_vol = NULL;
     int i = 0;
-    char key[PATH_MAX] = "";
+    char key[32] = "";
     char session[PATH_MAX] = "";
     char slave[PATH_MAX] = "";
     char snapgeo_dir[PATH_MAX] = "";
@@ -4067,8 +4090,10 @@ glusterd_restore_nfs_ganesha_file(glusterd_volinfo_t *src_vol,
 
     ret = snprintf(src_path, sizeof(src_path), "%s/export.%s.conf", snap_dir,
                    snap->snapname);
-    if (ret < 0)
+    if (ret < 0) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         goto out;
+    }
 
     ret = sys_lstat(src_path, &stbuf);
     if (ret) {
@@ -4083,8 +4108,10 @@ glusterd_restore_nfs_ganesha_file(glusterd_volinfo_t *src_vol,
 
     ret = snprintf(dest_path, sizeof(dest_path), "%s/export.%s.conf",
                    GANESHA_EXPORT_DIRECTORY, src_vol->volname);
-    if (ret < 0)
+    if (ret < 0) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         goto out;
+    }
 
     ret = glusterd_copy_file(src_path, dest_path);
     if (ret)

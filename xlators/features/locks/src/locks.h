@@ -43,9 +43,8 @@ struct __posix_lock {
     fd_t *fd;
     call_frame_t *frame;
 
-    struct timeval blkd_time; /*time at which lock was queued into blkd list*/
-    struct timeval
-        granted_time; /*time at which lock was queued into active list*/
+    time_t blkd_time;    /* time at which lock was queued into blkd list */
+    time_t granted_time; /* time at which lock was queued into active list */
 
     /* These two together serve to uniquely identify each process
        across nodes */
@@ -85,9 +84,9 @@ struct __pl_inode_lock {
 
     call_frame_t *frame;
 
-    struct timeval blkd_time; /*time at which lock was queued into blkd list*/
-    struct timeval
-        granted_time; /*time at which lock was queued into active list*/
+    time_t blkd_time;    /* time at which lock was queued into blkd list */
+    time_t granted_time; /* time at which lock was queued into active list */
+
     /*last time at which lock contention was detected and notified*/
     struct timespec contention_time;
 
@@ -102,6 +101,9 @@ struct __pl_inode_lock {
 
     struct list_head client_list; /* list of all locks from a client */
     short fl_type;
+
+    int32_t status; /* Error code when we try to grant a lock in blocked
+                       state */
 };
 typedef struct __pl_inode_lock pl_inode_lock_t;
 
@@ -136,9 +138,9 @@ struct __entry_lock {
 
     const char *basename;
 
-    struct timeval blkd_time; /*time at which lock was queued into blkd list*/
-    struct timeval
-        granted_time; /*time at which lock was queued into active list*/
+    time_t blkd_time;    /* time at which lock was queued into blkd list */
+    time_t granted_time; /* time at which lock was queued into active list */
+
     /*last time at which lock contention was detected and notified*/
     struct timespec contention_time;
 
@@ -164,13 +166,14 @@ struct __pl_inode {
     struct list_head rw_list;            /* list of waiting r/w requests */
     struct list_head reservelk_list;     /* list of reservelks */
     struct list_head blocked_reservelks; /* list of blocked reservelks */
-    struct list_head
-        blocked_calls; /* List of blocked lock calls while a reserve is held*/
-    struct list_head metalk_list; /* Meta lock list */
-                                  /* This is to store the incoming lock
-                                     requests while meta lock is enabled */
-    struct list_head queued_locks;
-    int mandatory; /* if mandatory locking is enabled */
+    struct list_head blocked_calls;      /* List of blocked lock calls while a
+                                            reserve is held*/
+    struct list_head metalk_list;        /* Meta lock list */
+    struct list_head queued_locks;       /* This is to store the incoming lock
+                                            requests while meta lock is enabled */
+    struct list_head waiting; /* List of pending fops waiting to unlink/rmdir
+                                 the inode. */
+    int mandatory;            /* if mandatory locking is enabled */
 
     inode_t *refkeeper; /* hold refs on an inode while locks are
                            held to prevent pruning */
@@ -197,7 +200,13 @@ struct __pl_inode {
     */
     int fop_wind_count;
     pthread_cond_t check_fop_wind_count;
+
     gf_boolean_t track_fop_wind_count;
+
+    int32_t links;           /* Number of hard links the inode has. */
+    uint32_t remove_running; /* Number of remove operations running. */
+    gf_boolean_t is_locked;  /* Regular locks will be blocked. */
+    gf_boolean_t removed;    /* The inode has been deleted. */
 };
 typedef struct __pl_inode pl_inode_t;
 
@@ -240,6 +249,7 @@ typedef struct {
     gf_boolean_t inodelk_count_req;
     gf_boolean_t posixlk_count_req;
     gf_boolean_t parent_entrylk_req;
+    gf_boolean_t multiple_dom_lk_requests;
     int update_mlock_enforced_flag;
 } pl_local_t;
 
@@ -260,6 +270,13 @@ typedef struct _locks_ctx {
     struct list_head entrylk_lockers;
     struct list_head metalk_list;
 } pl_ctx_t;
+
+typedef struct _multi_dom_lk_data {
+    xlator_t *this;
+    inode_t *inode;
+    dict_t *xdata_rsp;
+    gf_boolean_t keep_max;
+} multi_dom_lk_data;
 
 typedef enum { DECREMENT, INCREMENT } pl_count_op_t;
 

@@ -11,8 +11,6 @@
 #ifndef _AFR_SELFHEAL_H
 #define _AFR_SELFHEAL_H
 
-#define AFR_SH_MIN_PARTICIPANTS 2
-
 /* Perform fop on all UP subvolumes and wait for all callbacks to return */
 
 #define AFR_ONALL(frame, rfn, fop, args...)                                    \
@@ -47,13 +45,16 @@
         afr_local_t *__local = frame->local;                                   \
         afr_private_t *__priv = frame->this->private;                          \
         int __i = 0;                                                           \
-        int __count = AFR_COUNT(list, __priv->child_count);                    \
+        int __count = 0;                                                       \
+        unsigned char *__list = alloca(__priv->child_count);                   \
                                                                                \
+        memcpy(__list, list, sizeof(*__list) * __priv->child_count);           \
+        __count = AFR_COUNT(__list, __priv->child_count);                      \
         __local->barrier.waitfor = __count;                                    \
         afr_local_replies_wipe(__local, __priv);                               \
                                                                                \
         for (__i = 0; __i < __priv->child_count; __i++) {                      \
-            if (!list[__i])                                                    \
+            if (!__list[__i])                                                  \
                 continue;                                                      \
             STACK_WIND_COOKIE(frame, rfn, (void *)(long)__i,                   \
                               __priv->children[__i],                           \
@@ -325,7 +326,8 @@ int
 afr_selfheal_unlocked_inspect(call_frame_t *frame, xlator_t *this, uuid_t gfid,
                               inode_t **link_inode, gf_boolean_t *data_selfheal,
                               gf_boolean_t *metadata_selfheal,
-                              gf_boolean_t *entry_selfheal);
+                              gf_boolean_t *entry_selfheal,
+                              struct afr_reply *replies);
 
 int
 afr_selfheal_do(call_frame_t *frame, xlator_t *this, uuid_t gfid);
@@ -367,4 +369,9 @@ gf_boolean_t
 afr_is_file_empty_on_all_children(afr_private_t *priv,
                                   struct afr_reply *replies);
 
+int
+afr_selfheal_entry_delete(xlator_t *this, inode_t *dir, const char *name,
+                          inode_t *inode, int child, struct afr_reply *replies);
+int
+afr_anon_inode_create(xlator_t *this, int child, inode_t **linked_inode);
 #endif /* !_AFR_SELFHEAL_H */

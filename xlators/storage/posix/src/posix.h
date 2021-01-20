@@ -16,12 +16,8 @@
 #include <dirent.h>
 #include <time.h>
 
-#ifdef linux
-#ifdef __GLIBC__
+#ifdef HAVE_SET_FSID
 #include <sys/fsuid.h>
-#else
-#include <unistd.h>
-#endif
 #endif
 
 #ifdef HAVE_SYS_XATTR_H
@@ -51,10 +47,6 @@
 #define ACL_BUFFER_MAX 4096 /* size of character buffer */
 
 #define DHT_LINKTO "trusted.glusterfs.dht.linkto"
-/*
- * TIER_MODE need to be changed when we stack tiers
- */
-#define TIER_LINKTO "trusted.tier.tier-dht.linkto"
 
 #define POSIX_GFID_HANDLE_SIZE(base_path_len)                                  \
     (base_path_len + SLEN("/") + SLEN(GF_HIDDEN_PATH) + SLEN("/") +            \
@@ -69,7 +61,7 @@
 #define DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out)   \
     do {                                                                       \
         if (frame->root->pid >= 0 && priv->disk_space_full &&                  \
-            !dict_get(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {                    \
+            !dict_get_sizen(xdata, GLUSTERFS_INTERNAL_FOP_KEY)) {              \
             op_ret = -1;                                                       \
             op_errno = ENOSPC;                                                 \
             gf_msg_debug("posix", ENOSPC,                                      \
@@ -97,9 +89,8 @@
 #endif
 
 #define GFID_NULL_CHECK_AND_GOTO(frame, this, loc, xattr_req, op_ret,          \
-                                 op_errno, out)                                \
+                                 op_errno, _uuid_req, out)                     \
     do {                                                                       \
-        uuid_t _uuid_req;                                                      \
         int _ret = 0;                                                          \
         /* TODO: Remove pid check once trash implements client side            \
          * logic to assign gfid for entry creations inside .trashcan           \
@@ -109,9 +100,7 @@
         _ret = dict_get_gfuuid(xattr_req, "gfid-req", &_uuid_req);             \
         if (_ret) {                                                            \
             gf_msg(this->name, GF_LOG_ERROR, EINVAL, P_MSG_NULL_GFID,          \
-                   "failed to get the gfid from"                               \
-                   " dict for %s",                                             \
-                   loc->path);                                                 \
+                   "failed to get the gfid from dict for %s", loc->path);      \
             op_ret = -1;                                                       \
             op_errno = EINVAL;                                                 \
             goto out;                                                          \
@@ -130,12 +119,14 @@
  */
 
 struct posix_fd {
-    int fd;        /* fd returned by the kernel */
-    int32_t flags; /* flags for open/creat      */
-    DIR *dir;      /* handle returned by the kernel */
-    off_t dir_eof; /* offset at dir EOF */
-    int odirect;
+    int fd;                /* fd returned by the kernel */
+    int32_t flags;         /* flags for open/creat      */
+    DIR *dir;              /* handle returned by the kernel */
+    off_t dir_eof;         /* offset at dir EOF */
     struct list_head list; /* to add to the janitor list */
+    int odirect;
+    xlator_t *xl;
+    char _pad[4]; /* manual padding */
 };
 
 struct posix_private {
@@ -146,16 +137,97 @@ struct posix_private {
     gf_lock_t lock;
 
     char *hostname;
-    /* Statistics, provides activity of the server */
-
-    struct timeval prev_fetch_time;
-    struct timeval init_time;
 
     time_t last_landfill_check;
-    int32_t janitor_sleep_duration;
 
     gf_atomic_t read_value;  /* Total read, from init */
     gf_atomic_t write_value; /* Total write, from init */
+
+    /* janitor task which cleans up /.trash (created by replicate) */
+    struct gf_tw_timer_list *janitor;
+
+    char *trash_path;
+    /* lock for brick dir */
+    int mount_lock;
+
+    struct stat handledir;
+
+    /* uuid of glusterd that swapned the brick process */
+    uuid_t glusterd_uuid;
+
+#ifdef HAVE_LIBAIO
+    io_context_t ctxp;
+    pthread_t aiothread;
+#endif
+
+    pthread_t fsyncer;
+    struct list_head fsyncs;
+    pthread_mutex_t fsync_mutex;
+    pthread_cond_t fsync_cond;
+    pthread_mutex_t janitor_mutex;
+    pthread_cond_t janitor_cond;
+    pthread_cond_t fd_cond;
+    int fsync_queue_count;
+    int32_t janitor_sleep_duration;
+
+    enum {
+        BATCH_NONE = 0,
+        BATCH_SYNCFS,
+        BATCH_SYNCFS_SINGLE_FSYNC,
+        BATCH_REVERSE_FSYNC,
+        BATCH_SYNCFS_REVERSE_FSYNC
+    } batch_fsync_mode;
+
+    uint32_t batch_fsync_delay_usec;
+    char gfid2path_sep[8];
+
+    /* seconds to sleep between health checks */
+    uint32_t health_check_interval;
+    /* seconds to sleep to wait for aio write finish for health checks */
+    uint32_t health_check_timeout;
+    pthread_t health_check;
+
+    double disk_reserve;
+    pthread_t disk_space_check;
+    uint32_t disk_space_full;
+
+#ifdef GF_DARWIN_HOST_OS
+    enum {
+        XATTR_NONE = 0,
+        XATTR_STRIP,
+        XATTR_APPEND,
+        XATTR_BOTH,
+    } xattr_user_namespace;
+#endif
+
+    /* Option to handle the cases of multiple bricks exported from
+       same backend. Very much usable in brick-splitting feature. */
+    int32_t shared_brick_count;
+
+    /*Option to set mode bit permission that will always be set on
+      file/directory. */
+    mode_t force_create_mode;
+    mode_t force_directory_mode;
+    mode_t create_mask;
+    mode_t create_directory_mask;
+    uint32_t max_hardlinks;
+    int32_t arrdfd[256];
+    int dirfd;
+
+    /* This option is used for either to call a landfill_purge or not */
+    gf_boolean_t disable_landfill_purge;
+
+    gf_boolean_t fips_mode_rchecksum;
+    gf_boolean_t ctime;
+    gf_boolean_t janitor_task_stop;
+
+    gf_boolean_t disk_space_check_active;
+    char disk_unit;
+    gf_boolean_t health_check_active;
+    gf_boolean_t update_pgfid_nlinks;
+    gf_boolean_t gfid2path;
+    /* node-uuid in pathinfo xattr */
+    gf_boolean_t node_uuid_pathinfo;
     /*
        In some cases, two exported volumes may reside on the same
        partition on the server. Sending statvfs info for both
@@ -176,91 +248,10 @@ struct posix_private {
        for the entire duration of freeing of data blocks.
     */
     gf_boolean_t background_unlink;
-
-    /* janitor task which cleans up /.trash (created by replicate) */
-    struct gf_tw_timer_list *janitor;
-
-    char *trash_path;
-    /* lock for brick dir */
-    DIR *mount_lock;
-
-    struct stat handledir;
-
-    /* uuid of glusterd that swapned the brick process */
-    uuid_t glusterd_uuid;
-
     gf_boolean_t aio_configured;
     gf_boolean_t aio_init_done;
     gf_boolean_t aio_capable;
-#ifdef HAVE_LIBAIO
-    io_context_t ctxp;
-    pthread_t aiothread;
-#endif
-
-    /* node-uuid in pathinfo xattr */
-    gf_boolean_t node_uuid_pathinfo;
-
-    pthread_t fsyncer;
-    struct list_head fsyncs;
-    pthread_mutex_t fsync_mutex;
-    pthread_cond_t fsync_cond;
-    pthread_mutex_t janitor_mutex;
-    pthread_cond_t janitor_cond;
-    int fsync_queue_count;
-
-    enum {
-        BATCH_NONE = 0,
-        BATCH_SYNCFS,
-        BATCH_SYNCFS_SINGLE_FSYNC,
-        BATCH_REVERSE_FSYNC,
-        BATCH_SYNCFS_REVERSE_FSYNC
-    } batch_fsync_mode;
-
-    uint32_t batch_fsync_delay_usec;
-    gf_boolean_t update_pgfid_nlinks;
-    gf_boolean_t gfid2path;
-    char gfid2path_sep[8];
-
-    /* seconds to sleep between health checks */
-    uint32_t health_check_interval;
-    /* seconds to sleep to wait for aio write finish for health checks */
-    uint32_t health_check_timeout;
-    pthread_t health_check;
-    gf_boolean_t health_check_active;
-
-    double disk_reserve;
-    char disk_unit;
-    uint32_t disk_space_full;
-    pthread_t disk_space_check;
-    gf_boolean_t disk_space_check_active;
-
-#ifdef GF_DARWIN_HOST_OS
-    enum {
-        XATTR_NONE = 0,
-        XATTR_STRIP,
-        XATTR_APPEND,
-        XATTR_BOTH,
-    } xattr_user_namespace;
-#endif
-
-    /* Option to handle the cases of multiple bricks exported from
-       same backend. Very much usable in brick-splitting feature. */
-    int32_t shared_brick_count;
-
-    /* This option is used for either to call a landfill_purge or not */
-    gf_boolean_t disable_landfill_purge;
-
-    /*Option to set mode bit permission that will always be set on
-      file/directory. */
-    mode_t force_create_mode;
-    mode_t force_directory_mode;
-    mode_t create_mask;
-    mode_t create_directory_mask;
-    uint32_t max_hardlinks;
-
-    gf_boolean_t fips_mode_rchecksum;
-    gf_boolean_t ctime;
-    gf_boolean_t janitor_task_stop;
+    uint32_t rel_fdcount;
 };
 
 typedef struct {
@@ -274,9 +265,11 @@ typedef struct {
     fd_t *fd;
     int fdnum;
     int flags;
-    int32_t op_errno;
     char *list;
     size_t list_size;
+    int32_t op_errno;
+
+    char _pad[4]; /* manual padding */
 } posix_xattr_filler_t;
 
 typedef struct {
@@ -336,6 +329,7 @@ posix_istat(xlator_t *this, inode_t *inode, uuid_t gfid, const char *basename,
 int
 posix_pstat(xlator_t *this, inode_t *inode, uuid_t gfid, const char *real_path,
             struct iatt *iatt, gf_boolean_t inode_locked);
+
 dict_t *
 posix_xattr_fill(xlator_t *this, const char *path, loc_t *loc, fd_t *fd,
                  int fdnum, dict_t *xattr, struct iatt *buf);
@@ -669,4 +663,11 @@ posix_spawn_ctx_janitor_thread(xlator_t *this);
 
 void
 posix_update_iatt_buf(struct iatt *buf, int fd, char *loc, dict_t *xdata);
+
+gf_boolean_t
+posix_is_layout_stale(dict_t *xdata, char *par_path, xlator_t *this);
+
+int
+posix_delete_user_xattr(dict_t *dict, char *k, data_t *v, void *data);
+
 #endif /* _POSIX_H */

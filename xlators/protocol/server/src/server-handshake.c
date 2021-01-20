@@ -240,7 +240,6 @@ server_setvolume(rpcsvc_request_t *req)
     int32_t ret = -1;
     int32_t op_ret = -1;
     int32_t op_errno = EINVAL;
-    char *buf = NULL;
     uint32_t opversion = 0;
     rpc_transport_t *xprt = NULL;
     int32_t fop_version = 0;
@@ -250,6 +249,7 @@ server_setvolume(rpcsvc_request_t *req)
     char *subdir_mount = NULL;
     char *client_name = NULL;
     gf_boolean_t cleanup_starting = _gf_false;
+    gf_boolean_t xlator_in_graph = _gf_true;
 
     params = dict_new();
     reply = dict_new();
@@ -267,18 +267,11 @@ server_setvolume(rpcsvc_request_t *req)
      */
     config_params = dict_copy_with_ref(this->options, NULL);
 
-    buf = gf_memdup(args.dict.dict_val, args.dict.dict_len);
-    if (buf == NULL) {
-        op_ret = -1;
-        op_errno = ENOMEM;
-        goto fail;
-    }
-
-    ret = dict_unserialize(buf, args.dict.dict_len, &params);
+    ret = dict_unserialize(args.dict.dict_val, args.dict.dict_len, &params);
     if (ret < 0) {
-        ret = dict_set_str(reply, "ERROR",
-                           "Internal error: failed to unserialize "
-                           "request dictionary");
+        ret = dict_set_sizen_str_sizen(reply, "ERROR",
+                                       "Internal error: failed to unserialize "
+                                       "request dictionary");
         if (ret < 0)
             gf_msg_debug(this->name, 0,
                          "failed to set error "
@@ -290,9 +283,6 @@ server_setvolume(rpcsvc_request_t *req)
         op_errno = EINVAL;
         goto fail;
     }
-
-    params->extra_free = buf;
-    buf = NULL;
 
     ret = dict_get_str(params, "remote-subvolume", &name);
     if (ret < 0) {
@@ -311,8 +301,10 @@ server_setvolume(rpcsvc_request_t *req)
     LOCK(&ctx->volfile_lock);
     {
         xl = get_xlator_by_name(this, name);
-        if (!xl)
+        if (!xl) {
+            xlator_in_graph = _gf_false;
             xl = this;
+        }
     }
     UNLOCK(&ctx->volfile_lock);
     if (xl == NULL) {
@@ -587,20 +579,30 @@ server_setvolume(rpcsvc_request_t *req)
                          "failed to set error "
                          "msg");
     } else {
-        gf_event(EVENT_CLIENT_AUTH_REJECT,
-                 "client_uid=%s;"
-                 "client_identifier=%s;server_identifier=%s;"
-                 "brick_path=%s",
-                 client->client_uid, req->trans->peerinfo.identifier,
-                 req->trans->myinfo.identifier, name);
-        gf_msg(this->name, GF_LOG_ERROR, EACCES, PS_MSG_AUTHENTICATE_ERROR,
-               "Cannot authenticate client"
-               " from %s %s",
-               client->client_uid, (clnt_version) ? clnt_version : "old");
-
         op_ret = -1;
-        op_errno = EACCES;
-        ret = dict_set_str(reply, "ERROR", "Authentication failed");
+        if (!xlator_in_graph) {
+            gf_msg(this->name, GF_LOG_ERROR, ENOENT, PS_MSG_AUTHENTICATE_ERROR,
+                   "Cannot authenticate client"
+                   " from %s %s because brick is not attached in graph",
+                   client->client_uid, (clnt_version) ? clnt_version : "old");
+
+            op_errno = ENOENT;
+            ret = dict_set_str(reply, "ERROR", "Brick not found");
+        } else {
+            gf_event(EVENT_CLIENT_AUTH_REJECT,
+                     "client_uid=%s;"
+                     "client_identifier=%s;server_identifier=%s;"
+                     "brick_path=%s",
+                     client->client_uid, req->trans->peerinfo.identifier,
+                     req->trans->myinfo.identifier, name);
+            gf_msg(this->name, GF_LOG_ERROR, EACCES, PS_MSG_AUTHENTICATE_ERROR,
+                   "Cannot authenticate client"
+                   " from %s %s",
+                   client->client_uid, (clnt_version) ? clnt_version : "old");
+
+            op_errno = EACCES;
+            ret = dict_set_str(reply, "ERROR", "Authentication failed");
+        }
         if (ret < 0)
             gf_msg_debug(this->name, 0,
                          "failed to set error "
@@ -726,8 +728,6 @@ fail:
          */
         dict_unref(config_params);
     }
-
-    GF_FREE(buf);
 
     return 0;
 }

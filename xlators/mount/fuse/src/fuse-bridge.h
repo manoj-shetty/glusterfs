@@ -78,6 +78,20 @@ typedef struct fuse_in_header fuse_in_header_t;
 typedef void(fuse_handler_t)(xlator_t *this, fuse_in_header_t *finh, void *msg,
                              struct iobuf *iobuf);
 
+enum fusedev_errno {
+    FUSEDEV_ENOENT,
+    FUSEDEV_ENOTDIR,
+    FUSEDEV_ENODEV,
+    FUSEDEV_EPERM,
+    FUSEDEV_ENOMEM,
+    FUSEDEV_ENOTCONN,
+    FUSEDEV_ECONNREFUSED,
+    FUSEDEV_EOVERFLOW,
+    FUSEDEV_EBUSY,
+    FUSEDEV_ENOTEMPTY,
+    FUSEDEV_EMAXPLUS
+};
+
 struct fuse_private {
     int fd;
     uint32_t proto_minor;
@@ -193,8 +207,17 @@ struct fuse_private {
     uint32_t lru_limit;
     uint32_t invalidate_limit;
     uint32_t fuse_dev_eperm_ratelimit_ns;
+
+    /* counters for fusdev errnos */
+    uint8_t fusedev_errno_cnt[FUSEDEV_EMAXPLUS];
+    pthread_mutex_t fusedev_errno_cnt_mutex;
 };
 typedef struct fuse_private fuse_private_t;
+
+typedef uint64_t errnomask_t[2];
+#define MASK_ERRNO(mask, n) ((mask)[(n) >> 6] |= ((uint64_t)1 << ((n)&63)))
+#define GET_ERRNO_MASK(mask, n) ((mask)[(n) >> 6] & ((uint64_t)1 << ((n)&63)))
+#define ERRNOMASK_MAX (64 * (sizeof(errnomask_t) / sizeof(uint64_t)))
 
 #define INVAL_BUF_SIZE                                                         \
     (sizeof(struct fuse_out_header) +                                          \
@@ -202,8 +225,9 @@ typedef struct fuse_private fuse_private_t;
          sizeof(struct fuse_notify_inval_entry_out) + NAME_MAX + 1))
 
 struct fuse_invalidate_node {
-    char inval_buf[INVAL_BUF_SIZE];
+    errnomask_t errnomask;
     struct list_head next;
+    char inval_buf[INVAL_BUF_SIZE];
 };
 typedef struct fuse_invalidate_node fuse_invalidate_node_t;
 
@@ -211,6 +235,7 @@ struct fuse_timed_message {
     struct fuse_out_header fuse_out_header;
     void *fuse_message_body;
     struct timespec scheduled_ts;
+    errnomask_t errnomask;
     struct list_head next;
 };
 typedef struct fuse_timed_message fuse_timed_message_t;
@@ -219,6 +244,7 @@ enum fuse_interrupt_state {
     INTERRUPT_NONE,
     INTERRUPT_SQUELCHED,
     INTERRUPT_HANDLED,
+    INTERRUPT_WAITING_HANDLER,
 };
 typedef enum fuse_interrupt_state fuse_interrupt_state_t;
 struct fuse_interrupt_record;
@@ -334,30 +360,6 @@ typedef struct fuse_graph_switch_args fuse_graph_switch_args_t;
                 return;                                                        \
             }                                                                  \
             state->umask = fci->umask;                                         \
-                                                                               \
-            /* TODO: remove this after 3.4.0 release. keeping it for the       \
-               sake of backward compatibility with old (3.3.[01])              \
-               releases till then. */                                          \
-            ret = dict_set_int16(state->xdata, "umask", fci->umask);           \
-            if (ret < 0) {                                                     \
-                gf_log("glusterfs-fuse", GF_LOG_WARNING,                       \
-                       "%s Failed adding umask"                                \
-                       " to request",                                          \
-                       op);                                                    \
-                send_fuse_err(this, finh, ENOMEM);                             \
-                free_fuse_state(state);                                        \
-                return;                                                        \
-            }                                                                  \
-            ret = dict_set_int16(state->xdata, "mode", fci->mode);             \
-            if (ret < 0) {                                                     \
-                gf_log("glusterfs-fuse", GF_LOG_WARNING,                       \
-                       "%s Failed adding mode "                                \
-                       "to request",                                           \
-                       op);                                                    \
-                send_fuse_err(this, finh, ENOMEM);                             \
-                free_fuse_state(state);                                        \
-                return;                                                        \
-            }                                                                  \
         }                                                                      \
     } while (0)
 

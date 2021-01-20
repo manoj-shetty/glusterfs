@@ -601,25 +601,23 @@ br_fsscan_deactivate(xlator_t *this)
 static void
 br_scrubber_log_time(xlator_t *this, const char *sfx)
 {
-    char timestr[1024] = {
-        0,
-    };
-    struct timeval tv = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     br_private_t *priv = NULL;
+    time_t now = 0;
 
+    now = gf_time();
     priv = this->private;
 
-    gettimeofday(&tv, NULL);
-    gf_time_fmt(timestr, sizeof(timestr), tv.tv_sec, gf_timefmt_FT);
+    gf_time_fmt(timestr, sizeof(timestr), now, gf_timefmt_FT);
 
     if (strcasecmp(sfx, "started") == 0) {
-        br_update_scrub_start_time(&priv->scrub_stat, &tv);
+        br_update_scrub_start_time(&priv->scrub_stat, now);
         gf_msg(this->name, GF_LOG_INFO, 0, BRB_MSG_SCRUB_START,
                "Scrubbing %s at %s", sfx, timestr);
     } else {
-        br_update_scrub_finish_time(&priv->scrub_stat, timestr, &tv);
+        br_update_scrub_finish_time(&priv->scrub_stat, timestr, now);
         gf_msg(this->name, GF_LOG_INFO, 0, BRB_MSG_SCRUB_FINISH,
                "Scrubbing %s at %s", sfx, timestr);
     }
@@ -628,15 +626,13 @@ br_scrubber_log_time(xlator_t *this, const char *sfx)
 static void
 br_fsscanner_log_time(xlator_t *this, br_child_t *child, const char *sfx)
 {
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
-    struct timeval tv = {
-        0,
-    };
+    time_t now = 0;
 
-    gettimeofday(&tv, NULL);
-    gf_time_fmt(timestr, sizeof(timestr), tv.tv_sec, gf_timefmt_FT);
+    now = gf_time();
+    gf_time_fmt(timestr, sizeof(timestr), now, gf_timefmt_FT);
 
     if (strcasecmp(sfx, "started") == 0) {
         gf_msg_debug(this->name, 0, "Scrubbing \"%s\" %s at %s",
@@ -919,10 +915,7 @@ br_fsscan_schedule(xlator_t *this)
 {
     uint32_t timo = 0;
     br_private_t *priv = NULL;
-    struct timeval tv = {
-        0,
-    };
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     struct br_scrubber *fsscrub = NULL;
@@ -933,8 +926,7 @@ br_fsscan_schedule(xlator_t *this)
     fsscrub = &priv->fsscrub;
     scrub_monitor = &priv->scrub_monitor;
 
-    (void)gettimeofday(&tv, NULL);
-    scrub_monitor->boot = tv.tv_sec;
+    scrub_monitor->boot = gf_time();
 
     timo = br_fsscan_calculate_timeout(fsscrub->frequency);
     if (timo == 0) {
@@ -975,12 +967,10 @@ int32_t
 br_fsscan_activate(xlator_t *this)
 {
     uint32_t timo = 0;
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
-    struct timeval now = {
-        0,
-    };
+    time_t now = 0;
     br_private_t *priv = NULL;
     struct br_scrubber *fsscrub = NULL;
     struct br_monitor *scrub_monitor = NULL;
@@ -989,7 +979,7 @@ br_fsscan_activate(xlator_t *this)
     fsscrub = &priv->fsscrub;
     scrub_monitor = &priv->scrub_monitor;
 
-    (void)gettimeofday(&now, NULL);
+    now = gf_time();
     timo = br_fsscan_calculate_timeout(fsscrub->frequency);
     if (timo == 0) {
         gf_msg(this->name, GF_LOG_ERROR, 0, BRB_MSG_ZERO_TIMEOUT_BUG,
@@ -1003,7 +993,7 @@ br_fsscan_activate(xlator_t *this)
     }
     pthread_mutex_unlock(&scrub_monitor->donelock);
 
-    gf_time_fmt(timestr, sizeof(timestr), (now.tv_sec + timo), gf_timefmt_FT);
+    gf_time_fmt(timestr, sizeof(timestr), now + timo, gf_timefmt_FT);
     (void)gf_tw_mod_timer(priv->timer_wheel, scrub_monitor->timer, timo);
 
     _br_monitor_set_scrub_state(scrub_monitor, BR_SCRUB_STATE_PENDING);
@@ -1020,12 +1010,10 @@ br_fsscan_reschedule(xlator_t *this)
 {
     int32_t ret = 0;
     uint32_t timo = 0;
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
-    struct timeval now = {
-        0,
-    };
+    time_t now = 0;
     br_private_t *priv = NULL;
     struct br_scrubber *fsscrub = NULL;
     struct br_monitor *scrub_monitor = NULL;
@@ -1037,7 +1025,7 @@ br_fsscan_reschedule(xlator_t *this)
     if (!fsscrub->frequency_reconf)
         return 0;
 
-    (void)gettimeofday(&now, NULL);
+    now = gf_time();
     timo = br_fsscan_calculate_timeout(fsscrub->frequency);
     if (timo == 0) {
         gf_msg(this->name, GF_LOG_ERROR, 0, BRB_MSG_ZERO_TIMEOUT_BUG,
@@ -1045,7 +1033,7 @@ br_fsscan_reschedule(xlator_t *this)
         return -1;
     }
 
-    gf_time_fmt(timestr, sizeof(timestr), (now.tv_sec + timo), gf_timefmt_FT);
+    gf_time_fmt(timestr, sizeof(timestr), now + timo, gf_timefmt_FT);
 
     pthread_mutex_lock(&scrub_monitor->donelock);
     {
@@ -1073,23 +1061,19 @@ br_fsscan_ondemand(xlator_t *this)
 {
     int32_t ret = 0;
     uint32_t timo = 0;
-    char timestr[1024] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
-    struct timeval now = {
-        0,
-    };
+    time_t now = 0;
     br_private_t *priv = NULL;
     struct br_monitor *scrub_monitor = NULL;
 
     priv = this->private;
     scrub_monitor = &priv->scrub_monitor;
 
-    (void)gettimeofday(&now, NULL);
-
+    now = gf_time();
     timo = BR_SCRUB_ONDEMAND;
-
-    gf_time_fmt(timestr, sizeof(timestr), (now.tv_sec + timo), gf_timefmt_FT);
+    gf_time_fmt(timestr, sizeof(timestr), now + timo, gf_timefmt_FT);
 
     pthread_mutex_lock(&scrub_monitor->donelock);
     {
@@ -1657,7 +1641,7 @@ br_read_bad_object_dir(xlator_t *this, br_child_t *child, fd_t *fd,
     int32_t ret = -1;
     off_t offset = 0;
     int32_t count = 0;
-    char key[PATH_MAX] = {
+    char key[32] = {
         0,
     };
     dict_t *out_dict = NULL;
@@ -1695,7 +1679,7 @@ br_read_bad_object_dir(xlator_t *this, br_child_t *child, fd_t *fd,
     }
 
     ret = count;
-    ret = dict_set_int32(dict, "count", count);
+    ret = dict_set_int32_sizen(dict, "count", count);
 
 out:
     return ret;
@@ -1777,10 +1761,10 @@ br_collect_bad_objects_of_child(xlator_t *this, br_child_t *child, dict_t *dict,
 {
     int32_t ret = -1;
     int32_t count = 0;
-    char key[PATH_MAX] = {
+    char key[32] = {
         0,
     };
-    char main_key[PATH_MAX] = {
+    char main_key[32] = {
         0,
     };
     int32_t j = 0;
@@ -1792,15 +1776,15 @@ br_collect_bad_objects_of_child(xlator_t *this, br_child_t *child, dict_t *dict,
     char *path = NULL;
     int32_t len = 0;
 
-    ret = dict_get_int32(child_dict, "count", &count);
+    ret = dict_get_int32_sizen(child_dict, "count", &count);
     if (ret)
         goto out;
 
     tmp_count = total_count;
 
     for (j = 0; j < count; j++) {
-        snprintf(key, PATH_MAX, "quarantine-%d", j);
-        ret = dict_get_str(child_dict, key, &entry);
+        len = snprintf(key, sizeof(key), "quarantine-%d", j);
+        ret = dict_get_strn(child_dict, key, len, &entry);
         if (ret)
             continue;
 
@@ -1810,7 +1794,7 @@ br_collect_bad_objects_of_child(xlator_t *this, br_child_t *child, dict_t *dict,
         if ((len < 0) || (len >= PATH_MAX)) {
             continue;
         }
-        snprintf(main_key, PATH_MAX, "quarantine-%d", tmp_count);
+        snprintf(main_key, sizeof(main_key), "quarantine-%d", tmp_count);
 
         ret = dict_set_dynstr_with_alloc(dict, main_key, tmp);
         if (!ret)

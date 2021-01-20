@@ -325,13 +325,18 @@ ec_get_event_from_state(ec_t *ec)
 void
 ec_up(xlator_t *this, ec_t *ec)
 {
+    char str1[32], str2[32];
+
     if (ec->timer != NULL) {
         gf_timer_call_cancel(this->ctx, ec->timer);
         ec->timer = NULL;
     }
 
     ec->up = 1;
-    gf_msg(this->name, GF_LOG_INFO, 0, EC_MSG_EC_UP, "Going UP");
+    gf_msg(this->name, GF_LOG_INFO, 0, EC_MSG_EC_UP,
+           "Going UP : Child UP = %s Child Notify = %s",
+           ec_bin(str1, sizeof(str1), ec->xl_up, ec->nodes),
+           ec_bin(str2, sizeof(str2), ec->xl_notify, ec->nodes));
 
     gf_event(EVENT_EC_MIN_BRICKS_UP, "subvol=%s", this->name);
 }
@@ -339,13 +344,18 @@ ec_up(xlator_t *this, ec_t *ec)
 void
 ec_down(xlator_t *this, ec_t *ec)
 {
+    char str1[32], str2[32];
+
     if (ec->timer != NULL) {
         gf_timer_call_cancel(this->ctx, ec->timer);
         ec->timer = NULL;
     }
 
     ec->up = 0;
-    gf_msg(this->name, GF_LOG_INFO, 0, EC_MSG_EC_DOWN, "Going DOWN");
+    gf_msg(this->name, GF_LOG_INFO, 0, EC_MSG_EC_DOWN,
+           "Going DOWN : Child UP = %s Child Notify = %s",
+           ec_bin(str1, sizeof(str1), ec->xl_up, ec->nodes),
+           ec_bin(str2, sizeof(str2), ec->xl_notify, ec->nodes));
 
     gf_event(EVENT_EC_MIN_BRICKS_NOT_UP, "subvol=%s", this->name);
 }
@@ -700,6 +710,8 @@ ec_statistics_init(ec_t *ec)
     GF_ATOMIC_INIT(ec->stats.stripe_cache.evicts, 0);
     GF_ATOMIC_INIT(ec->stats.stripe_cache.allocs, 0);
     GF_ATOMIC_INIT(ec->stats.stripe_cache.errors, 0);
+    GF_ATOMIC_INIT(ec->stats.shd.attempted, 0);
+    GF_ATOMIC_INIT(ec->stats.shd.completed, 0);
 }
 
 static int
@@ -1569,6 +1581,10 @@ ec_dump_private(xlator_t *this)
                        GF_ATOMIC_GET(ec->stats.stripe_cache.allocs));
     gf_proc_dump_write("errors", "%" GF_PRI_ATOMIC,
                        GF_ATOMIC_GET(ec->stats.stripe_cache.errors));
+    gf_proc_dump_write("heals-attempted", "%" GF_PRI_ATOMIC,
+                       GF_ATOMIC_GET(ec->stats.shd.attempted));
+    gf_proc_dump_write("heals-completed", "%" GF_PRI_ATOMIC,
+                       GF_ATOMIC_GET(ec->stats.shd.completed));
 
     return 0;
 }

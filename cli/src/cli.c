@@ -33,12 +33,6 @@
 #include <malloc.h>
 #endif
 
-#ifdef HAVE_MALLOC_STATS
-#ifdef DEBUG
-#include <mcheck.h>
-#endif
-#endif
-
 #include "cli.h"
 #include "cli-quotad-client.h"
 #include "cli-cmd.h"
@@ -61,7 +55,6 @@
 
 #include "xdr-generic.h"
 
-extern int connected;
 /* using argp for command line parsing */
 
 const char *argp_program_version =
@@ -78,11 +71,15 @@ const char *argp_program_version =
 const char *argp_program_bug_address = "<" PACKAGE_BUGREPORT ">";
 
 struct rpc_clnt *global_quotad_rpc;
+
 struct rpc_clnt *global_rpc;
 
 rpc_clnt_prog_t *cli_rpc_prog;
 
 extern struct rpc_clnt_program cli_prog;
+
+int cli_default_conn_timeout = 120;
+int cli_ten_minutes_timeout = 600;
 
 static int
 glusterfs_ctx_defaults_init(glusterfs_ctx_t *ctx)
@@ -306,14 +303,14 @@ cli_rpc_notify(struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
 
     switch (event) {
         case RPC_CLNT_CONNECT: {
-            cli_cmd_broadcast_connected();
+            cli_cmd_broadcast_connected(_gf_true);
             gf_log(this->name, GF_LOG_TRACE, "got RPC_CLNT_CONNECT");
             break;
         }
 
         case RPC_CLNT_DISCONNECT: {
+            cli_cmd_broadcast_connected(_gf_false);
             gf_log(this->name, GF_LOG_TRACE, "got RPC_CLNT_DISCONNECT");
-            connected = 0;
             if (!global_state->prompt && global_state->await_connected) {
                 ret = 1;
                 cli_out(
@@ -851,10 +848,6 @@ main(int argc, char *argv[])
         goto out;
 
     ret = cli_cmds_register(&state);
-    if (ret)
-        goto out;
-
-    ret = cli_cmd_cond_init();
     if (ret)
         goto out;
 

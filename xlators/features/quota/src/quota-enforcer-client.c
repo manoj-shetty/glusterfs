@@ -32,12 +32,6 @@
 #include <malloc.h>
 #endif
 
-#ifdef HAVE_MALLOC_STATS
-#ifdef DEBUG
-#include <mcheck.h>
-#endif
-#endif
-
 #include "quota.h"
 #include "quota-messages.h"
 
@@ -362,16 +356,28 @@ quota_enforcer_notify(struct rpc_clnt *rpc, void *mydata,
 {
     xlator_t *this = NULL;
     int ret = 0;
+    quota_priv_t *priv = NULL;
 
     this = mydata;
-
+    priv = this->private;
     switch (event) {
         case RPC_CLNT_CONNECT: {
+            pthread_mutex_lock(&priv->conn_mutex);
+            {
+                priv->conn_status = _gf_true;
+            }
+            pthread_mutex_unlock(&priv->conn_mutex);
             gf_msg_trace(this->name, 0, "got RPC_CLNT_CONNECT");
             break;
         }
 
         case RPC_CLNT_DISCONNECT: {
+            pthread_mutex_lock(&priv->conn_mutex);
+            {
+                priv->conn_status = _gf_false;
+                pthread_cond_signal(&priv->conn_cond);
+            }
+            pthread_mutex_unlock(&priv->conn_mutex);
             gf_msg_trace(this->name, 0, "got RPC_CLNT_DISCONNECT");
             break;
         }

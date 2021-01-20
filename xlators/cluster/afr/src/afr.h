@@ -42,6 +42,7 @@
 #define AFR_LK_HEAL_DOM "afr.lock-heal.domain"
 
 #define AFR_HALO_MAX_LATENCY 99999
+#define AFR_ANON_DIR_PREFIX ".glusterfs-anonymous-inode"
 
 #define PFLAG_PENDING (1 << 0)
 #define PFLAG_SBRAIN (1 << 1)
@@ -190,7 +191,9 @@ typedef struct _afr_private {
     struct list_head ta_waitq;
     struct list_head ta_onwireq;
 
+    unsigned char *anon_inode;
     unsigned char *child_up;
+    unsigned char *halo_child_up;
     int64_t *child_latency;
     unsigned char *local;
 
@@ -274,10 +277,15 @@ typedef struct _afr_private {
     gf_boolean_t esh_granular;
     gf_boolean_t consistent_io;
     gf_boolean_t data_self_heal; /* on/off */
+    gf_boolean_t use_anon_inode;
 
     /*For lock healing.*/
     struct list_head saved_locks;
     struct list_head lk_healq;
+
+    /*For anon-inode handling */
+    char anon_inode_name[NAME_MAX + 1];
+    char anon_gfid_str[UUID_SIZE + 1];
 } afr_private_t;
 
 typedef enum {
@@ -900,7 +908,7 @@ typedef struct _afr_local {
         gf_boolean_t uninherit_done;
         gf_boolean_t uninherit_value;
 
-        /* post-op hook */
+        gf_boolean_t disable_delayed_post_op;
     } transaction;
 
     syncbarrier_t barrier;
@@ -996,7 +1004,10 @@ afr_inode_read_subvol_set(inode_t *inode, xlator_t *this,
                           int event_generation);
 
 int
-afr_inode_event_gen_reset(inode_t *inode, xlator_t *this);
+__afr_inode_need_refresh_set(inode_t *inode, xlator_t *this);
+
+int
+afr_inode_need_refresh_set(inode_t *inode, xlator_t *this);
 
 int
 afr_read_subvol_select_by_policy(inode_t *inode, xlator_t *this,
@@ -1267,8 +1278,8 @@ int
 afr_inode_split_brain_choice_set(inode_t *inode, xlator_t *this,
                                  int spb_choice);
 int
-afr_inode_split_brain_choice_get(inode_t *inode, xlator_t *this,
-                                 int *spb_choice);
+afr_split_brain_read_subvol_get(inode_t *inode, xlator_t *this,
+                                call_frame_t *frame, int *spb_subvol);
 int
 afr_get_child_index_from_name(xlator_t *this, char *name);
 
@@ -1353,7 +1364,7 @@ int
 afr_set_inode_local(xlator_t *this, afr_local_t *local, inode_t *inode);
 
 int
-afr_fill_ta_loc(xlator_t *this, loc_t *loc);
+afr_fill_ta_loc(xlator_t *this, loc_t *loc, gf_boolean_t is_gfid_based_fop);
 
 int
 afr_ta_post_op_lock(xlator_t *this, loc_t *loc);
@@ -1380,8 +1391,8 @@ void
 afr_ta_locked_priv_invalidate(afr_private_t *priv);
 
 gf_boolean_t
-afr_lookup_has_quorum(call_frame_t *frame, xlator_t *this,
-                      unsigned char *subvols);
+afr_lookup_has_quorum(call_frame_t *frame,
+                      const unsigned int up_children_count);
 
 void
 afr_mark_new_entry_changelog(call_frame_t *frame, xlator_t *this);
@@ -1401,4 +1412,12 @@ afr_is_lock_mode_mandatory(dict_t *xdata);
 
 void
 afr_dom_lock_release(call_frame_t *frame);
+
+void
+afr_fill_success_replies(afr_local_t *local, afr_private_t *priv,
+                         unsigned char *replies);
+
+gf_boolean_t
+afr_is_private_directory(afr_private_t *priv, uuid_t pargfid, const char *name,
+                         pid_t pid);
 #endif /* __AFR_H__ */

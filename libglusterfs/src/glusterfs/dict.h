@@ -25,9 +25,6 @@ typedef struct _data_pair data_pair_t;
 
 #define dict_add_sizen(this, key, value) dict_addn(this, key, SLEN(key), value)
 
-#define dict_get_with_ref_sizen(this, key, value)                              \
-    dict_get_with_refn(this, key, SLEN(key), value)
-
 #define dict_get_sizen(this, key) dict_getn(this, key, SLEN(key))
 
 #define dict_del_sizen(this, key) dict_deln(this, key, SLEN(key))
@@ -98,7 +95,7 @@ struct _data {
     char *data;
     gf_atomic_t refcount;
     gf_dict_data_type_t data_type;
-    int32_t len;
+    uint32_t len;
     gf_boolean_t is_static;
 };
 
@@ -118,12 +115,12 @@ struct _dict {
     gf_atomic_t refcount;
     data_pair_t **members;
     data_pair_t *members_list;
-    char *extra_free;
     char *extra_stdfree;
     gf_lock_t lock;
     data_pair_t *members_internal;
     data_pair_t free_pair;
-    gf_boolean_t free_pair_in_use;
+    /* Variable to store total keylen + value->len */
+    uint32_t totkvlen;
 };
 
 typedef gf_boolean_t (*dict_match_t)(dict_t *d, char *k, data_t *v, void *data);
@@ -138,6 +135,7 @@ int32_t
 dict_set(dict_t *this, char *key, data_t *value);
 int32_t
 dict_setn(dict_t *this, char *key, const int keylen, data_t *value);
+
 /* function to set a new key/value pair (without checking for duplicate) */
 int32_t
 dict_add(dict_t *this, char *key, data_t *value);
@@ -145,8 +143,6 @@ int32_t
 dict_addn(dict_t *this, char *key, const int keylen, data_t *value);
 int
 dict_get_with_ref(dict_t *this, char *key, data_t **data);
-int
-dict_get_with_refn(dict_t *this, char *key, const int keylen, data_t **data);
 data_t *
 dict_get(dict_t *this, char *key);
 data_t *

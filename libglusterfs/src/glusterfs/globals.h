@@ -45,7 +45,7 @@
     1 /* MIN is the fresh start op-version, mostly                             \
          should not change */
 #define GD_OP_VERSION_MAX                                                      \
-    GD_OP_VERSION_8_0 /* MAX VERSION is the maximum                            \
+    GD_OP_VERSION_9_0 /* MAX VERSION is the maximum                            \
                          count in VME table, should                            \
                          keep changing with                                    \
                          introduction of newer                                 \
@@ -117,8 +117,12 @@
 
 #define GD_OP_VERSION_7_0 70000 /* Op-version for GlusterFS 7.0 */
 #define GD_OP_VERSION_7_1 70100 /* Op-version for GlusterFS 7.1 */
+#define GD_OP_VERSION_7_2 70200 /* Op-version for GlusterFS 7.2 */
+#define GD_OP_VERSION_7_3 70300 /* Op-version for GlusterFS 7.3 */
 
 #define GD_OP_VERSION_8_0 80000 /* Op-version for GlusterFS 8.0 */
+
+#define GD_OP_VERSION_9_0 90000 /* Op-version for GlusterFS 9.0 */
 
 #define GD_OP_VER_PERSISTENT_AFR_XATTRS GD_OP_VERSION_3_6_0
 
@@ -164,6 +168,9 @@ glusterfs_leaseid_exist(void);
 /* init */
 int
 glusterfs_globals_init(glusterfs_ctx_t *ctx);
+
+void
+gf_thread_needs_cleanup(void);
 
 struct tvec_base *
 glusterfs_ctx_tw_get(glusterfs_ctx_t *ctx);

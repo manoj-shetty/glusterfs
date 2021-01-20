@@ -96,16 +96,25 @@ int
 sys_unlink(const char *pathname);
 
 int
+sys_unlinkat(int dfd, const char *pathname);
+
+int
 sys_rmdir(const char *pathname);
 
 int
 sys_symlink(const char *oldpath, const char *newpath);
 
 int
+sys_symlinkat(const char *oldpath, int dirfd, const char *newpath);
+
+int
 sys_rename(const char *oldpath, const char *newpath);
 
 int
 sys_link(const char *oldpath, const char *newpath);
+
+int
+sys_linkat(int oldfd, const char *oldpath, int newfd, const char *newpath);
 
 int
 sys_chmod(const char *path, mode_t mode);
@@ -256,5 +265,14 @@ typedef int64_t off64_t;
 ssize_t
 sys_copy_file_range(int fd_in, off64_t *off_in, int fd_out, off64_t *off_out,
                     size_t len, unsigned int flags);
+
+int
+sys_kill(pid_t pid, int sig);
+
+#ifdef __FreeBSD__
+int
+sys_sysctl(const int *name, u_int namelen, void *oldp, size_t *oldlenp,
+           const void *newp, size_t newlen);
+#endif
 
 #endif /* __SYSCALL_H__ */

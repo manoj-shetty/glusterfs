@@ -123,6 +123,15 @@ gf_mem_update_acct_info(struct mem_acct *mem_acct, struct mem_header *header,
     return gf_mem_header_prepare(header, size);
 }
 
+static bool
+gf_mem_acct_enabled(void)
+{
+    xlator_t *x = THIS;
+    /* Low-level __gf_xxx() may be called
+       before ctx is initialized. */
+    return x->ctx && x->ctx->mem_acct_enable;
+}
+
 void *
 __gf_calloc(size_t nmemb, size_t size, uint32_t type, const char *typestr)
 {
@@ -131,7 +140,7 @@ __gf_calloc(size_t nmemb, size_t size, uint32_t type, const char *typestr)
     void *ptr = NULL;
     xlator_t *xl = NULL;
 
-    if (!THIS->ctx->mem_acct_enable)
+    if (!gf_mem_acct_enabled())
         return CALLOC(nmemb, size);
 
     xl = THIS;
@@ -156,7 +165,7 @@ __gf_malloc(size_t size, uint32_t type, const char *typestr)
     void *ptr = NULL;
     xlator_t *xl = NULL;
 
-    if (!THIS->ctx->mem_acct_enable)
+    if (!gf_mem_acct_enabled())
         return MALLOC(size);
 
     xl = THIS;
@@ -178,7 +187,7 @@ __gf_realloc(void *ptr, size_t size)
     size_t tot_size = 0;
     struct mem_header *header = NULL;
 
-    if (!THIS->ctx->mem_acct_enable)
+    if (!gf_mem_acct_enabled())
         return REALLOC(ptr, size);
 
     REQUIRE(NULL != ptr);
@@ -301,7 +310,7 @@ __gf_free(void *free_ptr)
     struct mem_header *header = NULL;
     bool last_ref = false;
 
-    if (!THIS->ctx->mem_acct_enable) {
+    if (!gf_mem_acct_enabled()) {
         FREE(free_ptr);
         return;
     }
@@ -353,6 +362,30 @@ free:
     FREE(ptr);
 }
 
+#if defined(GF_DISABLE_MEMPOOL)
+
+struct mem_pool *
+mem_pool_new_fn(glusterfs_ctx_t *ctx, unsigned long sizeof_type,
+                unsigned long count, char *name)
+{
+    struct mem_pool *new;
+
+    new = GF_MALLOC(sizeof(struct mem_pool), gf_common_mt_mem_pool);
+    if (!new)
+        return NULL;
+
+    new->sizeof_type = sizeof_type;
+    return new;
+}
+
+void
+mem_pool_destroy(struct mem_pool *pool)
+{
+    GF_FREE(pool);
+}
+
+#else /* !GF_DISABLE_MEMPOOL */
+
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list_head pool_threads;
 static pthread_mutex_t pool_free_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -362,12 +395,10 @@ static size_t pool_list_size;
 
 static __thread per_thread_pool_list_t *thread_pool_list = NULL;
 
-#if !defined(GF_DISABLE_MEMPOOL)
 #define N_COLD_LISTS 1024
 #define POOL_SWEEP_SECS 30
 
 typedef struct {
-    struct list_head death_row;
     pooled_obj_hdr_t *cold_lists[N_COLD_LISTS];
     unsigned int n_cold_lists;
 } sweep_state_t;
@@ -384,36 +415,33 @@ static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int init_count = 0;
 static pthread_t sweeper_tid;
 
-gf_boolean_t
+static bool
 collect_garbage(sweep_state_t *state, per_thread_pool_list_t *pool_list)
 {
     unsigned int i;
     per_thread_pool_t *pt_pool;
-    gf_boolean_t poisoned;
 
     (void)pthread_spin_lock(&pool_list->lock);
 
-    poisoned = pool_list->poison != 0;
-    if (!poisoned) {
-        for (i = 0; i < NPOOLS; ++i) {
-            pt_pool = &pool_list->pools[i];
-            if (pt_pool->cold_list) {
-                if (state->n_cold_lists >= N_COLD_LISTS) {
-                    break;
-                }
-                state->cold_lists[state->n_cold_lists++] = pt_pool->cold_list;
+    for (i = 0; i < NPOOLS; ++i) {
+        pt_pool = &pool_list->pools[i];
+        if (pt_pool->cold_list) {
+            if (state->n_cold_lists >= N_COLD_LISTS) {
+                (void)pthread_spin_unlock(&pool_list->lock);
+                return true;
             }
-            pt_pool->cold_list = pt_pool->hot_list;
-            pt_pool->hot_list = NULL;
+            state->cold_lists[state->n_cold_lists++] = pt_pool->cold_list;
         }
+        pt_pool->cold_list = pt_pool->hot_list;
+        pt_pool->hot_list = NULL;
     }
 
     (void)pthread_spin_unlock(&pool_list->lock);
 
-    return poisoned;
+    return false;
 }
 
-void
+static void
 free_obj_list(pooled_obj_hdr_t *victim)
 {
     pooled_obj_hdr_t *next;
@@ -425,82 +453,96 @@ free_obj_list(pooled_obj_hdr_t *victim)
     }
 }
 
-void *
+static void *
 pool_sweeper(void *arg)
 {
     sweep_state_t state;
     per_thread_pool_list_t *pool_list;
-    per_thread_pool_list_t *next_pl;
-    per_thread_pool_t *pt_pool;
-    unsigned int i;
-    gf_boolean_t poisoned;
+    uint32_t i;
+    bool pending;
 
     /*
      * This is all a bit inelegant, but the point is to avoid doing
      * expensive things (like freeing thousands of objects) while holding a
-     * global lock.  Thus, we split each iteration into three passes, with
+     * global lock.  Thus, we split each iteration into two passes, with
      * only the first and fastest holding the lock.
      */
 
+    pending = true;
+
     for (;;) {
-        sleep(POOL_SWEEP_SECS);
+        /* If we know there's pending work to do (or it's the first run), we
+         * do collect garbage more often. */
+        sleep(pending ? POOL_SWEEP_SECS / 5 : POOL_SWEEP_SECS);
+
         (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-        INIT_LIST_HEAD(&state.death_row);
         state.n_cold_lists = 0;
+        pending = false;
 
         /* First pass: collect stuff that needs our attention. */
         (void)pthread_mutex_lock(&pool_lock);
-        list_for_each_entry_safe(pool_list, next_pl, &pool_threads, thr_list)
+        list_for_each_entry(pool_list, &pool_threads, thr_list)
         {
-            (void)pthread_mutex_unlock(&pool_lock);
-            poisoned = collect_garbage(&state, pool_list);
-            (void)pthread_mutex_lock(&pool_lock);
-
-            if (poisoned) {
-                list_move(&pool_list->thr_list, &state.death_row);
+            if (collect_garbage(&state, pool_list)) {
+                pending = true;
             }
         }
         (void)pthread_mutex_unlock(&pool_lock);
 
-        /* Second pass: free dead pools. */
-        (void)pthread_mutex_lock(&pool_free_lock);
-        list_for_each_entry_safe(pool_list, next_pl, &state.death_row, thr_list)
-        {
-            for (i = 0; i < NPOOLS; ++i) {
-                pt_pool = &pool_list->pools[i];
-                free_obj_list(pt_pool->cold_list);
-                free_obj_list(pt_pool->hot_list);
-                pt_pool->hot_list = pt_pool->cold_list = NULL;
-            }
-            list_del(&pool_list->thr_list);
-            list_add(&pool_list->thr_list, &pool_free_threads);
-        }
-        (void)pthread_mutex_unlock(&pool_free_lock);
-
-        /* Third pass: free cold objects from live pools. */
+        /* Second pass: free cold objects from live pools. */
         for (i = 0; i < state.n_cold_lists; ++i) {
             free_obj_list(state.cold_lists[i]);
         }
         (void)pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     }
+
+    return NULL;
 }
 
 void
-mem_pool_thread_destructor(void)
+mem_pool_thread_destructor(per_thread_pool_list_t *pool_list)
 {
-    per_thread_pool_list_t *pool_list = thread_pool_list;
+    per_thread_pool_t *pt_pool;
+    uint32_t i;
 
-    /* The pool-sweeper thread will take it from here.
-     *
-     * We can change 'poison' here without taking locks because the change
-     * itself doesn't interact with other parts of the code and a simple write
-     * is already atomic from the point of view of the processor.
-     *
-     * This change can modify what mem_put() does, but both possibilities are
-     * fine until the sweeper thread kicks in. The real synchronization must be
-     * between mem_put() and the sweeper thread. */
+    if (pool_list == NULL) {
+        pool_list = thread_pool_list;
+    }
+
+    /* The current thread is terminating. None of the allocated objects will
+     * be used again. We can directly destroy them here instead of delaying
+     * it until the next sweeper loop. */
     if (pool_list != NULL) {
-        pool_list->poison = 1;
+        /* Remove pool_list from the global list to avoid that sweeper
+         * could touch it. */
+        pthread_mutex_lock(&pool_lock);
+        list_del(&pool_list->thr_list);
+        pthread_mutex_unlock(&pool_lock);
+
+        /* We need to protect hot/cold changes from potential mem_put() calls
+         * that reference this pool_list. Once poison is set to true, we are
+         * sure that no one else will touch hot/cold lists. The only possible
+         * race is when at the same moment a mem_put() is adding a new item
+         * to the hot list. We protect from that by taking pool_list->lock.
+         * After that we don't need the lock to destroy the hot/cold lists. */
+        pthread_spin_lock(&pool_list->lock);
+        pool_list->poison = true;
+        pthread_spin_unlock(&pool_list->lock);
+
+        for (i = 0; i < NPOOLS; i++) {
+            pt_pool = &pool_list->pools[i];
+
+            free_obj_list(pt_pool->hot_list);
+            pt_pool->hot_list = NULL;
+
+            free_obj_list(pt_pool->cold_list);
+            pt_pool->cold_list = NULL;
+        }
+
+        pthread_mutex_lock(&pool_free_lock);
+        list_add(&pool_list->thr_list, &pool_free_threads);
+        pthread_mutex_unlock(&pool_free_lock);
+
         thread_pool_list = NULL;
     }
 }
@@ -526,6 +568,22 @@ mem_pools_preinit(void)
                      sizeof(per_thread_pool_t) * (NPOOLS - 1);
 
     init_done = GF_MEMPOOL_INIT_EARLY;
+}
+
+static __attribute__((destructor)) void
+mem_pools_postfini(void)
+{
+    /* TODO: This function should destroy all per thread memory pools that
+     *       are still alive, but this is not possible right now because glibc
+     *       starts calling destructors as soon as exit() is called, and
+     *       gluster doesn't ensure that all threads have been stopped before
+     *       calling exit(). Existing threads would crash when they try to use
+     *       memory or they terminate if we destroy things here.
+     *
+     *       When we propertly terminate all threads, we can add the needed
+     *       code here. Till then we need to leave the memory allocated. Most
+     *       probably this function will be executed on process termination,
+     *       so the memory will be released anyway by the system. */
 }
 
 /* Call mem_pools_init() once threading has been configured completely. This
@@ -560,10 +618,6 @@ mem_pools_fini(void)
              */
             break;
         case 1: {
-            per_thread_pool_list_t *pool_list;
-            per_thread_pool_list_t *next_pl;
-            unsigned int i;
-
             /* if mem_pools_init() was not called, sweeper_tid will be invalid
              * and the functions will error out. That is not critical. In all
              * other cases, the sweeper_tid will be valid and the thread gets
@@ -571,32 +625,11 @@ mem_pools_fini(void)
             (void)pthread_cancel(sweeper_tid);
             (void)pthread_join(sweeper_tid, NULL);
 
-            /* At this point all threads should have already terminated, so
-             * it should be safe to destroy all pending per_thread_pool_list_t
-             * structures that are stored for each thread. */
-            mem_pool_thread_destructor();
-
-            /* free all objects from all pools */
-            list_for_each_entry_safe(pool_list, next_pl, &pool_threads,
-                                     thr_list)
-            {
-                for (i = 0; i < NPOOLS; ++i) {
-                    free_obj_list(pool_list->pools[i].hot_list);
-                    free_obj_list(pool_list->pools[i].cold_list);
-                    pool_list->pools[i].hot_list = NULL;
-                    pool_list->pools[i].cold_list = NULL;
-                }
-
-                list_del(&pool_list->thr_list);
-                FREE(pool_list);
-            }
-
-            list_for_each_entry_safe(pool_list, next_pl, &pool_free_threads,
-                                     thr_list)
-            {
-                list_del(&pool_list->thr_list);
-                FREE(pool_list);
-            }
+            /* There could be threads still running in some cases, so we can't
+             * destroy pool_lists in use. We can also not destroy unused
+             * pool_lists because some allocated objects may still be pointing
+             * to them. */
+            mem_pool_thread_destructor(NULL);
 
             init_done = GF_MEMPOOL_INIT_DESTROY;
             /* Fall through. */
@@ -607,21 +640,29 @@ mem_pools_fini(void)
     pthread_mutex_unlock(&init_mutex);
 }
 
-#else
 void
-mem_pools_init(void)
+mem_pool_destroy(struct mem_pool *pool)
 {
-}
-void
-mem_pools_fini(void)
-{
-}
-void
-mem_pool_thread_destructor(void)
-{
-}
+    if (!pool)
+        return;
 
-#endif
+    /* remove this pool from the owner (glusterfs_ctx_t) */
+    LOCK(&pool->ctx->lock);
+    {
+        list_del(&pool->owner);
+    }
+    UNLOCK(&pool->ctx->lock);
+
+    /* free this pool, but keep the mem_pool_shared */
+    GF_FREE(pool);
+
+    /*
+     * Pools are now permanent, so the mem_pool->pool is kept around. All
+     * of the objects *in* the pool will eventually be freed via the
+     * pool-sweeper thread, and this way we don't have to add a lot of
+     * reference-counting complexity.
+     */
+}
 
 struct mem_pool *
 mem_pool_new_fn(glusterfs_ctx_t *ctx, unsigned long sizeof_type,
@@ -672,6 +713,7 @@ mem_pool_new_fn(glusterfs_ctx_t *ctx, unsigned long sizeof_type,
     new->sizeof_type = sizeof_type;
     new->count = count;
     new->name = name;
+    new->xl_name = THIS->name;
     new->pool = pool;
     GF_ATOMIC_INIT(new->active, 0);
 #ifdef DEBUG
@@ -687,21 +729,6 @@ mem_pool_new_fn(glusterfs_ctx_t *ctx, unsigned long sizeof_type,
     UNLOCK(&ctx->lock);
 
     return new;
-}
-
-void *
-mem_get0(struct mem_pool *mem_pool)
-{
-    void *ptr = mem_get(mem_pool);
-    if (ptr) {
-#if defined(GF_DISABLE_MEMPOOL)
-        memset(ptr, 0, mem_pool->sizeof_type);
-#else
-        memset(ptr, 0, AVAILABLE_SIZE(mem_pool->pool->power_of_two));
-#endif
-    }
-
-    return ptr;
 }
 
 per_thread_pool_list_t *
@@ -738,12 +765,20 @@ mem_get_pool_list(void)
         }
     }
 
+    /* There's no need to take pool_list->lock, because this is already an
+     * atomic operation and we don't need to synchronize it with any change
+     * in hot/cold lists. */
+    pool_list->poison = false;
+
     (void)pthread_mutex_lock(&pool_lock);
-    pool_list->poison = 0;
     list_add(&pool_list->thr_list, &pool_threads);
     (void)pthread_mutex_unlock(&pool_lock);
 
     thread_pool_list = pool_list;
+
+    /* Ensure that all memory objects associated to the new pool_list are
+     * destroyed when the thread terminates. */
+    gf_thread_needs_cleanup();
 
     return pool_list;
 }
@@ -804,6 +839,23 @@ mem_get_from_pool(struct mem_pool *mem_pool)
     return retval;
 }
 
+#endif /* GF_DISABLE_MEMPOOL */
+
+void *
+mem_get0(struct mem_pool *mem_pool)
+{
+    void *ptr = mem_get(mem_pool);
+    if (ptr) {
+#if defined(GF_DISABLE_MEMPOOL)
+        memset(ptr, 0, mem_pool->sizeof_type);
+#else
+        memset(ptr, 0, AVAILABLE_SIZE(mem_pool->pool->power_of_two));
+#endif
+    }
+
+    return ptr;
+}
+
 void *
 mem_get(struct mem_pool *mem_pool)
 {
@@ -848,6 +900,14 @@ mem_put(void *ptr)
         /* Not one of ours; don't touch it. */
         return;
     }
+
+    if (!hdr->pool_list) {
+        gf_msg_callingfn("mem-pool", GF_LOG_CRITICAL, EINVAL,
+                         LG_MSG_INVALID_ARG,
+                         "invalid argument hdr->pool_list NULL");
+        return;
+    }
+
     pool_list = hdr->pool_list;
     pt_pool = &pool_list->pools[hdr->power_of_two - POOL_SMALLEST];
 
@@ -869,28 +929,4 @@ mem_put(void *ptr)
         free(hdr);
     }
 #endif /* GF_DISABLE_MEMPOOL */
-}
-
-void
-mem_pool_destroy(struct mem_pool *pool)
-{
-    if (!pool)
-        return;
-
-    /* remove this pool from the owner (glusterfs_ctx_t) */
-    LOCK(&pool->ctx->lock);
-    {
-        list_del(&pool->owner);
-    }
-    UNLOCK(&pool->ctx->lock);
-
-    /* free this pool, but keep the mem_pool_shared */
-    GF_FREE(pool);
-
-    /*
-     * Pools are now permanent, so the mem_pool->pool is kept around. All
-     * of the objects *in* the pool will eventually be freed via the
-     * pool-sweeper thread, and this way we don't have to add a lot of
-     * reference-counting complexity.
-     */
 }

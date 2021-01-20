@@ -2586,8 +2586,6 @@ cli_cmd_log_rotate_parse(const char **words, int wordcount, dict_t **options)
 
     if (strcmp("rotate", words[3]) == 0)
         volname = (char *)words[2];
-    else if (strcmp("rotate", words[2]) == 0)
-        volname = (char *)words[3];
     GF_ASSERT(volname);
 
     ret = dict_set_str(dict, "volname", volname);
@@ -2863,8 +2861,8 @@ out:
 }
 
 int32_t
-cli_cmd_gsync_set_parse(const char **words, int wordcount, dict_t **options,
-                        char **errstr)
+cli_cmd_gsync_set_parse(struct cli_state *state, const char **words,
+                        int wordcount, dict_t **options, char **errstr)
 {
     int32_t ret = -1;
     dict_t *dict = NULL;
@@ -2882,6 +2880,8 @@ cli_cmd_gsync_set_parse(const char **words, int wordcount, dict_t **options,
     char *save_ptr = NULL;
     char *slave_temp = NULL;
     char *token = NULL;
+    gf_answer_t answer = GF_ANSWER_NO;
+    const char *question = NULL;
 
     GF_ASSERT(words);
     GF_ASSERT(options);
@@ -3068,16 +3068,36 @@ cli_cmd_gsync_set_parse(const char **words, int wordcount, dict_t **options,
     }
     if (!ret)
         ret = dict_set_int32(dict, "type", type);
-    if (!ret && type == GF_GSYNC_OPTION_TYPE_CONFIG)
+    if (!ret && type == GF_GSYNC_OPTION_TYPE_CONFIG) {
+        if (!strcmp((char *)words[wordcount - 2], "ignore-deletes") &&
+            !strcmp((char *)words[wordcount - 1], "true")) {
+            question =
+                "There exists ~15 seconds delay for the option to take"
+                " effect from stime of the corresponding brick. Please"
+                " check the log for the time, the option is effective."
+                " Proceed";
+
+            answer = cli_cmd_get_confirmation(state, question);
+
+            if (GF_ANSWER_NO == answer) {
+                gf_log("cli", GF_LOG_INFO,
+                       "Operation "
+                       "cancelled, exiting");
+                *errstr = gf_strdup("Aborted by user.");
+                ret = -1;
+                goto out;
+            }
+        }
+
         ret = config_parse(words, wordcount, dict, cmdi, glob);
+    }
 
 out:
     if (slave_temp)
         GF_FREE(slave_temp);
-    if (ret) {
-        if (dict)
-            dict_unref(dict);
-    } else
+    if (ret && dict)
+        dict_unref(dict);
+    else
         *options = dict;
 
     return ret;
@@ -3886,8 +3906,6 @@ heal_command_type_get(const char *command)
         [GF_SHD_OP_HEAL_INDEX] = NULL,
         [GF_SHD_OP_HEAL_FULL] = "full",
         [GF_SHD_OP_INDEX_SUMMARY] = "info",
-        [GF_SHD_OP_HEALED_FILES] = NULL,
-        [GF_SHD_OP_HEAL_FAILED_FILES] = NULL,
         [GF_SHD_OP_SPLIT_BRAIN_FILES] = NULL,
         [GF_SHD_OP_STATISTICS] = "statistics",
         [GF_SHD_OP_STATISTICS_HEAL_COUNT] = NULL,
@@ -5567,9 +5585,9 @@ cli_cmd_bitrot_parse(const char **words, int wordcount, dict_t **options)
     int32_t ret = -1;
     char *w = NULL;
     char *volname = NULL;
-    static char *opwords[] = {
-        "enable",       "disable", "scrub-throttle", "scrub-frequency", "scrub",
-        "signing-time", NULL};
+    static char *opwords[] = {"enable",          "disable", "scrub-throttle",
+                              "scrub-frequency", "scrub",   "signing-time",
+                              "signer-threads",  NULL};
     static char *scrub_throt_values[] = {"lazy", "normal", "aggressive", NULL};
     static char *scrub_freq_values[] = {
         "hourly", "daily", "weekly", "biweekly", "monthly", "minute", NULL};
@@ -5578,6 +5596,7 @@ cli_cmd_bitrot_parse(const char **words, int wordcount, dict_t **options)
     dict_t *dict = NULL;
     gf_bitrot_type type = GF_BITROT_OPTION_TYPE_NONE;
     int32_t expiry_time = 0;
+    int32_t signer_th_count = 0;
 
     GF_ASSERT(words);
     GF_ASSERT(options);
@@ -5758,6 +5777,31 @@ cli_cmd_bitrot_parse(const char **words, int wordcount, dict_t **options)
             }
             goto set_type;
         }
+    } else if (!strcmp(words[3], "signer-threads")) {
+        if (!words[4]) {
+            cli_err(
+                "Missing signer-thread value for bitrot "
+                "option");
+            ret = -1;
+            goto out;
+        } else {
+            type = GF_BITROT_OPTION_TYPE_SIGNER_THREADS;
+
+            signer_th_count = strtol(words[4], NULL, 0);
+            if (signer_th_count < 1) {
+                cli_err("signer-thread count should not be less than 1");
+                ret = -1;
+                goto out;
+            }
+
+            ret = dict_set_uint32(dict, "signer-threads",
+                                  (unsigned int)signer_th_count);
+            if (ret) {
+                cli_out("Failed to set dict for bitrot");
+                goto out;
+            }
+            goto set_type;
+        }
     } else {
         cli_err(
             "Invalid option %s for bitrot. Please enter valid "
@@ -5766,7 +5810,6 @@ cli_cmd_bitrot_parse(const char **words, int wordcount, dict_t **options)
         ret = -1;
         goto out;
     }
-
 set_type:
     ret = dict_set_int32(dict, "type", type);
     if (ret < 0)

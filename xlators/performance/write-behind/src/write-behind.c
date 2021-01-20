@@ -1283,13 +1283,13 @@ __wb_pick_unwinds(wb_inode_t *wb_inode, list_head_t *lies)
 
         wb_inode->window_current += req->orig_size;
 
+        wb_inode->gen++;
+
         if (!req->ordering.fulfilled) {
             /* burden increased */
             list_add_tail(&req->lie, &wb_inode->liability);
 
             req->ordering.lied = 1;
-
-            wb_inode->gen++;
 
             uuid_utoa_r(req->gfid, gfid);
             gf_msg_debug(wb_inode->this->name, 0,
@@ -2489,7 +2489,7 @@ wb_mark_readdirp_start(xlator_t *this, inode_t *directory)
 
     wb_directory_inode = wb_inode_create(this, directory);
 
-    if (!wb_directory_inode || !wb_directory_inode->lock.spinlock)
+    if (!wb_directory_inode)
         return;
 
     LOCK(&wb_directory_inode->lock);
@@ -2509,7 +2509,7 @@ wb_mark_readdirp_end(xlator_t *this, inode_t *directory)
 
     wb_directory_inode = wb_inode_ctx_get(this, directory);
 
-    if (!wb_directory_inode || !wb_directory_inode->lock.spinlock)
+    if (!wb_directory_inode)
         return;
 
     LOCK(&wb_directory_inode->lock);

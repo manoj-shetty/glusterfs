@@ -14,7 +14,6 @@
 #include "glusterd-op-sm.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
-#include "glusterd-nfs-svc.h"
 #include "glusterd-quotad-svc.h"
 #include "glusterd-volgen.h"
 #include "glusterd-messages.h"
@@ -479,8 +478,9 @@ glusterd_stop_all_quota_crawl_service(glusterd_conf_t *priv,
     if (dir == NULL)
         return;
 
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-    while (entry) {
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         len = snprintf(pidfile, sizeof(pidfile), "%s/%s", pid_dir,
                        entry->d_name);
         if ((len >= 0) && (len < sizeof(pidfile))) {
@@ -488,8 +488,6 @@ glusterd_stop_all_quota_crawl_service(glusterd_conf_t *priv,
                                          _gf_true);
             sys_unlink(pidfile);
         }
-
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
     }
     sys_closedir(dir);
 }
@@ -1809,10 +1807,12 @@ glusterd_op_quota(dict_t *dict, char **op_errstr, dict_t *rsp_dict)
         goto out;
     }
 
+#if BUILD_GNFS
     if (GLUSTERD_STATUS_STARTED == volinfo->status) {
         if (priv->op_version == GD_OP_VERSION_MIN)
             (void)priv->nfs_svc.manager(&(priv->nfs_svc), NULL, 0);
     }
+#endif
 
     if (rsp_dict && start_crawl == _gf_true)
         glusterd_quota_initiate_fs_crawl(priv, volinfo, type);
@@ -1899,10 +1899,9 @@ glusterd_get_gfid_from_brick(dict_t *dict, glusterd_volinfo_t *volinfo,
         }
         ret = sys_lgetxattr(backend_path, GFID_XATTR_KEY, gfid, 16);
         if (ret < 0) {
-            gf_msg(this->name, GF_LOG_INFO, errno, GD_MSG_SETXATTR_FAIL,
-                   "Failed to get "
-                   "extended attribute %s for directory %s. ",
-                   GFID_XATTR_KEY, backend_path);
+            gf_smsg(this->name, GF_LOG_INFO, errno, GD_MSG_GET_XATTR_FAIL,
+                    "Attribute=%s, Directory=%s", GFID_XATTR_KEY, backend_path,
+                    NULL);
             ret = 0;
             continue;
         }

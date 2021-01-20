@@ -17,7 +17,9 @@
 #include "glusterd-svc-mgmt.h"
 #include "glusterd-shd-svc.h"
 #include "glusterd-quotad-svc.h"
+#ifdef BUILD_GNFS
 #include "glusterd-nfs-svc.h"
+#endif
 #include "glusterd-bitd-svc.h"
 #include "glusterd-shd-svc-helper.h"
 #include "glusterd-scrub-svc.h"
@@ -38,11 +40,12 @@ glusterd_svcs_reconfigure(glusterd_volinfo_t *volinfo)
     conf = this->private;
     GF_ASSERT(conf);
 
+#ifdef BUILD_GNFS
     svc_name = "nfs";
     ret = glusterd_nfssvc_reconfigure();
     if (ret)
         goto out;
-
+#endif
     svc_name = "self-heald";
     if (volinfo) {
         ret = glusterd_shdsvc_reconfigure(volinfo);
@@ -84,10 +87,11 @@ glusterd_svcs_stop(glusterd_volinfo_t *volinfo)
     priv = this->private;
     GF_ASSERT(priv);
 
+#ifdef BUILD_GNFS
     ret = priv->nfs_svc.stop(&(priv->nfs_svc), SIGKILL);
     if (ret)
         goto out;
-
+#endif
     ret = priv->quotad_svc.stop(&(priv->quotad_svc), SIGTERM);
     if (ret)
         goto out;
@@ -103,6 +107,7 @@ glusterd_svcs_stop(glusterd_volinfo_t *volinfo)
         goto out;
 
     ret = priv->scrub_svc.stop(&(priv->scrub_svc), SIGTERM);
+
 out:
     return ret;
 }
@@ -122,10 +127,11 @@ glusterd_svcs_manager(glusterd_volinfo_t *volinfo)
     if (volinfo && volinfo->is_snap_volume)
         return 0;
 
+#if BUILD_GNFS
     ret = conf->nfs_svc.manager(&(conf->nfs_svc), NULL, PROC_START_NO_WAIT);
     if (ret)
         goto out;
-
+#endif
     if (conf->op_version == GD_OP_VERSION_MIN)
         goto out;
 
@@ -233,8 +239,10 @@ glusterd_svc_check_topology_identical(char *svc_name,
     int tmpclean = 0;
     int tmpfd = -1;
 
-    if ((!identical) || (!this) || (!this->private))
+    if ((!identical) || (!this) || (!this->private)) {
+        gf_smsg(THIS->name, GF_LOG_ERROR, errno, GD_MSG_INVALID_ARGUMENT, NULL);
         goto out;
+    }
 
     conf = this->private;
     GF_VALIDATE_OR_GOTO(this->name, conf, out);
@@ -352,8 +360,10 @@ glusterd_volume_svc_check_topology_identical(
     int tmpclean = 0;
     int tmpfd = -1;
 
-    if ((!identical) || (!this) || (!this->private))
+    if ((!identical) || (!this) || (!this->private)) {
+        gf_smsg(THIS->name, GF_LOG_ERROR, errno, GD_MSG_INVALID_ARGUMENT, NULL);
         goto out;
+    }
 
     conf = this->private;
     GF_VALIDATE_OR_GOTO(this->name, conf, out);
@@ -628,7 +638,9 @@ my_callback(struct rpc_req *req, struct iovec *iov, int count, void *v_frame)
     conf = this->private;
     GF_VALIDATE_OR_GOTO(this->name, conf, out);
 
-    GF_ATOMIC_DEC(conf->blockers);
+    if (GF_ATOMIC_DEC(conf->blockers) == 0) {
+        synccond_broadcast(&conf->cond_blockers);
+    }
 
     STACK_DESTROY(frame->root);
 out:
@@ -716,7 +728,9 @@ out:
     if (volinfo)
         glusterd_volinfo_unref(volinfo);
 
-    GF_ATOMIC_DEC(conf->blockers);
+    if (GF_ATOMIC_DEC(conf->blockers) == 0) {
+        synccond_broadcast(&conf->cond_blockers);
+    }
     STACK_DESTROY(frame->root);
     return 0;
 }
@@ -779,12 +793,16 @@ __glusterd_send_svc_configure_req(glusterd_svc_t *svc, int flags,
 
     frame = create_frame(this, this->ctx->pool);
     if (!frame) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_FRAME_CREATE_FAIL,
+                NULL);
         goto *errlbl;
     }
 
     if (op == GLUSTERD_SVC_ATTACH) {
         dict = dict_new();
         if (!dict) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL,
+                    NULL);
             ret = -ENOMEM;
             goto *errlbl;
         }
@@ -802,6 +820,7 @@ __glusterd_send_svc_configure_req(glusterd_svc_t *svc, int flags,
         file_len = stbuf.st_size;
         volfile_content = GF_MALLOC(file_len + 1, gf_common_mt_char);
         if (!volfile_content) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
             ret = -ENOMEM;
             goto *errlbl;
         }
@@ -828,13 +847,10 @@ __glusterd_send_svc_configure_req(glusterd_svc_t *svc, int flags,
             ret = dict_allocate_and_serialize(dict, &brick_req.dict.dict_val,
                                               &brick_req.dict.dict_len);
             if (ret) {
-                gf_msg(this->name, GF_LOG_ERROR, 0,
-                       GD_MSG_DICT_SERL_LENGTH_GET_FAIL,
-                       "Failed to serialize dict "
-                       "to request buffer");
+                gf_smsg(this->name, GF_LOG_ERROR, errno,
+                        GD_MSG_DICT_ALLOC_AND_SERL_LENGTH_GET_FAIL, NULL);
                 goto *errlbl;
             }
-            dict->extra_free = brick_req.dict.dict_val;
         }
 
         frame->cookie = svc;
@@ -896,6 +912,8 @@ maybe_free_iobuf:
 err:
     if (dict)
         dict_unref(dict);
+    if (brick_req.dict.dict_val)
+        GF_FREE(brick_req.dict.dict_val);
 
     GF_FREE(volfile_content);
     if (spec_fd >= 0)
@@ -962,7 +980,7 @@ glusterd_attach_svc(glusterd_svc_t *svc, glusterd_volinfo_t *volinfo, int flags)
          * TBD: see if there's a better way
          */
         synclock_unlock(&conf->big_lock);
-        sleep(1);
+        synctask_sleep(1);
         synclock_lock(&conf->big_lock);
     }
     ret = -1;
@@ -1016,7 +1034,7 @@ glusterd_detach_svc(glusterd_svc_t *svc, glusterd_volinfo_t *volinfo, int sig)
          * TBD: see if there's a better way
          */
         synclock_unlock(&conf->big_lock);
-        sleep(1);
+        synctask_sleep(1);
         synclock_lock(&conf->big_lock);
     }
     ret = -1;

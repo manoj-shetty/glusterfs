@@ -10,17 +10,17 @@
 
 #include "dht-common.h"
 
-int
+static int
 dht_writev2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_truncate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_setattr2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_fallocate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_discard2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
-int
+static int
 dht_zerofill2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret);
 
 int
@@ -93,28 +93,26 @@ dht_writev_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
 
     /* Check if the rebalance phase1 is true */
     if (IS_DHT_MIGRATION_PHASE1(postbuf)) {
-        if (!dht_is_tier_xlator(this)) {
+        if (!local->xattr_req) {
+            local->xattr_req = dict_new();
             if (!local->xattr_req) {
-                local->xattr_req = dict_new();
-                if (!local->xattr_req) {
-                    gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_NO_MEMORY, ENOMEM,
-                           "insufficient memory");
-                    local->op_errno = ENOMEM;
-                    local->op_ret = -1;
-                    goto out;
-                }
-            }
-
-            ret = dict_set_uint32(local->xattr_req,
-                                  GF_PROTECT_FROM_EXTERNAL_WRITES, 1);
-            if (ret) {
-                gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_DICT_SET_FAILED, 0,
-                       "Failed to set key %s in dictionary",
-                       GF_PROTECT_FROM_EXTERNAL_WRITES);
+                gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_NO_MEMORY, ENOMEM,
+                       "insufficient memory");
                 local->op_errno = ENOMEM;
                 local->op_ret = -1;
                 goto out;
             }
+        }
+
+        ret = dict_set_uint32(local->xattr_req, GF_PROTECT_FROM_EXTERNAL_WRITES,
+                              1);
+        if (ret) {
+            gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_DICT_SET_FAILED, 0,
+                   "Failed to set key %s in dictionary",
+                   GF_PROTECT_FROM_EXTERNAL_WRITES);
+            local->op_errno = ENOMEM;
+            local->op_ret = -1;
+            goto out;
         }
 
         dht_iatt_merge(this, &local->stbuf, postbuf);
@@ -142,7 +140,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_writev2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -336,7 +334,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_truncate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -555,7 +553,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_fallocate2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -731,7 +729,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_discard2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -902,7 +900,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_zerofill2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -1049,7 +1047,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_setattr2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;

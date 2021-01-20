@@ -107,12 +107,14 @@ glusterd_proc_stop(glusterd_proc_t *proc, int sig, int flags)
                        "service, reason:%s",
                        proc->name, strerror(errno));
         }
+    } else {
+        (void)glusterd_unlink_file(proc->pidfile);
     }
     if (flags != PROC_STOP_FORCE)
         goto out;
 
     synclock_unlock(&conf->big_lock);
-    sleep(1);
+    synctask_sleep(1);
     synclock_lock(&conf->big_lock);
     if (gf_is_service_running(proc->pidfile, &pid)) {
         ret = kill(pid, SIGKILL);

@@ -31,7 +31,7 @@
  */
 typedef struct changelog_log_data {
     /* rollover related */
-    unsigned long cld_roll_time;
+    time_t cld_roll_time;
 
     /* reopen changelog? */
     gf_boolean_t cld_finale;
@@ -96,12 +96,6 @@ struct changelog_encoder {
 /* xlator private */
 
 typedef struct changelog_time_slice {
-    /**
-     * just in case we need nanosecond granularity some day.
-     * field is unused as of now (maybe we'd need it later).
-     */
-    struct timeval tv_start;
-
     /**
      * version of changelog file, incremented each time changes
      * rollover.
@@ -190,7 +184,11 @@ typedef struct changelog_ev_selector {
 
 /* changelog's private structure */
 struct changelog_priv {
+    /* changelog journalling */
     gf_boolean_t active;
+
+    /* changelog live notifications */
+    gf_boolean_t rpc_active;
 
     /* to generate unique socket file per brick */
     char *changelog_brick;
@@ -419,11 +417,11 @@ changelog_local_t *
 changelog_local_init(xlator_t *this, inode_t *inode, uuid_t gfid,
                      int xtra_records, gf_boolean_t update_flag);
 int
-changelog_start_next_change(xlator_t *this, changelog_priv_t *priv,
-                            unsigned long ts, gf_boolean_t finale);
+changelog_start_next_change(xlator_t *this, changelog_priv_t *priv, time_t ts,
+                            gf_boolean_t finale);
 int
 changelog_open_journal(xlator_t *this, changelog_priv_t *priv);
-int
+void
 changelog_fill_rollover_data(changelog_log_data_t *cld, gf_boolean_t is_last);
 int
 changelog_inject_single_event(xlator_t *this, changelog_priv_t *priv,
@@ -447,12 +445,11 @@ changelog_fsync_thread(void *data);
 int
 changelog_forget(xlator_t *this, inode_t *inode);
 int
-htime_update(xlator_t *this, changelog_priv_t *priv, unsigned long ts,
-             char *buffer);
+htime_update(xlator_t *this, changelog_priv_t *priv, time_t ts, char *buffer);
 int
-htime_open(xlator_t *this, changelog_priv_t *priv, unsigned long ts);
+htime_open(xlator_t *this, changelog_priv_t *priv, time_t ts);
 int
-htime_create(xlator_t *this, changelog_priv_t *priv, unsigned long ts);
+htime_create(xlator_t *this, changelog_priv_t *priv, time_t ts);
 
 /* Geo-Rep snapshot dependency changes */
 void
@@ -672,8 +669,8 @@ resolve_pargfid_to_path(xlator_t *this, const uuid_t gfid, char **path,
 #define CHANGELOG_NOT_ON_THEN_GOTO(priv, ret, label)                           \
     do {                                                                       \
         if (!priv->active) {                                                   \
-            gf_msg(this->name, GF_LOG_WARNING, 0, CHANGELOG_MSG_NOT_ACTIVE,    \
-                   "Changelog is not active, return success");                 \
+            gf_smsg(this->name, GF_LOG_WARNING, 0,                             \
+                    CHANGELOG_MSG_CHANGELOG_NOT_ACTIVE, NULL);                 \
             ret = 0;                                                           \
             goto label;                                                        \
         }                                                                      \

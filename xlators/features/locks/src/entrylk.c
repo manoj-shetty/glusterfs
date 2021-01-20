@@ -121,7 +121,6 @@ __stale_entrylk(xlator_t *this, pl_entry_lock_t *candidate_lock,
                 pl_entry_lock_t *requested_lock, time_t *lock_age_sec)
 {
     posix_locks_private_t *priv = NULL;
-    struct timeval curr;
 
     priv = this->private;
 
@@ -129,8 +128,7 @@ __stale_entrylk(xlator_t *this, pl_entry_lock_t *candidate_lock,
      * chance?  Or just the locks we are attempting to acquire?
      */
     if (names_conflict(candidate_lock->basename, requested_lock->basename)) {
-        gettimeofday(&curr, NULL);
-        *lock_age_sec = curr.tv_sec - candidate_lock->granted_time.tv_sec;
+        *lock_age_sec = gf_time() - candidate_lock->granted_time;
         if (*lock_age_sec > priv->revocation_secs)
             return _gf_true;
     }
@@ -204,9 +202,9 @@ out:
     return revoke_lock;
 }
 
-static gf_boolean_t
-__entrylk_needs_contention_notify(xlator_t *this, pl_entry_lock_t *lock,
-                                  struct timespec *now)
+void
+entrylk_contention_notify_check(xlator_t *this, pl_entry_lock_t *lock,
+                                struct timespec *now, struct list_head *contend)
 {
     posix_locks_private_t *priv;
     int64_t elapsed;
@@ -216,7 +214,7 @@ __entrylk_needs_contention_notify(xlator_t *this, pl_entry_lock_t *lock,
     /* If this lock is in a list, it means that we are about to send a
      * notification for it, so no need to do anything else. */
     if (!list_empty(&lock->contend)) {
-        return _gf_false;
+        return;
     }
 
     elapsed = now->tv_sec;
@@ -225,7 +223,7 @@ __entrylk_needs_contention_notify(xlator_t *this, pl_entry_lock_t *lock,
         elapsed--;
     }
     if (elapsed < priv->notify_contention_delay) {
-        return _gf_false;
+        return;
     }
 
     /* All contention notifications will be sent outside of the locked
@@ -238,7 +236,7 @@ __entrylk_needs_contention_notify(xlator_t *this, pl_entry_lock_t *lock,
 
     lock->contention_time = *now;
 
-    return _gf_true;
+    list_add_tail(&lock->contend, contend);
 }
 
 void
@@ -332,9 +330,7 @@ __entrylk_grantable(xlator_t *this, pl_dom_list_t *dom, pl_entry_lock_t *lock,
                     break;
                 }
             }
-            if (__entrylk_needs_contention_notify(this, tmp, now)) {
-                list_add_tail(&tmp->contend, contend);
-            }
+            entrylk_contention_notify_check(this, tmp, now, contend);
         }
     }
 
@@ -546,14 +542,10 @@ static int
 __lock_blocked_add(xlator_t *this, pl_inode_t *pinode, pl_dom_list_t *dom,
                    pl_entry_lock_t *lock, int nonblock)
 {
-    struct timeval now;
-
     if (nonblock)
         goto out;
 
-    gettimeofday(&now, NULL);
-
-    lock->blkd_time = now;
+    lock->blkd_time = gf_time();
     list_add_tail(&lock->blocked_locks, &dom->blocked_entrylks);
 
     gf_msg_trace(this->name, 0, "Blocking lock: {pinode=%p, basename=%s}",
@@ -614,7 +606,7 @@ __lock_entrylk(xlator_t *this, pl_inode_t *pinode, pl_entry_lock_t *lock,
     }
 
     __pl_entrylk_ref(lock);
-    gettimeofday(&lock->granted_time, NULL);
+    lock->granted_time = gf_time();
     list_add(&lock->domain_list, &dom->entrylk_list);
 
     ret = 0;
@@ -697,10 +689,9 @@ __grant_blocked_entry_locks(xlator_t *this, pl_inode_t *pl_inode,
         bl_ret = __lock_entrylk(bl->this, pl_inode, bl, 0, dom, now, contend);
 
         if (bl_ret == 0) {
-            list_add(&bl->blocked_locks, granted);
+            list_add_tail(&bl->blocked_locks, granted);
         }
     }
-    return;
 }
 
 /* Grants locks if possible which are blocked on a lock */

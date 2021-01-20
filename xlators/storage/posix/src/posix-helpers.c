@@ -824,6 +824,11 @@ posix_pstat(xlator_t *this, inode_t *inode, uuid_t gfid, const char *path,
             gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_LSTAT_FAILED,
                    "lstat failed on %s", path);
             errno = op_errno; /*gf_msg could have changed errno*/
+        } else {
+            op_errno = errno;
+            gf_msg_debug(this->name, 0, "lstat failed on %s (%s)", path,
+                         strerror(errno));
+            errno = op_errno; /*gf_msg could have changed errno*/
         }
         goto out;
     }
@@ -1065,7 +1070,7 @@ verify_handle:
         ret = posix_handle_soft(this, path, loc, uuid_curr, &stat);
 
 out:
-    if (!(*op_errno))
+    if (ret && !(*op_errno))
         *op_errno = errno;
     return ret;
 }
@@ -1500,7 +1505,7 @@ posix_janitor_task(void *data)
     if (!priv)
         goto out;
 
-    time(&now);
+    now = gf_time();
     if ((now - priv->last_landfill_check) > priv->janitor_sleep_duration) {
         if (priv->disable_landfill_purge) {
             gf_msg_debug(this->name, 0,
@@ -1588,65 +1593,67 @@ unlock:
 }
 
 static struct posix_fd *
-janitor_get_next_fd(glusterfs_ctx_t *ctx, int32_t janitor_sleep)
+janitor_get_next_fd(glusterfs_ctx_t *ctx)
 {
     struct posix_fd *pfd = NULL;
 
-    struct timespec timeout;
-
-    pthread_mutex_lock(&ctx->janitor_lock);
-    {
-        if (list_empty(&ctx->janitor_fds)) {
-            time(&timeout.tv_sec);
-            timeout.tv_sec += janitor_sleep;
-            timeout.tv_nsec = 0;
-
-            pthread_cond_timedwait(&ctx->janitor_cond, &ctx->janitor_lock,
-                                   &timeout);
-            goto unlock;
+    while (list_empty(&ctx->janitor_fds)) {
+        if (ctx->pxl_count == 0) {
+            return NULL;
         }
 
-        pfd = list_entry(ctx->janitor_fds.next, struct posix_fd, list);
-
-        list_del(ctx->janitor_fds.next);
+        pthread_cond_wait(&ctx->fd_cond, &ctx->fd_lock);
     }
-unlock:
-    pthread_mutex_unlock(&ctx->janitor_lock);
+
+    pfd = list_first_entry(&ctx->janitor_fds, struct posix_fd, list);
+    list_del_init(&pfd->list);
 
     return pfd;
+}
+
+static void
+posix_close_pfd(xlator_t *xl, struct posix_fd *pfd)
+{
+    THIS = xl;
+
+    if (pfd->dir == NULL) {
+        gf_msg_trace(xl->name, 0, "janitor: closing file fd=%d", pfd->fd);
+        sys_close(pfd->fd);
+    } else {
+        gf_msg_debug(xl->name, 0, "janitor: closing dir fd=%p", pfd->dir);
+        sys_closedir(pfd->dir);
+    }
+
+    GF_FREE(pfd);
 }
 
 static void *
 posix_ctx_janitor_thread_proc(void *data)
 {
-    xlator_t *this = NULL;
+    xlator_t *xl;
     struct posix_fd *pfd;
     glusterfs_ctx_t *ctx = NULL;
-    struct posix_private *priv = NULL;
-    int32_t sleep_duration = 0;
+    struct posix_private *priv_fd;
 
-    this = data;
-    ctx = THIS->ctx;
-    THIS = this;
+    ctx = data;
 
-    priv = this->private;
-    sleep_duration = priv->janitor_sleep_duration;
-    while (1) {
-        pfd = janitor_get_next_fd(ctx, sleep_duration);
-        if (pfd) {
-            if (pfd->dir == NULL) {
-                gf_msg_trace(this->name, 0, "janitor: closing file fd=%d",
-                             pfd->fd);
-                sys_close(pfd->fd);
-            } else {
-                gf_msg_debug(this->name, 0, "janitor: closing dir fd=%p",
-                             pfd->dir);
-                sys_closedir(pfd->dir);
-            }
+    pthread_mutex_lock(&ctx->fd_lock);
 
-            GF_FREE(pfd);
-        }
+    while ((pfd = janitor_get_next_fd(ctx)) != NULL) {
+        pthread_mutex_unlock(&ctx->fd_lock);
+
+        xl = pfd->xl;
+        posix_close_pfd(xl, pfd);
+
+        pthread_mutex_lock(&ctx->fd_lock);
+
+        priv_fd = xl->private;
+        priv_fd->rel_fdcount--;
+        if (!priv_fd->rel_fdcount)
+            pthread_cond_signal(&priv_fd->fd_cond);
     }
+
+    pthread_mutex_unlock(&ctx->fd_lock);
 
     return NULL;
 }
@@ -1654,47 +1661,39 @@ posix_ctx_janitor_thread_proc(void *data)
 int
 posix_spawn_ctx_janitor_thread(xlator_t *this)
 {
-    struct posix_private *priv = NULL;
     int ret = 0;
     glusterfs_ctx_t *ctx = NULL;
 
-    priv = this->private;
-    ctx = THIS->ctx;
+    ctx = this->ctx;
 
-    LOCK(&priv->lock);
+    pthread_mutex_lock(&ctx->fd_lock);
     {
-        if (!ctx->janitor) {
-            pthread_mutex_init(&ctx->janitor_lock, NULL);
-            pthread_cond_init(&ctx->janitor_cond, NULL);
-            INIT_LIST_HEAD(&ctx->janitor_fds);
-
+        if (ctx->pxl_count++ == 0) {
             ret = gf_thread_create(&ctx->janitor, NULL,
-                                   posix_ctx_janitor_thread_proc, this,
+                                   posix_ctx_janitor_thread_proc, ctx,
                                    "posixctxjan");
 
             if (ret) {
                 gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_THREAD_FAILED,
-                       "spawning janitor "
-                       "thread failed");
-                goto unlock;
+                       "spawning janitor thread failed");
+                ctx->pxl_count--;
             }
         }
     }
-unlock:
-    UNLOCK(&priv->lock);
+    pthread_mutex_unlock(&ctx->fd_lock);
+
     return ret;
 }
 
 static int
-is_fresh_file(int64_t sec, int64_t ns)
+is_fresh_file(struct timespec *ts)
 {
-    struct timeval tv;
+    struct timespec now;
     int64_t elapsed;
 
-    gettimeofday(&tv, NULL);
+    timespec_now_realtime(&now);
+    elapsed = (int64_t)gf_tsdiff(ts, &now);
 
-    elapsed = (tv.tv_sec - sec) * 1000000L;
-    elapsed += tv.tv_usec - (ns / 1000L);
     if (elapsed < 0) {
         /* The file has been modified in the future !!!
          * Is it fresh ? previous implementation considered this as a
@@ -1703,11 +1702,7 @@ is_fresh_file(int64_t sec, int64_t ns)
     }
 
     /* If the file is newer than a second, we consider it fresh. */
-    if (elapsed < 1000000) {
-        return 1;
-    }
-
-    return 0;
+    return elapsed < 1000000;
 }
 
 int
@@ -1770,7 +1765,9 @@ posix_gfid_heal(xlator_t *this, const char *path, loc_t *loc, dict_t *xattr_req)
         if (ret != 16) {
             /* TODO: This is a very hacky way of doing this, and very prone to
              *       errors and unexpected behavior. This should be changed. */
-            if (is_fresh_file(stbuf.ia_ctime, stbuf.ia_ctime_nsec)) {
+            struct timespec ts = {.tv_sec = stbuf.ia_ctime,
+                                  .tv_nsec = stbuf.ia_ctime_nsec};
+            if (is_fresh_file(&ts)) {
                 gf_msg(this->name, GF_LOG_ERROR, ENOENT, P_MSG_FRESHFILE,
                        "Fresh file: %s", path);
                 return -ENOENT;
@@ -1784,7 +1781,7 @@ posix_gfid_heal(xlator_t *this, const char *path, loc_t *loc, dict_t *xattr_req)
         if (ret != 16) {
             /* TODO: This is a very hacky way of doing this, and very prone to
              *       errors and unexpected behavior. This should be changed. */
-            if (is_fresh_file(stat.st_ctim.tv_sec, stat.st_ctim.tv_nsec)) {
+            if (is_fresh_file(&stat.st_ctim)) {
                 gf_msg(this->name, GF_LOG_ERROR, ENOENT, P_MSG_FRESHFILE,
                        "Fresh file: %s", path);
                 return -ENOENT;
@@ -2017,7 +2014,7 @@ posix_fs_health_check(xlator_t *this, char *file_path)
 {
     struct posix_private *priv = NULL;
     int ret = -1;
-    char timestamp[256] = {
+    char timestamp[GF_TIMESTR_SIZE] = {
         0,
     };
     int fd = -1;
@@ -2032,9 +2029,7 @@ posix_fs_health_check(xlator_t *this, char *file_path)
     int timeout = 0;
     struct aiocb aiocb;
 
-    GF_VALIDATE_OR_GOTO(this->name, this, out);
     priv = this->private;
-    GF_VALIDATE_OR_GOTO("posix-helpers", priv, out);
 
     timeout = priv->health_check_timeout;
 
@@ -2045,7 +2040,7 @@ posix_fs_health_check(xlator_t *this, char *file_path)
         goto out;
     }
 
-    time_sec = time(NULL);
+    time_sec = gf_time();
     gf_time_fmt(timestamp, sizeof timestamp, time_sec, gf_timefmt_FT);
     timelen = strlen(timestamp);
 
@@ -2317,7 +2312,7 @@ posix_disk_space_check(xlator_t *this)
     double totsz = 0;
     double freesz = 0;
 
-    GF_VALIDATE_OR_GOTO(this->name, this, out);
+    GF_VALIDATE_OR_GOTO("posix-helpers", this, out);
     priv = this->private;
     GF_VALIDATE_OR_GOTO(this->name, priv, out);
 
@@ -2410,7 +2405,7 @@ posix_spawn_disk_space_check_thread(xlator_t *xl)
 
         ret = gf_thread_create(&priv->disk_space_check, NULL,
                                posix_disk_space_check_thread_proc, xl,
-                               "posix_reserve");
+                               "posixrsv");
         if (ret) {
             priv->disk_space_check_active = _gf_false;
             gf_msg(xl->name, GF_LOG_ERROR, errno, P_MSG_DISK_SPACE_CHECK_FAILED,
@@ -2490,23 +2485,8 @@ posix_fsyncer_syncfs(xlator_t *this, struct list_head *head)
 
     stub = list_entry(head->prev, call_stub_t, list);
     ret = posix_fd_ctx_get(stub->args.fd, this, &pfd, NULL);
-    if (ret)
-        return;
-
-#ifdef GF_LINUX_HOST_OS
-        /* syncfs() is not "declared" in RHEL's glibc even though
-           the kernel has support.
-        */
-#include <sys/syscall.h>
-#include <unistd.h>
-#ifdef SYS_syncfs
-    syscall(SYS_syncfs, pfd->fd);
-#else
-    sync();
-#endif
-#else
-    sync();
-#endif
+    if (!ret)
+        (void)gf_syncfs(pfd->fd);
 }
 
 void *
@@ -2858,7 +2838,8 @@ __posix_inode_ctx_get(inode_t *inode, xlator_t *this)
     pthread_mutex_init(&ctx_p->write_atomic_lock, NULL);
     pthread_mutex_init(&ctx_p->pgfid_lock, NULL);
 
-    ret = __inode_ctx_set(inode, this, (uint64_t *)&ctx_p);
+    ctx_uint = (uint64_t)(uintptr_t)ctx_p;
+    ret = __inode_ctx_set(inode, this, &ctx_uint);
     if (ret < 0) {
         pthread_mutex_destroy(&ctx_p->xattrop_lock);
         pthread_mutex_destroy(&ctx_p->write_atomic_lock);
@@ -3584,4 +3565,102 @@ posix_update_iatt_buf(struct iatt *buf, int fd, char *loc, dict_t *xattr_req)
             buf->ia_blocks = atoll(val);
         }
     }
+}
+
+gf_boolean_t
+posix_is_layout_stale(dict_t *xdata, char *par_path, xlator_t *this)
+{
+    int op_ret = 0;
+    ssize_t size = 0;
+    char value_buf[4096] = {
+        0,
+    };
+    gf_boolean_t have_val = _gf_false;
+    data_t *arg_data = NULL;
+    char *xattr_name = NULL;
+    size_t xattr_len = 0;
+    gf_boolean_t is_stale = _gf_false;
+
+    op_ret = dict_get_str_sizen(xdata, GF_PREOP_PARENT_KEY, &xattr_name);
+    if (xattr_name == NULL) {
+        op_ret = 0;
+        return is_stale;
+    }
+
+    xattr_len = strlen(xattr_name);
+    arg_data = dict_getn(xdata, xattr_name, xattr_len);
+    if (!arg_data) {
+        op_ret = 0;
+        dict_del_sizen(xdata, GF_PREOP_PARENT_KEY);
+        return is_stale;
+    }
+
+    size = sys_lgetxattr(par_path, xattr_name, value_buf,
+                         sizeof(value_buf) - 1);
+
+    if (size >= 0) {
+        have_val = _gf_true;
+    } else {
+        if (errno == ERANGE) {
+            gf_msg(this->name, GF_LOG_INFO, errno, P_MSG_PREOP_CHECK_FAILED,
+                   "getxattr on key (%s) path (%s) failed due to"
+                   " buffer overflow",
+                   xattr_name, par_path);
+            size = sys_lgetxattr(par_path, xattr_name, NULL, 0);
+        }
+        if (size < 0) {
+            op_ret = -1;
+            gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_PREOP_CHECK_FAILED,
+                   "getxattr on key (%s)  failed, path : %s", xattr_name,
+                   par_path);
+            goto out;
+        }
+    }
+
+    if (!have_val) {
+        size = sys_lgetxattr(par_path, xattr_name, value_buf, size);
+        if (size < 0) {
+            gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_PREOP_CHECK_FAILED,
+                   "getxattr on key (%s) failed (%s)", xattr_name,
+                   strerror(errno));
+            goto out;
+        }
+    }
+
+    if ((arg_data->len != size) || (memcmp(arg_data->data, value_buf, size))) {
+        gf_msg(this->name, GF_LOG_INFO, EIO, P_MSG_PREOP_CHECK_FAILED,
+               "failing preop as on-disk xattr value differs from argument "
+               "value for key %s",
+               xattr_name);
+        op_ret = -1;
+    }
+
+out:
+    dict_deln(xdata, xattr_name, xattr_len);
+    dict_del_sizen(xdata, GF_PREOP_PARENT_KEY);
+
+    if (op_ret == -1) {
+        is_stale = _gf_true;
+    }
+
+    return is_stale;
+}
+
+/* Delete user xattr from the file at the file-path specified by data and from
+ * dict */
+int
+posix_delete_user_xattr(dict_t *dict, char *k, data_t *v, void *data)
+{
+    int ret;
+    char *real_path = data;
+
+    ret = sys_lremovexattr(real_path, k);
+    if (ret) {
+        gf_msg("posix-helpers", GF_LOG_ERROR, P_MSG_XATTR_NOT_REMOVED, errno,
+               "removexattr failed. key %s path %s", k, real_path);
+    }
+
+    dict_del(dict, k);
+
+    return ret;
 }

@@ -403,8 +403,10 @@ glusterd_brick_terminate(glusterd_volinfo_t *volinfo,
                          glusterd_brickinfo_t *brickinfo, char *options,
                          int option_cnt, char **op_errstr);
 
+#ifdef BUILD_GNFS
 int
 glusterd_nfs_statedump(char *options, int option_cnt, char **op_errstr);
+#endif
 
 int
 glusterd_client_statedump(char *volname, char *options, int option_cnt,
@@ -855,4 +857,9 @@ search_brick_path_from_proc(pid_t brick_pid, char *brickpath);
 int32_t
 glusterd_add_shd_to_dict(glusterd_volinfo_t *volinfo, dict_t *dict,
                          int32_t count);
+int32_t
+glusterd_check_brick_order(dict_t *dict, char *err_str, int32_t type,
+                           char **volname, char **bricks, int32_t *brick_count,
+                           int32_t sub_count);
+
 #endif

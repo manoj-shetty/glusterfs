@@ -43,6 +43,9 @@
 #define GF_YES 1
 #define GF_NO 0
 
+#define IS_ERROR(ret) ((ret) < 0)
+#define IS_SUCCESS(ret) ((ret) >= 0)
+
 #ifndef O_LARGEFILE
 /* savannah bug #20053, patch for compiling on darwin */
 #define O_LARGEFILE 0100000 /* from bits/fcntl.h */
@@ -203,6 +206,8 @@ enum gf_internal_fop_indicator {
 #define GLUSTERFS_POSIXLK_COUNT "glusterfs.posixlk-count"
 #define GLUSTERFS_PARENT_ENTRYLK "glusterfs.parent-entrylk"
 #define GLUSTERFS_INODELK_DOM_COUNT "glusterfs.inodelk-dom-count"
+#define GLUSTERFS_INODELK_DOM_PREFIX "glusterfs.inodelk-dom-prefix"
+#define GLUSTERFS_MULTIPLE_DOM_LK_CNT_REQUESTS "glusterfs.multi-dom-lk-cnt-req"
 #define GFID_TO_PATH_KEY "glusterfs.gfid2path"
 #define GF_XATTR_STIME_PATTERN "trusted.glusterfs.*.stime"
 #define GF_XATTR_XTIME_PATTERN "trusted.glusterfs.*.xtime"
@@ -304,7 +309,6 @@ enum gf_internal_fop_indicator {
 
 #define DHT_SKIP_NON_LINKTO_UNLINK "unlink-only-if-dht-linkto-file"
 #define TIER_SKIP_NON_LINKTO_UNLINK "unlink-only-if-tier-linkto-file"
-#define TIER_LINKFILE_GFID "tier-linkfile-gfid"
 #define DHT_SKIP_OPEN_FD_UNLINK "dont-unlink-for-open-fd"
 #define DHT_IATT_IN_XDATA_KEY "dht-get-iatt-in-xattr"
 #define DHT_MODE_IN_XDATA_KEY "dht-get-mode-in-xattr"
@@ -421,7 +425,7 @@ static const char *const FOP_PRI_STRINGS[] = {"HIGH", "NORMAL", "LOW", "LEAST"};
 static inline const char *
 fop_pri_to_string(gf_fop_pri_t pri)
 {
-    if (pri < 0)
+    if (IS_ERROR(pri))
         return "UNSPEC";
 
     if (pri >= GF_FOP_PRI_MAX)
@@ -461,6 +465,8 @@ typedef struct _server_cmdline server_cmdline_t;
 #define GF_OPTION_ENABLE _gf_true
 #define GF_OPTION_DISABLE _gf_false
 #define GF_OPTION_DEFERRED 2
+
+typedef enum { _gf_none, _gf_memcheck, _gf_drd } gf_valgrind_tool;
 
 struct _cmd_args {
     /* basic options */
@@ -554,7 +560,8 @@ struct _cmd_args {
     /* Run this process with valgrind? Might want to prevent calling
      * functions that prevent valgrind from working correctly, like
      * dlclose(). */
-    int valgrind;
+    gf_valgrind_tool vgtool;
+
     int localtime_logging;
 
     /* For the subdir mount */
@@ -726,12 +733,13 @@ struct _glusterfs_ctx {
     } stats;
 
     struct list_head volfile_list;
-
     /* Add members to manage janitor threads for cleanup fd */
     struct list_head janitor_fds;
-    pthread_cond_t janitor_cond;
-    pthread_mutex_t janitor_lock;
+    pthread_cond_t fd_cond;
+    pthread_mutex_t fd_lock;
     pthread_t janitor;
+    /* The variable is use to save total posix xlator count */
+    uint32_t pxl_count;
 
     char volume_id[GF_UUID_BUF_SIZE]; /* Used only in protocol/client */
 };

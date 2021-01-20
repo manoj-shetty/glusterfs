@@ -13,6 +13,7 @@
 #include <glusterfs/dict.h>
 #include <glusterfs/byte-order.h>
 #include <glusterfs/compat-errno.h>
+#include <glusterfs/statedump.h>
 #include "xdr-rpc.h"
 #include <glusterfs/iobuf.h>
 #include "xdr-common.h"
@@ -41,6 +42,10 @@
 #include "xdr-rpcclnt.h"
 #include <glusterfs/glusterfs-acl.h>
 
+#ifndef PTHREAD_MUTEX_ADAPTIVE_NP
+#define PTHREAD_MUTEX_ADAPTIVE_NP PTHREAD_MUTEX_DEFAULT
+#endif
+
 static struct rpcsvc_program gluster_dump_prog;
 
 #define rpcsvc_alloc_request(svc, request)                                     \
@@ -66,59 +71,33 @@ rpcsvc_request_handler(void *arg);
 static int
 rpcsvc_match_subnet_v4(const char *addrtok, const char *ipaddr);
 
-void
+static void
 rpcsvc_toggle_queue_status(rpcsvc_program_t *prog,
-                           rpcsvc_request_queue_t *queue, char status[])
+                           rpcsvc_request_queue_t *queue,
+                           unsigned long status[])
 {
-    int queue_index = 0, status_index = 0, set_bit = 0;
+    unsigned queue_index = queue - prog->request_queue;
 
-    if (queue != &prog->request_queue[0]) {
-        queue_index = (queue - &prog->request_queue[0]);
-    }
-
-    status_index = queue_index / 8;
-    set_bit = queue_index % 8;
-
-    status[status_index] ^= (1 << set_bit);
-
-    return;
+    status[queue_index / __BITS_PER_LONG] ^= (1UL << (queue_index %
+                                                      __BITS_PER_LONG));
 }
 
 int
 rpcsvc_get_free_queue_index(rpcsvc_program_t *prog)
 {
-    int queue_index = 0, max_index = 0, i = 0;
-    unsigned int right_most_unset_bit = 0;
+    unsigned i, j = 0;
 
-    right_most_unset_bit = 8;
-
-    max_index = gf_roof(EVENT_MAX_THREADS, 8) / 8;
-    for (i = 0; i < max_index; i++) {
-        if (prog->request_queue_status[i] == 0) {
-            right_most_unset_bit = 0;
+    for (i = 0; i < EVENT_MAX_THREADS / __BITS_PER_LONG; i++)
+        if (prog->request_queue_status[i] != ULONG_MAX) {
+            j = __builtin_ctzl(~prog->request_queue_status[i]);
             break;
-        } else {
-            /* get_rightmost_set_bit (sic)*/
-            right_most_unset_bit = __builtin_ctz(
-                ~prog->request_queue_status[i]);
-            if (right_most_unset_bit < 8) {
-                break;
-            }
         }
-    }
 
-    if (right_most_unset_bit > 7) {
-        queue_index = -1;
-    } else {
-        queue_index = i * 8;
-        queue_index += right_most_unset_bit;
-    }
+    if (i == EVENT_MAX_THREADS / __BITS_PER_LONG)
+        return -1;
 
-    if (queue_index != -1) {
-        prog->request_queue_status[i] |= (0x1 << right_most_unset_bit);
-    }
-
-    return queue_index;
+    prog->request_queue_status[i] |= (1UL << j);
+    return i * __BITS_PER_LONG + j;
 }
 
 rpcsvc_notify_wrapper_t *
@@ -361,6 +340,10 @@ rpcsvc_program_actor(rpcsvc_request_t *req)
         err = PROC_UNAVAIL;
         actor = NULL;
         goto err;
+    }
+
+    if (svc->xl->ctx->measure_latency) {
+        timespec_now(&req->begin);
     }
 
     req->ownthread = program->ownthread;
@@ -1512,10 +1495,18 @@ rpcsvc_submit_generic(rpcsvc_request_t *req, struct iovec *proghdr,
     size_t hdrlen = 0;
     char new_iobref = 0;
     rpcsvc_drc_globals_t *drc = NULL;
+    gf_latency_t *lat = NULL;
 
     if ((!req) || (!req->trans))
         return -1;
 
+    if (req->prog && req->begin.tv_sec) {
+        if ((req->procnum >= 0) && (req->procnum < req->prog->numactors)) {
+            timespec_now(&req->end);
+            lat = &req->prog->latencies[req->procnum];
+            gf_latency_update(lat, &req->begin, &req->end);
+        }
+    }
     trans = req->trans;
 
     for (i = 0; i < hdrcount; i++) {
@@ -1846,6 +1837,15 @@ rpcsvc_submit_message(rpcsvc_request_t *req, struct iovec *proghdr,
                                  iobref);
 }
 
+void
+rpcsvc_program_destroy(rpcsvc_program_t *program)
+{
+    if (program) {
+        GF_FREE(program->latencies);
+        GF_FREE(program);
+    }
+}
+
 int
 rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
 {
@@ -1854,6 +1854,18 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
     if (!svc || !program) {
         goto out;
     }
+
+    pthread_rwlock_rdlock(&svc->rpclock);
+    {
+        list_for_each_entry(prog, &svc->programs, program)
+        {
+            if ((prog->prognum == program->prognum) &&
+                (prog->progver == program->progver)) {
+                break;
+            }
+        }
+    }
+    pthread_rwlock_unlock(&svc->rpclock);
 
     ret = rpcsvc_program_unregister_portmap(program);
     if (ret == -1) {
@@ -1871,17 +1883,6 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
         goto out;
     }
 #endif
-    pthread_rwlock_rdlock(&svc->rpclock);
-    {
-        list_for_each_entry(prog, &svc->programs, program)
-        {
-            if ((prog->prognum == program->prognum) &&
-                (prog->progver == program->progver)) {
-                break;
-            }
-        }
-    }
-    pthread_rwlock_unlock(&svc->rpclock);
 
     gf_log(GF_RPCSVC, GF_LOG_DEBUG,
            "Program unregistered: %s, Num: %d,"
@@ -1902,6 +1903,8 @@ rpcsvc_program_unregister(rpcsvc_t *svc, rpcsvc_program_t *program)
 
     ret = 0;
 out:
+    rpcsvc_program_destroy(prog);
+
     if (ret == -1) {
         if (program) {
             gf_log(GF_RPCSVC, GF_LOG_ERROR,
@@ -2285,6 +2288,11 @@ rpcsvc_program_register(rpcsvc_t *svc, rpcsvc_program_t *program,
     }
 
     memcpy(newprog, program, sizeof(*program));
+    newprog->latencies = gf_latency_new(program->numactors);
+    if (!newprog->latencies) {
+        rpcsvc_program_destroy(newprog);
+        goto out;
+    }
 
     INIT_LIST_HEAD(&newprog->program);
     pthread_mutexattr_init(&thr_attr);
@@ -3228,6 +3236,48 @@ rpcsvc_match_subnet_v4(const char *addrtok, const char *ipaddr)
 out:
     GF_FREE(netaddr);
     return ret;
+}
+
+void
+rpcsvc_program_dump(rpcsvc_program_t *prog)
+{
+    char key_prefix[GF_DUMP_MAX_BUF_LEN];
+    char key[GF_DUMP_MAX_BUF_LEN];
+    int i;
+
+    snprintf(key_prefix, GF_DUMP_MAX_BUF_LEN, "%s", prog->progname);
+    gf_proc_dump_add_section("%s", key_prefix);
+
+    gf_proc_dump_build_key(key, key_prefix, "program-number");
+    gf_proc_dump_write(key, "%d", prog->prognum);
+
+    gf_proc_dump_build_key(key, key_prefix, "program-version");
+    gf_proc_dump_write(key, "%d", prog->progver);
+
+    strncat(key_prefix, ".latency",
+            sizeof(key_prefix) - strlen(key_prefix) - 1);
+
+    for (i = 0; i < prog->numactors; i++) {
+        gf_proc_dump_build_key(key, key_prefix, "%s", prog->actors[i].procname);
+        gf_latency_statedump_and_reset(key, &prog->latencies[i]);
+    }
+}
+
+void
+rpcsvc_statedump(rpcsvc_t *svc)
+{
+    rpcsvc_program_t *prog = NULL;
+    int ret = 0;
+    ret = pthread_rwlock_tryrdlock(&svc->rpclock);
+    if (ret)
+        return;
+    {
+        list_for_each_entry(prog, &svc->programs, program)
+        {
+            rpcsvc_program_dump(prog);
+        }
+    }
+    pthread_rwlock_unlock(&svc->rpclock);
 }
 
 static rpcsvc_actor_t gluster_dump_actors[GF_DUMP_MAXVALUE] = {

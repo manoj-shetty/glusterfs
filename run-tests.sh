@@ -328,6 +328,7 @@ function get_bug_list_for_disabled_test ()
 function run_tests()
 {
     RES=0
+    FLAKY=''
     FAILED=''
     TESTS_NEEDED_RETRY=''
     GENERATED_CORE=''
@@ -349,16 +350,16 @@ function run_tests()
         timeout_cmd_exists="no"
     fi
 
-    for t in $(find ${regression_testsdir}/tests -name '*.t' \
-               | LC_COLLATE=C sort) ; do
+    all_tests=($(find ${regression_testsdir}/tests -name '*.t' | sort))
+    all_tests_cnt=${#all_tests[@]}
+    for t in "${all_tests[@]}" ; do
         old_cores=$(ls /*-*.core 2> /dev/null | wc -l)
         total_tests=$((total_tests+1))
         if match $t "$@" ; then
             selected_tests=$((selected_tests+1))
             echo
-            echo $section_separator$section_separator
-            if [[ $(get_test_status $t) == "BAD_TEST" ]] || \
-               [[ $(get_test_status $t) == "BRICK_MUX_BAD_TEST" ]] && \
+            echo $section_separator "(${total_tests} / ${all_tests_cnt})" $section_separator
+            if [[ $(get_test_status $t) =~ "BAD_TEST" ]] && \
                [[ $skip_bad_tests == "yes" ]]
             then
                 skipped_bad_tests=$((skipped_bad_tests+1))
@@ -433,9 +434,17 @@ function run_tests()
 
                 TESTS_NEEDED_RETRY="${TESTS_NEEDED_RETRY}${t} "
             fi
+
+
             if [ ${TMP_RES} -ne 0 ] ; then
-                RES=${TMP_RES}
-                FAILED="${FAILED}${t} "
+		if [[ "$t" == *"tests/000-flaky/"* ]]; then
+                    FLAKY="${FLAKY}${t} "
+		    echo "FAILURE -> SUCCESS: Flaky test"
+		    TMP_RES=0
+		else
+                    RES=${TMP_RES}
+                    FAILED="${FAILED}${t} "
+		fi
             fi
 
             new_cores=$(ls /*-*.core 2> /dev/null | wc -l)
@@ -470,8 +479,10 @@ function run_tests()
         echo "$key  -  ${ELAPSEDTIMEMAP["$key"]} second"
     done | sort -rn -k3
 
-    # Output the errors into a file
+    # initialize the output file
     echo > "${result_output}"
+
+    # Output the errors into a file
     if [ ${RES} -ne 0 ] ; then
         FAILED=$( echo ${FAILED} | tr ' ' '\n' | sort -u )
         FAILED_COUNT=$( echo -n "${FAILED}" | grep -c '^' )
@@ -484,7 +495,13 @@ function run_tests()
     TESTS_NEEDED_RETRY=$( echo ${TESTS_NEEDED_RETRY} | tr ' ' '\n' | sort -u )
     RETRY_COUNT=$( echo -n "${TESTS_NEEDED_RETRY}" | grep -c '^' )
     if [ ${RETRY_COUNT} -ne 0 ] ; then
-        echo -e "\n${RETRY_COUNT} test(s) needed retry \n${TESTS_NEEDED_RETRY}"
+        echo -e "\n${RETRY_COUNT} test(s) needed retry \n${TESTS_NEEDED_RETRY}" >> "${result_output}"
+    fi
+
+    FLAKY_TESTS_FAILED=$( echo ${FLAKY} | tr ' ' '\n' | sort -u )
+    RETRY_COUNT=$( echo -n "${FLAKY_TESTS_FAILED}" | grep -c '^' )
+    if [ ${RETRY_COUNT} -ne 0 ] ; then
+        echo -e "\n${RETRY_COUNT} flaky test(s) marked as success even though they failed \n${FLAKY_TESTS_FAILED}" >> "${result_output}"
     fi
 
     echo
@@ -513,8 +530,38 @@ function run_head_tests()
     run_tests "$htests"
 }
 
-function parse_args () {
-    args=`getopt frcbkphHno:t: "$@"`
+function show_usage ()
+{
+    cat <<EOF
+Usage: $0 <opts> [<glob>|<bzid>]...
+
+Options:
+
+-f  force
+-h  skip tests altering from HEAD
+-H  run only tests altering from HEAD
+-r  retry failed tests
+-R  do not retry failed tests
+-c  dont't exit on failure
+-b  don't skip bad tests
+-k  don't skip known bugs
+-p  don't keep logs from preceding runs
+-o  OUTPUT
+-t  TIMEOUT
+-n  skip NFS tests
+--help
+EOF
+}
+
+usage="no"
+
+function parse_args ()
+{
+    args=`getopt -u -l help frRcbkphHno:t: "$@"`
+    if ! [ $? -eq 0 ]; then
+	show_usage
+	exit 1
+    fi
     set -- $args
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -522,6 +569,7 @@ function parse_args () {
         -h)    head="no" ;;
         -H)    head="only" ;;
         -r)    retry="yes" ;;
+        -R)    retry="no" ;;
         -c)    exit_on_failure="no" ;;
         -b)    skip_bad_tests="no" ;;
         -k)    skip_known_bugs="no" ;;
@@ -529,6 +577,7 @@ function parse_args () {
         -o)    result_output="$2"; shift;;
         -t)    run_timeout="$2"; shift;;
         -n)    nfs_tests="no";;
+        --help) usage="yes" ;;
         --)    shift; break;;
         esac
         shift
@@ -543,6 +592,10 @@ echo
 
 # Get user options
 parse_args "$@"
+if [ x"$usage" == x"yes" ]; then
+    show_usage
+    exit 0
+fi
 
 # Make sure we're running as the root user
 check_user

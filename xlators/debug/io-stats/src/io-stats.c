@@ -135,7 +135,7 @@ struct ios_global_stats {
     gf_atomic_t block_count_read[IOS_BLOCK_COUNT_SIZE];
     gf_atomic_t fop_hits[GF_FOP_MAXVALUE];
     gf_atomic_t upcall_hits[GF_UPCALL_FLAGS_MAXVALUE];
-    struct timeval started_at;
+    time_t started_at;
     struct ios_lat latency[GF_FOP_MAXVALUE];
     uint64_t nr_opens;
     uint64_t max_nr_opens;
@@ -292,9 +292,7 @@ is_fop_latency_started(call_frame_t *frame)
         begin = &frame->begin;                                                 \
         end = &frame->end;                                                     \
                                                                                \
-        elapsed = ((end->tv_sec - begin->tv_sec) * 1e9 +                       \
-                   (end->tv_nsec - begin->tv_nsec)) /                          \
-                  1000;                                                        \
+        elapsed = gf_tsdiff(begin, end) / 1000.0;                              \
         throughput = op_ret / elapsed;                                         \
                                                                                \
         conf = this->private;                                                  \
@@ -678,10 +676,7 @@ ios_dump_throughput_stats(struct ios_stat_head *list_head, xlator_t *this,
                           FILE *logfp, ios_stats_thru_t type)
 {
     struct ios_stat_list *entry = NULL;
-    struct timeval time = {
-        0,
-    };
-    char timestr[256] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
 
@@ -689,12 +684,9 @@ ios_dump_throughput_stats(struct ios_stat_head *list_head, xlator_t *this,
     {
         list_for_each_entry(entry, &list_head->iosstats->list, list)
         {
-            gf_time_fmt(timestr, sizeof timestr,
-                        entry->iosstat->thru_counters[type].time.tv_sec,
-                        gf_timefmt_FT);
-            snprintf(timestr + strlen(timestr),
-                     sizeof timestr - strlen(timestr), ".%" GF_PRI_SUSECONDS,
-                     time.tv_usec);
+            gf_time_fmt_tv(timestr, sizeof timestr,
+                           &entry->iosstat->thru_counters[type].time,
+                           gf_timefmt_FT);
 
             ios_log(this, logfp, "%s \t %-10.2f  \t  %s", timestr, entry->value,
                     entry->iosstat->filename);
@@ -773,9 +765,8 @@ err:
 
 int
 io_stats_dump_global_to_json_logfp(xlator_t *this,
-                                   struct ios_global_stats *stats,
-                                   struct timeval *now, int interval,
-                                   FILE *logfp)
+                                   struct ios_global_stats *stats, time_t now,
+                                   int interval, FILE *logfp)
 {
     int i = 0;
     int j = 0;
@@ -801,10 +792,7 @@ io_stats_dump_global_to_json_logfp(xlator_t *this,
     };
     dict_t *xattr = NULL;
 
-    interval_sec = ((now->tv_sec * 1000000.0 + now->tv_usec) -
-                    (stats->started_at.tv_sec * 1000000.0 +
-                     stats->started_at.tv_usec)) /
-                   1000000.0;
+    interval_sec = (double)(now - stats->started_at);
 
     conf = this->private;
 
@@ -956,8 +944,8 @@ io_stats_dump_global_to_json_logfp(xlator_t *this,
     }
 
     if (interval == -1) {
-        ios_log(this, logfp, "\"%s.%s.uptime\": %" PRId64 ",", key_prefix,
-                str_prefix, (uint64_t)(now->tv_sec - stats->started_at.tv_sec));
+        ios_log(this, logfp, "\"%s.%s.uptime\": %" PRIu64 ",", key_prefix,
+                str_prefix, (uint64_t)(now - stats->started_at));
         ios_log(this, logfp,
                 "\"%s.%s.bytes_read\": "
                 "%" GF_PRI_ATOMIC ",",
@@ -1209,14 +1197,14 @@ out:
 
 int
 io_stats_dump_global_to_logfp(xlator_t *this, struct ios_global_stats *stats,
-                              struct timeval *now, int interval, FILE *logfp)
+                              time_t now, int interval, FILE *logfp)
 {
     int i = 0;
     int per_line = 0;
     int index = 0;
     struct ios_stat_head *list_head = NULL;
     struct ios_conf *conf = NULL;
-    char timestr[256] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     char str_header[128] = {0};
@@ -1232,8 +1220,8 @@ io_stats_dump_global_to_logfp(xlator_t *this, struct ios_global_stats *stats,
         ios_log(this, logfp, "\n=== Cumulative stats ===");
     else
         ios_log(this, logfp, "\n=== Interval %d stats ===", interval);
-    ios_log(this, logfp, "      Duration : %" PRId64 " secs",
-            (uint64_t)(now->tv_sec - stats->started_at.tv_sec));
+    ios_log(this, logfp, "      Duration : %" PRIu64 " secs",
+            (uint64_t)(now - stats->started_at));
     ios_log(this, logfp, "     BytesRead : %" GF_PRI_ATOMIC,
             GF_ATOMIC_GET(stats->data_read));
     ios_log(this, logfp, "  BytesWritten : %" GF_PRI_ATOMIC "\n",
@@ -1325,11 +1313,8 @@ io_stats_dump_global_to_logfp(xlator_t *this, struct ios_global_stats *stats,
     if (interval == -1) {
         LOCK(&conf->lock);
         {
-            gf_time_fmt(timestr, sizeof timestr,
-                        conf->cumulative.max_openfd_time.tv_sec, gf_timefmt_FT);
-            snprintf(timestr + strlen(timestr),
-                     sizeof timestr - strlen(timestr), ".%" GF_PRI_SUSECONDS,
-                     conf->cumulative.max_openfd_time.tv_usec);
+            gf_time_fmt_tv(timestr, sizeof timestr,
+                           &conf->cumulative.max_openfd_time, gf_timefmt_FT);
             ios_log(this, logfp,
                     "Current open fd's: %" PRId64 " Max open fd's: %" PRId64
                     " time %s",
@@ -1381,10 +1366,10 @@ io_stats_dump_global_to_logfp(xlator_t *this, struct ios_global_stats *stats,
 
 int
 io_stats_dump_global_to_dict(xlator_t *this, struct ios_global_stats *stats,
-                             struct timeval *now, int interval, dict_t *dict)
+                             time_t now, int interval, dict_t *dict)
 {
     int ret = 0;
-    char key[256] = {0};
+    char key[64] = {0};
     uint64_t sec = 0;
     int i = 0;
     uint64_t count = 0;
@@ -1407,7 +1392,7 @@ io_stats_dump_global_to_dict(xlator_t *this, struct ios_global_stats *stats,
                interval);
 
     snprintf(key, sizeof(key), "%d-duration", interval);
-    sec = (uint64_t)(now->tv_sec - stats->started_at.tv_sec);
+    sec = now - stats->started_at;
     ret = dict_set_uint64(dict, key, sec);
     if (ret) {
         gf_log(this->name, GF_LOG_ERROR,
@@ -1530,9 +1515,8 @@ out:
 }
 
 int
-io_stats_dump_global(xlator_t *this, struct ios_global_stats *stats,
-                     struct timeval *now, int interval,
-                     struct ios_dump_args *args)
+io_stats_dump_global(xlator_t *this, struct ios_global_stats *stats, time_t now,
+                     int interval, struct ios_dump_args *args)
 {
     int ret = -1;
 
@@ -1590,13 +1574,13 @@ ios_dump_args_init(struct ios_dump_args *args, ios_dump_type_t type,
 }
 
 static void
-ios_global_stats_clear(struct ios_global_stats *stats, struct timeval *now)
+ios_global_stats_clear(struct ios_global_stats *stats, time_t now)
 {
     GF_ASSERT(stats);
     GF_ASSERT(now);
 
     memset(stats, 0, sizeof(*stats));
-    stats->started_at = *now;
+    stats->started_at = now;
 }
 
 int
@@ -1607,7 +1591,7 @@ io_stats_dump(xlator_t *this, struct ios_dump_args *args, ios_info_op_t op,
     struct ios_global_stats cumulative = {};
     struct ios_global_stats incremental = {};
     int increment = 0;
-    struct timeval now;
+    time_t now = 0;
 
     GF_ASSERT(this);
     GF_ASSERT(args);
@@ -1615,8 +1599,8 @@ io_stats_dump(xlator_t *this, struct ios_dump_args *args, ios_info_op_t op,
     GF_ASSERT(args->type < IOS_DUMP_TYPE_MAX);
 
     conf = this->private;
+    now = gf_time();
 
-    gettimeofday(&now, NULL);
     LOCK(&conf->lock);
     {
         if (op == GF_IOS_INFO_ALL || op == GF_IOS_INFO_CUMULATIVE)
@@ -1629,17 +1613,17 @@ io_stats_dump(xlator_t *this, struct ios_dump_args *args, ios_info_op_t op,
             if (!is_peek) {
                 increment = conf->increment++;
 
-                ios_global_stats_clear(&conf->incremental, &now);
+                ios_global_stats_clear(&conf->incremental, now);
             }
         }
     }
     UNLOCK(&conf->lock);
 
     if (op == GF_IOS_INFO_ALL || op == GF_IOS_INFO_CUMULATIVE)
-        io_stats_dump_global(this, &cumulative, &now, -1, args);
+        io_stats_dump_global(this, &cumulative, now, -1, args);
 
     if (op == GF_IOS_INFO_ALL || op == GF_IOS_INFO_INCREMENTAL)
-        io_stats_dump_global(this, &incremental, &now, increment, args);
+        io_stats_dump_global(this, &incremental, now, increment, args);
 
     return 0;
 }
@@ -1649,9 +1633,8 @@ io_stats_dump_fd(xlator_t *this, struct ios_fd *iosfd)
 {
     struct ios_conf *conf = NULL;
     struct timeval now;
-    uint64_t sec = 0;
-    uint64_t usec = 0;
     int i = 0;
+    double usecs = 0;
     uint64_t data_read = 0;
     uint64_t data_written = 0;
     uint64_t block_count_read = 0;
@@ -1666,23 +1649,15 @@ io_stats_dump_fd(xlator_t *this, struct ios_fd *iosfd)
         return 0;
 
     gettimeofday(&now, NULL);
-
-    if (iosfd->opened_at.tv_usec > now.tv_usec) {
-        now.tv_usec += 1000000;
-        now.tv_usec--;
-    }
-
-    sec = now.tv_sec - iosfd->opened_at.tv_sec;
-    usec = now.tv_usec - iosfd->opened_at.tv_usec;
+    usecs = gf_tvdiff(&iosfd->opened_at, &now);
 
     gf_log(this->name, GF_LOG_INFO, "--- fd stats ---");
 
     if (iosfd->filename)
         gf_log(this->name, GF_LOG_INFO, "      Filename : %s", iosfd->filename);
 
-    if (sec)
-        gf_log(this->name, GF_LOG_INFO,
-               "      Lifetime : %" PRId64 "secs, %" PRId64 "usecs", sec, usec);
+    if (usecs)
+        gf_log(this->name, GF_LOG_INFO, "      Lifetime : %lf secs", usecs);
 
     data_read = GF_ATOMIC_GET(iosfd->data_read);
     if (data_read)
@@ -1785,9 +1760,7 @@ update_ios_latency(struct ios_conf *conf, call_frame_t *frame,
     begin = &frame->begin;
     end = &frame->end;
 
-    elapsed = ((end->tv_sec - begin->tv_sec) * 1e9 +
-               (end->tv_nsec - begin->tv_nsec)) /
-              1000;
+    elapsed = gf_tsdiff(begin, end) / 1000.0;
 
     update_ios_latency_stats(&conf->cumulative, elapsed, op);
     update_ios_latency_stats(&conf->incremental, elapsed, op);
@@ -1802,12 +1775,13 @@ io_stats_dump_stats_to_dict(xlator_t *this, dict_t *resp,
 {
     struct ios_conf *conf = NULL;
     int cnt = 0;
-    char key[256];
+    char key[32];
+    int keylen;
     struct ios_stat_head *list_head = NULL;
     struct ios_stat_list *entry = NULL;
     int ret = -1;
     ios_stats_thru_t index = IOS_STATS_THRU_MAX;
-    char timestr[256] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     char *dict_timestr = NULL;
@@ -1826,14 +1800,9 @@ io_stats_dump_stats_to_dict(xlator_t *this, dict_t *resp,
                 ret = dict_set_uint64(resp, "max-open",
                                       conf->cumulative.max_nr_opens);
 
-                gf_time_fmt(timestr, sizeof timestr,
-                            conf->cumulative.max_openfd_time.tv_sec,
-                            gf_timefmt_FT);
-                if (conf->cumulative.max_openfd_time.tv_sec)
-                    snprintf(timestr + strlen(timestr),
-                             sizeof timestr - strlen(timestr),
-                             ".%" GF_PRI_SUSECONDS,
-                             conf->cumulative.max_openfd_time.tv_usec);
+                gf_time_fmt_tv(timestr, sizeof timestr,
+                               &conf->cumulative.max_openfd_time,
+                               gf_timefmt_FT);
 
                 dict_timestr = gf_strdup(timestr);
                 if (!dict_timestr)
@@ -1873,7 +1842,7 @@ io_stats_dump_stats_to_dict(xlator_t *this, dict_t *resp,
         default:
             goto out;
     }
-    ret = dict_set_int32(resp, "top-op", flags);
+    ret = dict_set_int32_sizen(resp, "top-op", flags);
     if (!list_cnt)
         goto out;
     LOCK(&list_head->lock);
@@ -1881,24 +1850,24 @@ io_stats_dump_stats_to_dict(xlator_t *this, dict_t *resp,
         list_for_each_entry(entry, &list_head->iosstats->list, list)
         {
             cnt++;
-            snprintf(key, 256, "%s-%d", "filename", cnt);
-            ret = dict_set_str(resp, key, entry->iosstat->filename);
+            keylen = snprintf(key, sizeof(key), "filename-%d", cnt);
+            ret = dict_set_strn(resp, key, keylen, entry->iosstat->filename);
             if (ret)
                 goto unlock_list_head;
-            snprintf(key, 256, "%s-%d", "value", cnt);
+            snprintf(key, sizeof(key), "value-%d", cnt);
             ret = dict_set_uint64(resp, key, entry->value);
             if (ret)
                 goto unlock_list_head;
             if (index != IOS_STATS_THRU_MAX) {
-                snprintf(key, 256, "%s-%d", "time-sec", cnt);
-                ret = dict_set_int32(
-                    resp, key,
+                keylen = snprintf(key, sizeof(key), "time-sec-%d", cnt);
+                ret = dict_set_int32n(
+                    resp, key, keylen,
                     entry->iosstat->thru_counters[index].time.tv_sec);
                 if (ret)
                     goto unlock_list_head;
-                snprintf(key, 256, "%s-%d", "time-usec", cnt);
-                ret = dict_set_int32(
-                    resp, key,
+                keylen = snprintf(key, sizeof(key), "time-usec-%d", cnt);
+                ret = dict_set_int32n(
+                    resp, key, keylen,
                     entry->iosstat->thru_counters[index].time.tv_usec);
                 if (ret)
                     goto unlock_list_head;
@@ -1913,7 +1882,7 @@ unlock_list_head:
      * failed. */
     if (ret)
         goto out;
-    ret = dict_set_int32(resp, "members", cnt);
+    ret = dict_set_int32_sizen(resp, "members", cnt);
 out:
     return ret;
 }
@@ -3605,26 +3574,21 @@ ios_destroy_top_stats(struct ios_conf *conf)
     return;
 }
 
-static int
+static void
 io_stats_clear(struct ios_conf *conf)
 {
-    struct timeval now;
-    int ret = -1;
+    time_t now = 0;
 
     GF_ASSERT(conf);
+    now = gf_time();
 
-    if (!gettimeofday(&now, NULL)) {
-        LOCK(&conf->lock);
-        {
-            ios_global_stats_clear(&conf->cumulative, &now);
-            ios_global_stats_clear(&conf->incremental, &now);
-            conf->increment = 0;
-        }
-        UNLOCK(&conf->lock);
-        ret = 0;
+    LOCK(&conf->lock);
+    {
+        ios_global_stats_clear(&conf->cumulative, now);
+        ios_global_stats_clear(&conf->incremental, now);
+        conf->increment = 0;
     }
-
-    return ret;
+    UNLOCK(&conf->lock);
 }
 
 int32_t
@@ -3865,7 +3829,7 @@ ios_conf_destroy(struct ios_conf *conf)
     _ios_destroy_dump_thread(conf);
     ios_destroy_sample_buf(conf->ios_sample_buf);
     LOCK_DESTROY(&conf->lock);
-    GF_FREE(conf->dnscache);
+    gf_dnscache_deinit(conf->dnscache);
     GF_FREE(conf);
 }
 
@@ -3888,7 +3852,7 @@ ios_init_stats(struct ios_global_stats *stats)
     for (i = 0; i < GF_UPCALL_FLAGS_MAXVALUE; i++)
         GF_ATOMIC_INIT(stats->upcall_hits[i], 0);
 
-    gettimeofday(&stats->started_at, NULL);
+    stats->started_at = gf_time();
 }
 
 int
@@ -3977,11 +3941,14 @@ init(xlator_t *this)
         gf_log(this->name, GF_LOG_ERROR, "Out of memory.");
         goto out;
     }
-    ret = -1;
 
     GF_OPTION_INIT("ios-dnscache-ttl-sec", conf->ios_dnscache_ttl_sec, int32,
                    out);
     conf->dnscache = gf_dnscache_init(conf->ios_dnscache_ttl_sec);
+    if (!conf->dnscache) {
+        ret = -1;
+        goto out;
+    }
 
     GF_OPTION_INIT("sys-log-level", sys_log_str, str, out);
     if (sys_log_str) {
@@ -4132,12 +4099,9 @@ notify(xlator_t *this, int32_t event, void *data, ...)
                 }
 
                 if (GF_IOS_INFO_CLEAR == op) {
-                    ret = io_stats_clear(this->private);
-                    if (ret)
-                        gf_log(this->name, GF_LOG_ERROR,
-                               "Failed to clear info stats");
+                    io_stats_clear(this->private);
 
-                    ret = dict_set_int32(output, "stats-cleared", ret ? 0 : 1);
+                    ret = dict_set_int32(output, "stats-cleared", 1);
                     if (ret)
                         gf_log(this->name, GF_LOG_ERROR,
                                "Failed to set stats-cleared"

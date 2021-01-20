@@ -19,10 +19,10 @@ import logging.handlers
 import fcntl
 
 
-GCRON_TASKS = "/var/run/gluster/shared_storage/snaps/glusterfs_snap_cron_tasks"
+GCRON_TASKS = "/run/gluster/shared_storage/snaps/glusterfs_snap_cron_tasks"
 GCRON_CROND_TASK = "/etc/cron.d/glusterfs_snap_cron_tasks"
 GCRON_RELOAD_FLAG = "/var/run/gluster/crond_task_reload_flag"
-LOCK_FILE_DIR = "/var/run/gluster/shared_storage/snaps/lock_files/"
+LOCK_FILE_DIR = "/run/gluster/shared_storage/snaps/lock_files/"
 log = logging.getLogger("gcron-logger")
 start_time = 0.0
 
@@ -38,7 +38,8 @@ def initLogger(script_name):
     sh.setFormatter(formatter)
 
     process = subprocess.Popen(["gluster", "--print-logdir"],
-                               stdout=subprocess.PIPE)
+                               stdout=subprocess.PIPE,
+                               universal_newlines=True)
     out, err = process.communicate()
     if process.returncode == 0:
         logfile = os.path.join(out.strip(), script_name[:-3]+".log")

@@ -98,20 +98,11 @@ __afr_selfheal_name_expunge(xlator_t *this, inode_t *parent, uuid_t pargfid,
                             const char *bname, inode_t *inode,
                             struct afr_reply *replies)
 {
-    loc_t loc = {
-        0,
-    };
     int i = 0;
     afr_private_t *priv = NULL;
-    char g[64];
     int ret = 0;
 
     priv = this->private;
-
-    loc.parent = inode_ref(parent);
-    gf_uuid_copy(loc.pargfid, pargfid);
-    loc.name = bname;
-    loc.inode = inode_ref(inode);
 
     for (i = 0; i < priv->child_count; i++) {
         if (!replies[i].valid)
@@ -120,29 +111,9 @@ __afr_selfheal_name_expunge(xlator_t *this, inode_t *parent, uuid_t pargfid,
         if (replies[i].op_ret)
             continue;
 
-        switch (replies[i].poststat.ia_type) {
-            case IA_IFDIR:
-                gf_msg(this->name, GF_LOG_WARNING, 0,
-                       AFR_MSG_EXPUNGING_FILE_OR_DIR,
-                       "expunging dir %s/%s (%s) on %s", uuid_utoa(pargfid),
-                       bname, uuid_utoa_r(replies[i].poststat.ia_gfid, g),
-                       priv->children[i]->name);
-
-                ret |= syncop_rmdir(priv->children[i], &loc, 1, NULL, NULL);
-                break;
-            default:
-                gf_msg(this->name, GF_LOG_WARNING, 0,
-                       AFR_MSG_EXPUNGING_FILE_OR_DIR,
-                       "expunging file %s/%s (%s) on %s", uuid_utoa(pargfid),
-                       bname, uuid_utoa_r(replies[i].poststat.ia_gfid, g),
-                       priv->children[i]->name);
-
-                ret |= syncop_unlink(priv->children[i], &loc, NULL, NULL);
-                break;
-        }
+        ret |= afr_selfheal_entry_delete(this, parent, bname, inode, i,
+                                         replies);
     }
-
-    loc_wipe(&loc);
 
     return ret;
 }
@@ -381,7 +352,7 @@ __afr_selfheal_name_do(call_frame_t *frame, xlator_t *this, inode_t *parent,
     ret = __afr_selfheal_assign_gfid(this, parent, pargfid, bname, inode,
                                      replies, gfid, locked_on, source, sources,
                                      is_gfid_absent, &gfid_idx);
-    if (ret)
+    if (ret || (gfid_idx < 0))
         return ret;
 
     ret = __afr_selfheal_name_impunge(frame, this, parent, pargfid, bname,
@@ -514,7 +485,7 @@ afr_selfheal_name_do(call_frame_t *frame, xlator_t *this, inode_t *parent,
     ret = afr_selfheal_entrylk(frame, this, parent, this->name, bname,
                                locked_on);
     {
-        if (ret < AFR_SH_MIN_PARTICIPANTS) {
+        if (ret < priv->child_count) {
             ret = -ENOTCONN;
             goto unlock;
         }
@@ -560,13 +531,15 @@ afr_selfheal_name_unlocked_inspect(call_frame_t *frame, xlator_t *this,
     struct afr_reply *replies = NULL;
     inode_t *inode = NULL;
     int first_idx = -1;
+    afr_local_t *local = NULL;
 
     priv = this->private;
+    local = frame->local;
 
     replies = alloca0(sizeof(*replies) * priv->child_count);
 
     inode = afr_selfheal_unlocked_lookup_on(frame, parent, bname, replies,
-                                            priv->child_up, NULL);
+                                            local->child_up, NULL);
     if (!inode)
         return -ENOMEM;
 

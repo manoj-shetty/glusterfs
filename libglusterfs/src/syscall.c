@@ -13,6 +13,10 @@
 #include "glusterfs/mem-pool.h"
 #include "glusterfs/libglusterfs-messages.h"
 
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#include <signal.h>
+#endif
 #include <sys/types.h>
 #include <utime.h>
 #include <sys/time.h>
@@ -214,6 +218,15 @@ sys_unlink(const char *pathname)
 }
 
 int
+sys_unlinkat(int dfd, const char *pathname)
+{
+#ifdef GF_SOLARIS_HOST_OS
+    return FS_RET_CHECK0(solaris_unlinkat(dfd, pathname, 0), errno);
+#endif
+    return FS_RET_CHECK0(unlinkat(dfd, pathname, 0), errno);
+}
+
+int
 sys_rmdir(const char *pathname)
 {
     return FS_RET_CHECK0(rmdir(pathname), errno);
@@ -223,6 +236,12 @@ int
 sys_symlink(const char *oldpath, const char *newpath)
 {
     return FS_RET_CHECK0(symlink(oldpath, newpath), errno);
+}
+
+int
+sys_symlinkat(const char *oldpath, int dirfd, const char *newpath)
+{
+    return FS_RET_CHECK0(symlinkat(oldpath, dirfd, newpath), errno);
 }
 
 int
@@ -250,6 +269,12 @@ sys_link(const char *oldpath, const char *newpath)
 #else
     return FS_RET_CHECK0(link(oldpath, newpath), errno);
 #endif
+}
+
+int
+sys_linkat(int oldfd, const char *oldpath, int newfd, const char *newpath)
+{
+    return FS_RET_CHECK0(linkat(oldfd, oldpath, newfd, newpath, 0), errno);
 }
 
 int
@@ -485,7 +510,7 @@ sys_lsetxattr(const char *path, const char *name, const void *value,
 #endif
 
 #ifdef GF_BSD_HOST_OS
-    return FS_RET_CHECK0(
+    return FS_RET_CHECK(
         extattr_set_link(path, EXTATTR_NAMESPACE_USER, name, value, size),
         errno);
 #endif
@@ -603,7 +628,7 @@ sys_fsetxattr(int filedes, const char *name, const void *value, size_t size,
 #endif
 
 #ifdef GF_BSD_HOST_OS
-    return FS_RET_CHECK0(
+    return FS_RET_CHECK(
         extattr_set_fd(filedes, EXTATTR_NAMESPACE_USER, name, value, size),
         errno);
 #endif
@@ -828,7 +853,24 @@ sys_copy_file_range(int fd_in, off64_t *off_in, int fd_out, off64_t *off_out,
     return syscall(SYS_copy_file_range, fd_in, off_in, fd_out, off_out, len,
                    flags);
 #else
-    return -ENOSYS;
+    errno = ENOSYS;
+    return -1;
 #endif /* HAVE_COPY_FILE_RANGE_SYS */
 #endif /* HAVE_COPY_FILE_RANGE */
 }
+
+#ifdef __FreeBSD__
+int
+sys_kill(pid_t pid, int sig)
+{
+    return FS_RET_CHECK0(kill(pid, sig), errno);
+}
+
+int
+sys_sysctl(const int *name, u_int namelen, void *oldp, size_t *oldlenp,
+           const void *newp, size_t newlen)
+{
+    return FS_RET_CHECK0(sysctl(name, namelen, oldp, oldlenp, newp, newlen),
+                         errno);
+}
+#endif

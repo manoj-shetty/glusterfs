@@ -26,7 +26,6 @@
 #include <signal.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <ftw.h>
 #include <regex.h>
 
 #ifndef GF_BSD_HOST_OS
@@ -55,6 +54,7 @@
 #include <glusterfs/events.h>
 #include "posix-gfid-path.h"
 #include <glusterfs/compat-uuid.h>
+#include <glusterfs/common-utils.h>
 
 extern char *marker_xattrs[];
 #define ALIGN_SIZE 4096
@@ -698,6 +698,10 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
     gf_boolean_t locked = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
     struct posix_private *priv = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct stat statbuf = {
+        0,
+    };
 
     DECLARE_OLD_FS_ID_VAR;
 
@@ -717,7 +721,10 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
     if (priv->disk_reserve)
         posix_disk_space_check(this);
 
-    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, ret, ret, out);
+    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, ret, ret, unlock);
+
+overwrite:
+    check_space_error = _gf_true;
 
     ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
     if (ret < 0) {
@@ -741,7 +748,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
         ret = -errno;
         gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_FSTAT_FAILED,
                "fallocate (fstat) failed on fd=%p", fd);
-        goto out;
+        goto unlock;
     }
 
     if (xdata) {
@@ -751,7 +758,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
             gf_msg(this->name, GF_LOG_ERROR, 0, 0,
                    "file state check failed, fd %p", fd);
             ret = -EIO;
-            goto out;
+            goto unlock;
         }
     }
 
@@ -762,7 +769,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
                "fallocate failed on %s offset: %jd, "
                "len:%zu, flags: %d",
                uuid_utoa(fd->inode->gfid), offset, len, flags);
-        goto out;
+        goto unlock;
     }
 
     ret = posix_fdstat(this, fd->inode, pfd->fd, statpost);
@@ -770,16 +777,47 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
         ret = -errno;
         gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_FSTAT_FAILED,
                "fallocate (fstat) failed on fd=%p", fd);
-        goto out;
+        goto unlock;
     }
 
     posix_set_ctime(frame, this, NULL, pfd->fd, fd->inode, statpost);
 
-out:
+unlock:
     if (locked) {
         pthread_mutex_unlock(&ctx->write_atomic_lock);
         locked = _gf_false;
     }
+
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+#ifdef FALLOC_FL_KEEP_SIZE
+        if (flags & FALLOC_FL_KEEP_SIZE) {
+            goto overwrite;
+        }
+#endif
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto out;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto out;
+        }
+
+        if (offset + len <= statbuf.st_size) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+out:
     SET_TO_OLD_FS_ID();
     if (ret == ENOSPC)
         ret = -ENOSPC;
@@ -1089,25 +1127,57 @@ posix_zerofill(call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
     int op_ret = -1;
     int op_errno = EINVAL;
     dict_t *rsp_xdata = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct posix_fd *pfd = NULL;
+    struct stat statbuf = {
+        0,
+    };
 
-    VALIDATE_OR_GOTO(frame, out);
-    VALIDATE_OR_GOTO(this, out);
+    VALIDATE_OR_GOTO(frame, unwind);
+    VALIDATE_OR_GOTO(this, unwind);
 
     priv = this->private;
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
+overwrite:
+    check_space_error = _gf_true;
     ret = posix_do_zerofill(frame, this, fd, offset, len, &statpre, &statpost,
                             xdata, &rsp_xdata);
     if (ret < 0) {
         op_ret = -1;
         op_errno = -ret;
-        goto out;
+        goto unwind;
     }
 
     STACK_UNWIND_STRICT(zerofill, frame, 0, 0, &statpre, &statpost, rsp_xdata);
     return 0;
 
 out:
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto out;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto out;
+        }
+
+        if (offset + len <= statbuf.st_size) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+unwind:
     STACK_UNWIND_STRICT(zerofill, frame, op_ret, op_errno, NULL, NULL,
                         rsp_xdata);
     return 0;
@@ -1291,13 +1361,28 @@ out:
     return 0;
 }
 
+static void
+posix_add_fd_to_cleanup(xlator_t *this, struct posix_fd *pfd)
+{
+    glusterfs_ctx_t *ctx = this->ctx;
+    struct posix_private *priv = this->private;
+
+    pfd->xl = this;
+    pthread_mutex_lock(&ctx->fd_lock);
+    {
+        list_add_tail(&pfd->list, &ctx->janitor_fds);
+        priv->rel_fdcount++;
+        pthread_cond_signal(&ctx->fd_cond);
+    }
+    pthread_mutex_unlock(&ctx->fd_lock);
+}
+
 int32_t
 posix_releasedir(xlator_t *this, fd_t *fd)
 {
     struct posix_fd *pfd = NULL;
     uint64_t tmp_pfd = 0;
     int ret = 0;
-    glusterfs_ctx_t *ctx = NULL;
 
     VALIDATE_OR_GOTO(this, out);
     VALIDATE_OR_GOTO(fd, out);
@@ -1314,22 +1399,8 @@ posix_releasedir(xlator_t *this, fd_t *fd)
                "pfd->dir is NULL for fd=%p", fd);
         goto out;
     }
+    posix_add_fd_to_cleanup(this, pfd);
 
-    ctx = THIS->ctx;
-
-    pthread_mutex_lock(&ctx->janitor_lock);
-    {
-        INIT_LIST_HEAD(&pfd->list);
-        list_add_tail(&pfd->list, &ctx->janitor_fds);
-        pthread_cond_signal(&ctx->janitor_cond);
-    }
-    pthread_mutex_unlock(&ctx->janitor_lock);
-
-    /*gf_msg_debug(this->name, 0, "janitor: closing dir fd=%p", pfd->dir);
-
-    sys_closedir(pfd->dir);
-    GF_FREE(pfd);
-    */
 out:
     return 0;
 }
@@ -1872,19 +1943,28 @@ posix_writev(call_frame_t *frame, xlator_t *this, fd_t *fd,
     gf_boolean_t write_append = _gf_false;
     gf_boolean_t update_atomic = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct stat statbuf = {
+        0,
+    };
+    int totlen = 0;
+    int idx = 0;
 
-    VALIDATE_OR_GOTO(frame, out);
-    VALIDATE_OR_GOTO(this, out);
-    VALIDATE_OR_GOTO(fd, out);
-    VALIDATE_OR_GOTO(fd->inode, out);
-    VALIDATE_OR_GOTO(vector, out);
-    VALIDATE_OR_GOTO(this->private, out);
+    VALIDATE_OR_GOTO(frame, unwind);
+    VALIDATE_OR_GOTO(this, unwind);
+    VALIDATE_OR_GOTO(fd, unwind);
+    VALIDATE_OR_GOTO(fd->inode, unwind);
+    VALIDATE_OR_GOTO(vector, unwind);
+    VALIDATE_OR_GOTO(this->private, unwind);
 
     priv = this->private;
 
-    VALIDATE_OR_GOTO(priv, out);
+    VALIDATE_OR_GOTO(priv, unwind);
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
+overwrite:
+
+    check_space_error = _gf_true;
     if ((fd->inode->ia_type == IA_IFBLK) || (fd->inode->ia_type == IA_IFCHR)) {
         gf_msg(this->name, GF_LOG_ERROR, EINVAL, P_MSG_INVALID_ARGUMENT,
                "writev received on a block/char file (%s)",
@@ -2026,6 +2106,36 @@ out:
         locked = _gf_false;
     }
 
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto unwind;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto unwind;
+        }
+
+        for (idx = 0; idx < count; idx++) {
+            totlen = vector[idx].iov_len;
+        }
+
+        if ((offset + totlen <= statbuf.st_size) &&
+            !(statbuf.st_blocks * statbuf.st_blksize < statbuf.st_size)) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+unwind:
     STACK_UNWIND_STRICT(writev, frame, op_ret, op_errno, &preop, &postop,
                         rsp_xdata);
 
@@ -2061,6 +2171,7 @@ posix_copy_file_range(call_frame_t *frame, xlator_t *this, fd_t *fd_in,
     gf_boolean_t locked = _gf_false;
     gf_boolean_t update_atomic = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
+    char in_uuid_str[64] = {0}, out_uuid_str[64] = {0};
 
     VALIDATE_OR_GOTO(frame, out);
     VALIDATE_OR_GOTO(this, out);
@@ -2196,13 +2307,12 @@ posix_copy_file_range(call_frame_t *frame, xlator_t *this, fd_t *fd_in,
                                  flags);
 
     if (op_ret < 0) {
-        op_errno = -op_ret;
-        op_ret = -1;
+        op_errno = errno;
         gf_msg(this->name, GF_LOG_ERROR, op_errno, P_MSG_COPY_FILE_RANGE_FAILED,
                "copy_file_range failed: fd_in: %p (gfid: %s) ,"
                " fd_out %p (gfid:%s)",
-               fd_in, uuid_utoa(fd_in->inode->gfid), fd_out,
-               uuid_utoa(fd_out->inode->gfid));
+               fd_in, uuid_utoa_r(fd_in->inode->gfid, in_uuid_str), fd_out,
+               uuid_utoa_r(fd_out->inode->gfid, out_uuid_str));
         goto out;
     }
 
@@ -2412,17 +2522,12 @@ out:
 int32_t
 posix_release(xlator_t *this, fd_t *fd)
 {
-    struct posix_private *priv = NULL;
     struct posix_fd *pfd = NULL;
     int ret = -1;
     uint64_t tmp_pfd = 0;
-    glusterfs_ctx_t *ctx = NULL;
 
     VALIDATE_OR_GOTO(this, out);
     VALIDATE_OR_GOTO(fd, out);
-
-    priv = this->private;
-    ctx = THIS->ctx;
 
     ret = fd_ctx_del(fd, this, &tmp_pfd);
     if (ret < 0) {
@@ -2437,16 +2542,7 @@ posix_release(xlator_t *this, fd_t *fd)
                "pfd->dir is %p (not NULL) for file fd=%p", pfd->dir, fd);
     }
 
-    pthread_mutex_lock(&ctx->janitor_lock);
-    {
-        INIT_LIST_HEAD(&pfd->list);
-        list_add_tail(&pfd->list, &ctx->janitor_fds);
-        pthread_cond_signal(&ctx->janitor_cond);
-    }
-    pthread_mutex_unlock(&ctx->janitor_lock);
-
-    if (!priv)
-        goto out;
+    posix_add_fd_to_cleanup(this, pfd);
 
 out:
     return 0;
@@ -2616,6 +2712,7 @@ posix_setxattr(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
     int32_t ret = 0;
     ssize_t acl_size = 0;
     dict_t *xattr = NULL;
+    dict_t *subvol_xattrs = NULL;
     posix_xattr_filler_t filler = {
         0,
     };
@@ -2631,6 +2728,10 @@ posix_setxattr(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
     struct mdata_iatt mdata_iatt = {
         0,
     };
+    int8_t sync_backend_xattrs = _gf_false;
+    data_pair_t *custom_xattrs;
+    data_t *keyval = NULL;
+    char **xattrs_to_heal = get_xattrs_to_heal();
 
     DECLARE_OLD_FS_ID_VAR;
     SET_FS_ID(frame->root->uid, frame->root->gid);
@@ -2813,6 +2914,66 @@ posix_setxattr(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
         goto out;
     }
 
+    ret = dict_get_int8(xdata, "sync_backend_xattrs", &sync_backend_xattrs);
+    if (ret) {
+        gf_msg_debug(this->name, -ret, "Unable to get sync_backend_xattrs");
+    }
+
+    if (sync_backend_xattrs) {
+        /* List all custom xattrs */
+        subvol_xattrs = dict_new();
+        if (!subvol_xattrs)
+            goto out;
+
+        ret = dict_set_int32_sizen(xdata, "list-xattr", 1);
+        if (ret) {
+            gf_msg(this->name, GF_LOG_ERROR, 0, ENOMEM,
+                   "Unable to set list-xattr in dict ");
+            goto out;
+        }
+
+        subvol_xattrs = posix_xattr_fill(this, real_path, loc, NULL, -1, xdata,
+                                         NULL);
+
+        /* Remove all user xattrs from the file */
+        dict_foreach_fnmatch(subvol_xattrs, "user.*", posix_delete_user_xattr,
+                             real_path);
+
+        /* Remove all custom xattrs from the file */
+        for (i = 1; xattrs_to_heal[i]; i++) {
+            keyval = dict_get(subvol_xattrs, xattrs_to_heal[i]);
+            if (keyval) {
+                ret = sys_lremovexattr(real_path, xattrs_to_heal[i]);
+                if (ret) {
+                    gf_msg(this->name, GF_LOG_ERROR, P_MSG_XATTR_NOT_REMOVED,
+                           errno, "removexattr failed. key %s path %s",
+                           xattrs_to_heal[i], loc->path);
+                    goto out;
+                }
+
+                dict_del(subvol_xattrs, xattrs_to_heal[i]);
+                keyval = NULL;
+            }
+        }
+
+        /* Set custom xattrs based on info provided by DHT */
+        custom_xattrs = dict->members_list;
+
+        while (custom_xattrs != NULL) {
+            ret = sys_lsetxattr(real_path, custom_xattrs->key,
+                                custom_xattrs->value->data,
+                                custom_xattrs->value->len, flags);
+            if (ret) {
+                op_errno = errno;
+                gf_log(this->name, GF_LOG_ERROR, "setxattr failed - %s %d",
+                       custom_xattrs->key, ret);
+                goto out;
+            }
+
+            custom_xattrs = custom_xattrs->next;
+        }
+    }
+
     xattr = dict_new();
     if (!xattr)
         goto out;
@@ -2919,6 +3080,9 @@ out:
 
     if (xattr)
         dict_unref(xattr);
+
+    if (subvol_xattrs)
+        dict_unref(subvol_xattrs);
 
     return 0;
 }
@@ -4399,7 +4563,7 @@ posix_common_removexattr(call_frame_t *frame, loc_t *loc, fd_t *fd,
         ret = posix_fdstat(this, inode, _fd, &preop);
         if (ret) {
             gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_FDSTAT_FAILED,
-                   "fdstat operaton failed on %s", real_path);
+                   "fdstat operaton failed on %s", real_path ? real_path : "");
         }
     }
 

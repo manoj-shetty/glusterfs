@@ -37,6 +37,9 @@
 #ifndef GF_LINUX_HOST_OS
 #include <sys/resource.h>
 #endif
+#ifdef HAVE_SYNCFS_SYS
+#include <sys/syscall.h>
+#endif
 
 #include "glusterfs/compat-errno.h"
 #include "glusterfs/common-utils.h"
@@ -50,6 +53,7 @@
 #include "xxhash.h"
 #include <ifaddrs.h>
 #include "glusterfs/libglusterfs-messages.h"
+#include "glusterfs/glusterfs-acl.h"
 #ifdef __FreeBSD__
 #include <pthread_np.h>
 #undef BIT_SET
@@ -74,6 +78,15 @@ char *vol_type_str[] = {
 
 typedef int32_t (*rw_op_t)(int32_t fd, char *buf, int32_t size);
 typedef int32_t (*rwv_op_t)(int32_t fd, const struct iovec *buf, int32_t size);
+
+char *xattrs_to_heal[] = {"user.",
+                          POSIX_ACL_ACCESS_XATTR,
+                          POSIX_ACL_DEFAULT_XATTR,
+                          QUOTA_LIMIT_KEY,
+                          QUOTA_LIMIT_OBJECTS_KEY,
+                          GF_SELINUX_XATTR_KEY,
+                          GF_XATTR_MDATA_KEY,
+                          NULL};
 
 void
 gf_xxh64_wrapper(const unsigned char *data, size_t const len,
@@ -302,8 +315,7 @@ mkdir_p(char *path, mode_t mode, gf_boolean_t allow_symlinks)
         dir[i] = '\0';
         ret = sys_mkdir(dir, mode);
         if (ret && errno != EEXIST) {
-            gf_msg("", GF_LOG_ERROR, errno, LG_MSG_DIR_OP_FAILED,
-                   "Failed due to reason");
+            gf_smsg("", GF_LOG_ERROR, errno, LG_MSG_DIR_OP_FAILED, NULL);
             goto out;
         }
 
@@ -314,10 +326,8 @@ mkdir_p(char *path, mode_t mode, gf_boolean_t allow_symlinks)
 
             if (S_ISLNK(stbuf.st_mode)) {
                 ret = -1;
-                gf_msg("", GF_LOG_ERROR, 0, LG_MSG_DIR_IS_SYMLINK,
-                       "%s is a "
-                       "symlink",
-                       dir);
+                gf_smsg("", GF_LOG_ERROR, 0, LG_MSG_DIR_IS_SYMLINK, "dir=%s",
+                        dir, NULL);
                 goto out;
             }
         }
@@ -330,10 +340,10 @@ mkdir_p(char *path, mode_t mode, gf_boolean_t allow_symlinks)
         if (ret == 0)
             errno = 0;
         ret = -1;
-        gf_msg("", GF_LOG_ERROR, errno, LG_MSG_DIR_OP_FAILED,
-               "Failed"
-               " to create directory, possibly some of the components"
-               " were not directories");
+        gf_smsg("", GF_LOG_ERROR, errno, LG_MSG_DIR_OP_FAILED,
+                "possibly some of the components"
+                " were not directories",
+                NULL);
         goto out;
     }
 
@@ -406,10 +416,8 @@ gf_rev_dns_lookup(const char *ip)
     /* Get the FQDN */
     ret = gf_get_hostname_from_ip((char *)ip, &fqdn);
     if (ret != 0) {
-        gf_msg("resolver", GF_LOG_INFO, errno, LG_MSG_RESOLVE_HOSTNAME_FAILED,
-               "could not resolve "
-               "hostname for %s",
-               ip);
+        gf_smsg("resolver", GF_LOG_INFO, errno, LG_MSG_RESOLVE_HOSTNAME_FAILED,
+                "hostname=%s", ip, NULL);
     }
 out:
     return fqdn;
@@ -430,7 +438,7 @@ gf_resolve_path_parent(const char *path)
 
     GF_VALIDATE_OR_GOTO(THIS->name, path, out);
 
-    if (strlen(path) <= 0) {
+    if (0 == strlen(path)) {
         gf_msg_callingfn(THIS->name, GF_LOG_DEBUG, 0, LG_MSG_INVALID_STRING,
                          "invalid string for 'path'");
         goto out;
@@ -498,9 +506,8 @@ gf_resolve_ip6(const char *hostname, uint16_t port, int family, void **dnscache,
         }
         if ((ret = getaddrinfo(hostname, port_str, &hints, &cache->first)) !=
             0) {
-            gf_msg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETADDRINFO_FAILED,
-                   "getaddrinfo failed (family:%d) (%s)", family,
-                   gai_strerror(ret));
+            gf_smsg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETADDRINFO_FAILED,
+                    "family=%d", family, "ret=%s", gai_strerror(ret), NULL);
 
             GF_FREE(*dnscache);
             *dnscache = NULL;
@@ -517,10 +524,8 @@ gf_resolve_ip6(const char *hostname, uint16_t port, int family, void **dnscache,
                           cache->next->ai_addrlen, host, sizeof(host), service,
                           sizeof(service), NI_NUMERICHOST);
         if (ret != 0) {
-            gf_msg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
-                   "getnameinfo failed"
-                   " (%s)",
-                   gai_strerror(ret));
+            gf_smsg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
+                    "ret=%s", gai_strerror(ret), NULL);
             goto err;
         }
 
@@ -539,10 +544,8 @@ gf_resolve_ip6(const char *hostname, uint16_t port, int family, void **dnscache,
                           cache->next->ai_addrlen, host, sizeof(host), service,
                           sizeof(service), NI_NUMERICHOST);
         if (ret != 0) {
-            gf_msg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
-                   "getnameinfo failed"
-                   " (%s)",
-                   gai_strerror(ret));
+            gf_smsg("resolver", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
+                    "ret=%s", gai_strerror(ret), NULL);
             goto err;
         }
 
@@ -574,12 +577,32 @@ struct dnscache *
 gf_dnscache_init(time_t ttl)
 {
     struct dnscache *cache = GF_MALLOC(sizeof(*cache), gf_common_mt_dnscache);
-    if (cache) {
-        cache->cache_dict = NULL;
+    if (!cache)
+        return NULL;
+
+    cache->cache_dict = dict_new();
+    if (!cache->cache_dict) {
+        GF_FREE(cache);
+        cache = NULL;
+    } else {
         cache->ttl = ttl;
     }
 
     return cache;
+}
+
+/**
+ * gf_dnscache_deinit -- cleanup resources used by struct dnscache
+ */
+void
+gf_dnscache_deinit(struct dnscache *cache)
+{
+    if (!cache) {
+        gf_msg_plain(GF_LOG_WARNING, "dnscache is NULL");
+        return;
+    }
+    dict_unref(cache->cache_dict);
+    GF_FREE(cache);
 }
 
 /**
@@ -630,12 +653,6 @@ gf_rev_dns_lookup_cached(const char *ip, struct dnscache *dnscache)
     if (!dnscache)
         goto out;
 
-    if (!dnscache->cache_dict) {
-        dnscache->cache_dict = dict_new();
-        if (!dnscache->cache_dict) {
-            goto out;
-        }
-    }
     cache = dnscache->cache_dict;
 
     /* Quick cache lookup to see if we already hold it */
@@ -643,7 +660,7 @@ gf_rev_dns_lookup_cached(const char *ip, struct dnscache *dnscache)
     if (entrydata) {
         dnsentry = (struct dnscache_entry *)entrydata->data;
         /* First check the TTL & timestamp */
-        if (time(NULL) - dnsentry->timestamp > dnscache->ttl) {
+        if (gf_time() - dnsentry->timestamp > dnscache->ttl) {
             gf_dnscache_entry_deinit(dnsentry);
             entrydata->data = NULL; /* Mark this as 'null' so
                                      * dict_del () doesn't try free
@@ -674,23 +691,16 @@ gf_rev_dns_lookup_cached(const char *ip, struct dnscache *dnscache)
     from_cache = _gf_false;
 out:
     /* Insert into the cache */
-    if (fqdn && !from_cache) {
+    if (fqdn && !from_cache && ip) {
         struct dnscache_entry *entry = gf_dnscache_entry_init();
 
-        if (!entry) {
-            goto out;
+        if (entry) {
+            entry->fqdn = fqdn;
+            entry->ip = gf_strdup(ip);
+            entry->timestamp = gf_time();
+            entrydata = bin_to_data(entry, sizeof(*entry));
+            dict_set(cache, (char *)ip, entrydata);
         }
-        entry->fqdn = fqdn;
-        if (!ip) {
-            gf_dnscache_entry_deinit(entry);
-            goto out;
-        }
-
-        entry->ip = gf_strdup(ip);
-        entry->timestamp = time(NULL);
-
-        entrydata = bin_to_data(entry, sizeof(*entry));
-        dict_set(cache, (char *)ip, entrydata);
     }
     return fqdn;
 }
@@ -899,7 +909,7 @@ gf_print_trace(int32_t signum, glusterfs_ctx_t *ctx)
     char msg[1024] = {
         0,
     };
-    char timestr[64] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     call_stack_t *stack = NULL;
@@ -939,7 +949,7 @@ gf_print_trace(int32_t signum, glusterfs_ctx_t *ctx)
     {
         /* Dump the timestamp of the crash too, so the previous logs
            can be related */
-        gf_time_fmt(timestr, sizeof timestr, time(NULL), gf_timefmt_FT);
+        gf_time_fmt(timestr, sizeof timestr, gf_time(), gf_timefmt_FT);
         gf_msg_plain_nomem(GF_LOG_ALERT, "time of crash: ");
         gf_msg_plain_nomem(GF_LOG_ALERT, timestr);
     }
@@ -2103,8 +2113,8 @@ get_checksum_for_path(char *path, uint32_t *checksum, int op_version)
     fd = open(path, O_RDWR);
 
     if (fd == -1) {
-        gf_msg(THIS->name, GF_LOG_ERROR, errno, LG_MSG_PATH_ERROR,
-               "Unable to open %s", path);
+        gf_smsg(THIS->name, GF_LOG_ERROR, errno, LG_MSG_PATH_OPEN_FAILED,
+                "path=%s", path, NULL);
         goto out;
     }
 
@@ -2137,8 +2147,8 @@ get_file_mtime(const char *path, time_t *stamp)
 
     ret = sys_stat(path, &f_stat);
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_ERROR, errno, LG_MSG_FILE_STAT_FAILED,
-               "failed to stat %s", path);
+        gf_smsg(THIS->name, GF_LOG_ERROR, errno, LG_MSG_FILE_STAT_FAILED,
+                "path=%s", path, NULL);
         goto out;
     }
 
@@ -2197,14 +2207,14 @@ gf_is_ip_in_net(const char *network, const char *ip_str)
     /* Convert IP address to a long */
     ret = inet_pton(family, ip_str, &ip_buf);
     if (ret < 0)
-        gf_msg("common-utils", GF_LOG_ERROR, errno, LG_MSG_INET_PTON_FAILED,
-               "inet_pton() failed");
+        gf_smsg("common-utils", GF_LOG_ERROR, errno, LG_MSG_INET_PTON_FAILED,
+                NULL);
 
     /* Convert network IP address to a long */
     ret = inet_pton(family, net_ip, &net_ip_buf);
     if (ret < 0) {
-        gf_msg("common-utils", GF_LOG_ERROR, errno, LG_MSG_INET_PTON_FAILED,
-               "inet_pton() failed");
+        gf_smsg("common-utils", GF_LOG_ERROR, errno, LG_MSG_INET_PTON_FAILED,
+                NULL);
         goto out;
     }
 
@@ -2784,8 +2794,8 @@ gf_boolean_t
 gf_sock_union_equal_addr(union gf_sock_union *a, union gf_sock_union *b)
 {
     if (!a || !b) {
-        gf_msg("common-utils", GF_LOG_ERROR, 0, LG_MSG_INVALID_ENTRY,
-               "Invalid arguments to gf_sock_union_equal_addr");
+        gf_smsg("common-utils", GF_LOG_ERROR, 0, LG_MSG_INVALID_ENTRY,
+                "gf_sock_union_equal_addr", NULL);
         return _gf_false;
     }
 
@@ -3013,8 +3023,8 @@ gf_roundup_power_of_two(int32_t nr)
     int32_t result = 1;
 
     if (nr < 0) {
-        gf_msg("common-utils", GF_LOG_WARNING, 0, LG_MSG_NEGATIVE_NUM_PASSED,
-               "negative number passed");
+        gf_smsg("common-utils", GF_LOG_WARNING, 0, LG_MSG_NEGATIVE_NUM_PASSED,
+                NULL);
         result = -1;
         goto out;
     }
@@ -3037,8 +3047,8 @@ gf_roundup_next_power_of_two(int32_t nr)
     int32_t result = 1;
 
     if (nr < 0) {
-        gf_msg("common-utils", GF_LOG_WARNING, 0, LG_MSG_NEGATIVE_NUM_PASSED,
-               "negative number passed");
+        gf_smsg("common-utils", GF_LOG_WARNING, 0, LG_MSG_NEGATIVE_NUM_PASSED,
+                NULL);
         result = -1;
         goto out;
     }
@@ -3123,7 +3133,7 @@ get_mem_size()
     memsize = page_size * num_pages;
 #endif
 
-#if defined GF_DARWIN_HOST_OS
+#if defined GF_DARWIN_HOST_OS || defined __FreeBSD__
 
     size_t len = sizeof(memsize);
     int name[] = {CTL_HW, HW_PHYSMEM};
@@ -3212,8 +3222,7 @@ gf_canonicalize_path(char *path)
 
 out:
     if (ret)
-        gf_msg("common-utils", GF_LOG_ERROR, 0, LG_MSG_PATH_ERROR,
-               "Path manipulation failed");
+        gf_smsg("common-utils", GF_LOG_ERROR, 0, LG_MSG_PATH_ERROR, NULL);
 
     GF_FREE(tmppath);
 
@@ -3267,19 +3276,15 @@ gf_get_reserved_ports()
          * continue with older method of using any of the available
          * port? For now 2nd option is considered.
          */
-        gf_msg("glusterfs", GF_LOG_WARNING, errno, LG_MSG_FILE_OP_FAILED,
-               "could not open the file "
-               "/proc/sys/net/ipv4/ip_local_reserved_ports for "
-               "getting reserved ports info");
+        gf_smsg("glusterfs", GF_LOG_WARNING, errno, LG_MSG_FILE_OP_FAILED,
+                " /proc/sys/net/ipv4/ip_local_reserved_ports", NULL);
         goto out;
     }
 
     ret = sys_read(proc_fd, buffer, sizeof(buffer) - 1);
     if (ret < 0) {
-        gf_msg("glusterfs", GF_LOG_WARNING, errno, LG_MSG_FILE_OP_FAILED,
-               "could not read the file %s for"
-               " getting reserved ports info",
-               proc_file);
+        gf_smsg("glusterfs", GF_LOG_WARNING, errno, LG_MSG_FILE_OP_FAILED,
+                "file=%s", proc_file, NULL);
         goto out;
     }
 
@@ -3307,10 +3312,8 @@ gf_process_reserved_ports(unsigned char *ports, uint32_t ceiling)
 
     ports_info = gf_get_reserved_ports();
     if (!ports_info) {
-        gf_msg("glusterfs", GF_LOG_WARNING, 0, LG_MSG_RESERVED_PORTS_ERROR,
-               "Not able to get reserved"
-               " ports, hence there is a possibility that glusterfs "
-               "may consume reserved port");
+        gf_smsg("glusterfs", GF_LOG_WARNING, 0, LG_MSG_RESERVED_PORTS_ERROR,
+                NULL);
         goto out;
     }
 
@@ -3347,8 +3350,8 @@ gf_ports_reserved(char *blocked_port, unsigned char *ports, uint32_t ceiling)
             blocked_port[strlen(blocked_port) - 1] = '\0';
         if (gf_string2int32(blocked_port, &tmp_port1) == 0) {
             if (tmp_port1 > GF_PORT_MAX || tmp_port1 < 0) {
-                gf_msg("glusterfs-socket", GF_LOG_WARNING, 0,
-                       LG_MSG_INVALID_PORT, "invalid port %d", tmp_port1);
+                gf_smsg("glusterfs-socket", GF_LOG_WARNING, 0,
+                        LG_MSG_INVALID_PORT, "port=%d", tmp_port1, NULL);
                 result = _gf_true;
                 goto out;
             } else {
@@ -3359,10 +3362,8 @@ gf_ports_reserved(char *blocked_port, unsigned char *ports, uint32_t ceiling)
                 BIT_SET(ports, tmp_port1);
             }
         } else {
-            gf_msg("glusterfs-socket", GF_LOG_WARNING, 0, LG_MSG_INVALID_PORT,
-                   "%s is not a valid port "
-                   "identifier",
-                   blocked_port);
+            gf_smsg("glusterfs-socket", GF_LOG_WARNING, 0, LG_MSG_INVALID_PORT,
+                    "port=%s", blocked_port, NULL);
             result = _gf_true;
             goto out;
         }
@@ -3464,10 +3465,8 @@ gf_get_hostname_from_ip(char *client_ip, char **hostname)
     ret = getnameinfo(client_sockaddr, addr_sz, client_hostname,
                       sizeof(client_hostname), NULL, 0, 0);
     if (ret) {
-        gf_msg("common-utils", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
-               "Could not lookup hostname "
-               "of %s : %s",
-               client_ip, gai_strerror(ret));
+        gf_smsg("common-utils", GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
+                "ip=%s", client_ip, "ret=%s", gai_strerror(ret), NULL);
         ret = -1;
         goto out;
     }
@@ -3496,8 +3495,8 @@ gf_interface_search(char *ip)
     ret = getifaddrs(&ifaddr);
 
     if (ret != 0) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETIFADDRS_FAILED,
-               "getifaddrs() failed: %s\n", gai_strerror(ret));
+        gf_smsg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETIFADDRS_FAILED, "ret=%s",
+                gai_strerror(ret), NULL);
         goto out;
     }
 
@@ -3521,10 +3520,8 @@ gf_interface_search(char *ip)
                           host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
 
         if (ret != 0) {
-            gf_msg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
-                   "getnameinfo() "
-                   "failed: %s\n",
-                   gai_strerror(ret));
+            gf_smsg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETNAMEINFO_FAILED,
+                    "ret=%s", gai_strerror(ret), NULL);
             goto out;
         }
 
@@ -3574,14 +3571,12 @@ get_ip_from_addrinfo(struct addrinfo *addr, char **ip)
             break;
 
         default:
-            gf_msg("glusterd", GF_LOG_ERROR, 0, LG_MSG_INVALID_FAMILY,
-                   "Invalid family");
+            gf_smsg("glusterd", GF_LOG_ERROR, 0, LG_MSG_INVALID_FAMILY, NULL);
             return NULL;
     }
 
     if (!inet_ntop(addr->ai_family, in_addr, buf, sizeof(buf))) {
-        gf_msg("glusterd", GF_LOG_ERROR, 0, LG_MSG_CONVERSION_FAILED,
-               "String conversion failed");
+        gf_smsg("glusterd", GF_LOG_ERROR, 0, LG_MSG_CONVERSION_FAILED, NULL);
         return NULL;
     }
 
@@ -3616,10 +3611,9 @@ gf_is_loopback_localhost(const struct sockaddr *sa, char *hostname)
 
         default:
             if (hostname)
-                gf_msg("glusterd", GF_LOG_ERROR, 0, LG_MSG_INVALID_FAMILY,
-                       "unknown "
-                       "address family %d for %s",
-                       sa->sa_family, hostname);
+                gf_smsg("glusterd", GF_LOG_ERROR, 0, LG_MSG_INVALID_FAMILY,
+                        "family=%d", sa->sa_family, "hostname=%s", hostname,
+                        NULL);
             break;
     }
 
@@ -3649,8 +3643,8 @@ gf_is_local_addr(char *hostname)
     ret = getaddrinfo(hostname, NULL, &hints, &result);
 
     if (ret != 0) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETADDRINFO_FAILED,
-               "error in getaddrinfo: %s\n", gai_strerror(ret));
+        gf_smsg(this->name, GF_LOG_ERROR, 0, LG_MSG_GETADDRINFO_FAILED,
+                "ret=%s", gai_strerror(ret), NULL);
         goto out;
     }
 
@@ -3698,15 +3692,15 @@ gf_is_same_address(char *name1, char *name2)
 
     gai_err = getaddrinfo(name1, NULL, &hints, &addr1);
     if (gai_err != 0) {
-        gf_msg(name1, GF_LOG_WARNING, 0, LG_MSG_GETADDRINFO_FAILED,
-               "error in getaddrinfo: %s\n", gai_strerror(gai_err));
+        gf_smsg(name1, GF_LOG_WARNING, 0, LG_MSG_GETADDRINFO_FAILED, "error=%s",
+                gai_strerror(gai_err), NULL);
         goto out;
     }
 
     gai_err = getaddrinfo(name2, NULL, &hints, &addr2);
     if (gai_err != 0) {
-        gf_msg(name2, GF_LOG_WARNING, 0, LG_MSG_GETADDRINFO_FAILED,
-               "error in getaddrinfo: %s\n", gai_strerror(gai_err));
+        gf_smsg(name2, GF_LOG_WARNING, 0, LG_MSG_GETADDRINFO_FAILED, "error=%s",
+                gai_strerror(gai_err), NULL);
         goto out;
     }
 
@@ -3844,8 +3838,8 @@ gf_set_volfile_server_common(cmd_args_t *cmd_args, const char *host,
              !strcmp(tmp->transport, server->transport) &&
              (tmp->port == server->port))) {
             /* Duplicate option given, log and ignore */
-            gf_msg("gluster", GF_LOG_INFO, EEXIST, LG_MSG_INVALID_ENTRY,
-                   "duplicate entry for volfile-server");
+            gf_smsg("gluster", GF_LOG_INFO, EEXIST, LG_MSG_DUPLICATE_ENTRY,
+                    NULL);
             ret = 0;
             goto out;
         }
@@ -4023,15 +4017,14 @@ gf_thread_set_vname(pthread_t thread, const char *name, va_list args)
                     sizeof(thread_name) - sizeof(GF_THREAD_NAME_PREFIX) + 1,
                     name, args);
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_PTHREAD_NAMING_FAILED,
-               "Failed to compose thread name ('%s')", name);
+        gf_smsg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_PTHREAD_NAMING_FAILED,
+                "name=%s", name, NULL);
         return;
     }
 
     if (ret >= sizeof(thread_name)) {
-        gf_msg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_PTHREAD_NAMING_FAILED,
-               "Thread name is too long. It has been truncated ('%s')",
-               thread_name);
+        gf_smsg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_THREAD_NAME_TOO_LONG,
+                "name=%s", thread_name, NULL);
     }
 
 #ifdef GF_LINUX_HOST_OS
@@ -4045,8 +4038,8 @@ gf_thread_set_vname(pthread_t thread, const char *name, va_list args)
     ret = ENOSYS;
 #endif
     if (ret != 0) {
-        gf_msg(THIS->name, GF_LOG_WARNING, ret, LG_MSG_PTHREAD_NAMING_FAILED,
-               "Could not set thread name: %s", thread_name);
+        gf_smsg(THIS->name, GF_LOG_WARNING, ret, LG_MSG_SET_THREAD_FAILED,
+                "name=%s", thread_name, NULL);
     }
 }
 
@@ -4081,8 +4074,8 @@ gf_thread_vcreate(pthread_t *thread, const pthread_attr_t *attr,
 
     ret = pthread_create(thread, attr, start_routine, arg);
     if (ret != 0) {
-        gf_msg(THIS->name, GF_LOG_ERROR, ret, LG_MSG_PTHREAD_FAILED,
-               "Thread creation failed");
+        gf_smsg(THIS->name, GF_LOG_ERROR, ret, LG_MSG_THREAD_CREATE_FAILED,
+                NULL);
         ret = -1;
     } else if (name != NULL) {
         gf_thread_set_vname(*thread, name, args);
@@ -4118,8 +4111,8 @@ gf_thread_create_detached(pthread_t *thread, void *(*start_routine)(void *),
 
     ret = pthread_attr_init(&attr);
     if (ret) {
-        gf_msg(THIS->name, GF_LOG_ERROR, ret, LG_MSG_PTHREAD_ATTR_INIT_FAILED,
-               "Thread attribute initialization failed");
+        gf_smsg(THIS->name, GF_LOG_ERROR, ret, LG_MSG_PTHREAD_ATTR_INIT_FAILED,
+                NULL);
         return -1;
     }
 
@@ -4141,8 +4134,7 @@ gf_skip_header_section(int fd, int header_len)
 
     ret = sys_lseek(fd, header_len, SEEK_SET);
     if (ret == (off_t)-1) {
-        gf_msg("", GF_LOG_ERROR, 0, LG_MSG_SKIP_HEADER_FAILED,
-               "Failed to skip header section");
+        gf_smsg("", GF_LOG_ERROR, 0, LG_MSG_SKIP_HEADER_FAILED, NULL);
     } else {
         ret = 0;
     }
@@ -4155,6 +4147,14 @@ gf_skip_header_section(int fd, int header_len)
 gf_boolean_t
 gf_is_pid_running(int pid)
 {
+#ifdef __FreeBSD__
+    int ret = -1;
+
+    ret = sys_kill(pid, 0);
+    if (ret < 0) {
+        return _gf_false;
+    }
+#else
     char fname[32] = {
         0,
     };
@@ -4168,6 +4168,7 @@ gf_is_pid_running(int pid)
     }
 
     sys_close(fd);
+#endif
     return _gf_true;
 }
 
@@ -4192,8 +4193,8 @@ gf_is_service_running(char *pidfile, int *pid)
 
     ret = fscanf(file, "%d", pid);
     if (ret <= 0) {
-        gf_msg("", GF_LOG_ERROR, errno, LG_MSG_FILE_OP_FAILED,
-               "Unable to read pidfile: %s", pidfile);
+        gf_smsg("", GF_LOG_ERROR, errno, LG_MSG_FILE_OP_FAILED, "pidfile=%s",
+                pidfile, NULL);
         *pid = -1;
         running = _gf_false;
         goto out;
@@ -4267,10 +4268,10 @@ gf_check_log_format(const char *value)
         log_format = gf_logformat_withmsgid;
 
     if (log_format == -1)
-        gf_msg(
-            THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_LOG,
-            "Invalid log-format. possible values are " GF_LOG_FORMAT_NO_MSG_ID
-            "|" GF_LOG_FORMAT_WITH_MSG_ID);
+        gf_smsg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_LOG,
+                "possible_values=" GF_LOG_FORMAT_NO_MSG_ID
+                "|" GF_LOG_FORMAT_WITH_MSG_ID,
+                NULL);
 
     return log_format;
 }
@@ -4286,9 +4287,9 @@ gf_check_logger(const char *value)
         logger = gf_logger_syslog;
 
     if (logger == -1)
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_LOG,
-               "Invalid logger. possible values are " GF_LOGGER_GLUSTER_LOG
-               "|" GF_LOGGER_SYSLOG);
+        gf_smsg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_LOG,
+                "possible_values=" GF_LOGGER_GLUSTER_LOG "|" GF_LOGGER_SYSLOG,
+                NULL);
 
     return logger;
 }
@@ -4360,8 +4361,8 @@ gf_set_timestamp(const char *src, const char *dest)
 
     ret = sys_stat(src, &sb);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, LG_MSG_FILE_STAT_FAILED,
-               "stat on %s", src);
+        gf_smsg(this->name, GF_LOG_ERROR, errno, LG_MSG_FILE_STAT_FAILED,
+                "stat=%s", src, NULL);
         goto out;
     }
     /* The granularity is nano seconds if `utimensat()` is available,
@@ -4377,8 +4378,8 @@ gf_set_timestamp(const char *src, const char *dest)
     /* dirfd = 0 is ignored because `dest` is an absolute path. */
     ret = sys_utimensat(AT_FDCWD, dest, new_time, AT_SYMLINK_NOFOLLOW);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, LG_MSG_UTIMENSAT_FAILED,
-               "utimensat on %s", dest);
+        gf_smsg(this->name, GF_LOG_ERROR, errno, LG_MSG_UTIMENSAT_FAILED,
+                "dest=%s", dest, NULL);
     }
 #else
     new_time[0].tv_sec = sb.st_atime;
@@ -4389,8 +4390,8 @@ gf_set_timestamp(const char *src, const char *dest)
 
     ret = sys_utimes(dest, new_time);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, LG_MSG_UTIMES_FAILED,
-               "utimes on %s", dest);
+        gf_smsg(this->name, GF_LOG_ERROR, errno, LG_MSG_UTIMES_FAILED,
+                "dest=%s", dest, NULL);
     }
 #endif
 out:
@@ -4409,7 +4410,7 @@ gf_backtrace_end(char *buf, size_t frames)
 
     frames = min(frames, GF_BACKTRACE_LEN - pos - 1);
 
-    if (frames <= 0)
+    if (0 == frames)
         return;
 
     memset(buf + pos, ')', frames);
@@ -4455,8 +4456,8 @@ gf_backtrace_fillframes(char *buf)
      */
     ret = sys_unlink(tmpl);
     if (ret < 0) {
-        gf_msg(THIS->name, GF_LOG_INFO, 0, LG_MSG_FILE_OP_FAILED,
-               "Unable to delete temporary file: %s", tmpl);
+        gf_smsg(THIS->name, GF_LOG_INFO, 0, LG_MSG_FILE_DELETE_FAILED,
+                "temporary_file=%s", tmpl, NULL);
     }
 
     /*The most recent two frames are the calling function and
@@ -4516,8 +4517,7 @@ gf_backtrace_save(char *buf)
     if ((0 == gf_backtrace_fillframes(bt)))
         return bt;
 
-    gf_msg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_BACKTRACE_SAVE_FAILED,
-           "Failed to save the backtrace.");
+    gf_smsg(THIS->name, GF_LOG_WARNING, 0, LG_MSG_BACKTRACE_SAVE_FAILED, NULL);
     return NULL;
 }
 
@@ -4608,16 +4608,16 @@ gf_build_absolute_path(char *current_path, char *relative_path, char **path)
      */
     currentpath_len = strlen(current_path);
     if (current_path[0] != '/' || (currentpath_len > PATH_MAX)) {
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_ENTRY,
-               "Wrong value for current path %s", current_path);
+        gf_smsg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_WRONG_VALUE,
+                "current-path=%s", current_path, NULL);
         ret = -EINVAL;
         goto err;
     }
 
     relativepath_len = strlen(relative_path);
     if (relative_path[0] == '/' || (relativepath_len > PATH_MAX)) {
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_ENTRY,
-               "Wrong value for relative path %s", relative_path);
+        gf_smsg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_WRONG_VALUE,
+                "relative-path=%s", relative_path, NULL);
         ret = -EINVAL;
         goto err;
     }
@@ -4733,8 +4733,9 @@ recursive_rmdir(const char *delete_path)
         goto out;
     }
 
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
-    while (entry) {
+    while ((entry = sys_readdir(dir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         snprintf(path, PATH_MAX, "%s/%s", delete_path, entry->d_name);
         ret = sys_lstat(path, &st);
         if (ret == -1) {
@@ -4760,8 +4761,6 @@ recursive_rmdir(const char *delete_path)
 
         gf_msg_debug(this->name, 0, "%s %s",
                      ret ? "Failed to remove" : "Removed", entry->d_name);
-
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scratch);
     }
 
     ret = sys_closedir(dir);
@@ -5440,4 +5439,27 @@ gf_nanosleep(uint64_t nsec)
     } while (ret == -1 && errno == EINTR);
 
     return ret;
+}
+
+int
+gf_syncfs(int fd)
+{
+    int ret = 0;
+#if defined(HAVE_SYNCFS)
+    /* Linux with glibc recent enough. */
+    ret = syncfs(fd);
+#elif defined(HAVE_SYNCFS_SYS)
+    /* Linux with no library function. */
+    ret = syscall(SYS_syncfs, fd);
+#else
+    /* Fallback to generic UNIX stuff. */
+    sync();
+#endif
+    return ret;
+}
+
+char **
+get_xattrs_to_heal()
+{
+    return xattrs_to_heal;
 }

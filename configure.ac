@@ -164,6 +164,8 @@ AC_CONFIG_FILES([Makefile
                 xlators/features/cloudsync/src/cloudsync-plugins/src/cloudsyncs3/src/Makefile
                 xlators/features/cloudsync/src/cloudsync-plugins/src/cvlt/Makefile
                 xlators/features/cloudsync/src/cloudsync-plugins/src/cvlt/src/Makefile
+                xlators/features/metadisp/Makefile
+                xlators/features/metadisp/src/Makefile
                 xlators/playground/Makefile
                 xlators/playground/template/Makefile
                 xlators/playground/template/src/Makefile
@@ -273,36 +275,78 @@ AC_ARG_ENABLE([debug],
                              [Enable debug build options.]))
 if test "x$enable_debug" = "xyes"; then
         BUILD_DEBUG=yes
-        GF_CFLAGS="${GF_CFLAGS} -g -rdynamic -O0 -DDEBUG"
+        GF_CFLAGS="${GF_CFLAGS} -g -O0 -DDEBUG"
 else
         BUILD_DEBUG=no
 fi
+
+SANITIZER=none
 
 AC_ARG_ENABLE([asan],
               AC_HELP_STRING([--enable-asan],
                              [Enable Address Sanitizer support]))
 if test "x$enable_asan" = "xyes"; then
-        BUILD_ASAN=yes
-        AC_CHECK_LIB([asan], [__asan_report_error], ,
-                [AC_MSG_ERROR([libasan.so not found, this is required for --enable-asan])])
-        GF_CFLAGS="${GF_CFLAGS} -O1 -g -fsanitize=address -fno-omit-frame-pointer"
-        dnl -lasan always need to be the first library, otherwise libxml complains
-        GF_LDFLAGS="-lasan ${GF_LDFLAGS}"
-else
-        BUILD_ASAN=no
+        SANITIZER=asan
+        AC_CHECK_LIB([asan], [__asan_init], ,
+                [AC_MSG_ERROR([--enable-asan requires libasan.so, exiting])])
+        GF_CFLAGS="${GF_CFLAGS} -O2 -g -fsanitize=address -fno-omit-frame-pointer"
+        GF_LDFLAGS="${GF_LDFLAGS} -lasan"
 fi
 
-AC_ARG_ENABLE([atan],
+AC_ARG_ENABLE([tsan],
               AC_HELP_STRING([--enable-tsan],
-                             [Enable ThreadSanitizer support]))
+                             [Enable Thread Sanitizer support]))
 if test "x$enable_tsan" = "xyes"; then
-        BUILD_TSAN=yes
+        if test "x$SANITIZER" != "xnone"; then
+                AC_MSG_ERROR([only one sanitizer can be enabled at once])
+        fi
+        SANITIZER=tsan
         AC_CHECK_LIB([tsan], [__tsan_init], ,
-                [AC_MSG_ERROR([libtsan.so not found, this is required for --enable-tsan])])
-        GF_CFLAGS="${GF_CFLAGS} -O2 -g -fsanitize=thread"
+                [AC_MSG_ERROR([--enable-tsan requires libtsan.so, exiting])])
+        if test "x$ac_cv_lib_tsan___tsan_init" = xyes; then
+                AC_MSG_CHECKING([whether tsan API can be used])
+                saved_CFLAGS=${CFLAGS}
+                CFLAGS="${CFLAGS} -fsanitize=thread"
+                AC_COMPILE_IFELSE(
+                [AC_LANG_PROGRAM([
+                   [#include <sanitizer/tsan_interface.h>]],
+                   [[__tsan_create_fiber(0)]])],
+                   [TSAN_API=yes], [TSAN_API=no])
+                AC_MSG_RESULT([$TSAN_API])
+                if test x$TSAN_API = "xyes"; then
+                   AC_DEFINE(HAVE_TSAN_API, 1, [Define if tsan API can be used.])
+                fi
+                CFLAGS=${saved_CFLAGS}
+        fi
+        GF_CFLAGS="${GF_CFLAGS} -O2 -g -fsanitize=thread -fno-omit-frame-pointer"
         GF_LDFLAGS="${GF_LDFLAGS} -ltsan"
-else
-        BUILD_TSAN=no
+fi
+
+AC_ARG_ENABLE([ubsan],
+              AC_HELP_STRING([--enable-ubsan],
+                             [Enable Undefined Behavior Sanitizer support]))
+if test "x$enable_ubsan" = "xyes"; then
+        if test "x$SANITIZER" != "xnone"; then
+                AC_MSG_ERROR([only one sanitizer can be enabled at once])
+        fi
+        SANITIZER=ubsan
+        AC_CHECK_LIB([ubsan], [__ubsan_default_options], ,
+                [AC_MSG_ERROR([--enable-ubsan requires libubsan.so, exiting])])
+        GF_CFLAGS="${GF_CFLAGS} -O2 -g -fsanitize=undefined -fno-omit-frame-pointer"
+        GF_LDFLAGS="${GF_LDFLAGS} -lubsan"
+fi
+
+# Initialize CFLAGS before usage
+BUILD_TCMALLOC=no
+AC_ARG_ENABLE([tcmalloc],
+              AC_HELP_STRING([--enable-tcmalloc],
+                             [Enable linking with tcmalloc library.]))
+if test "x$enable_tcmalloc" = "xyes"; then
+    BUILD_TCMALLOC=yes
+    GF_CFLAGS="${GF_CFLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free"
+    AC_CHECK_LIB([tcmalloc], [malloc], [],
+                 [AC_MSG_ERROR([when --enable-tcmalloc is used, tcmalloc library needs to be present])])
+    GF_LDFLAGS="-ltcmalloc ${GF_LDFLAGS}"
 fi
 
 
@@ -365,12 +409,27 @@ esac
 
 # --enable-valgrind prevents calling dlclose(), this leaks memory
 AC_ARG_ENABLE([valgrind],
-              AC_HELP_STRING([--enable-valgrind],
-                             [Enable valgrind for resource leak debugging.]))
-if test "x$enable_valgrind" = "xyes"; then
-        AC_DEFINE(RUN_WITH_VALGRIND, 1, [define if all processes should run under valgrind])
-fi
-
+              AC_HELP_STRING([--enable-valgrind@<:@=memcheck,drd@:>@],
+                             [Enable valgrind for resource leak (memcheck, which is
+                              the default) or thread synchronization (drd) debugging.]))
+case x$enable_valgrind in
+  xmemcheck|xyes)
+    AC_DEFINE(RUN_WITH_MEMCHECK, 1,
+              [Define if all processes should run under 'valgrind --tool=memcheck'.])
+    VALGRIND_TOOL=memcheck
+    ;;
+  xdrd)
+    AC_DEFINE(RUN_WITH_DRD, 1,
+              [Define if all processes should run under 'valgrind --tool=drd'.])
+    VALGRIND_TOOL=drd
+    ;;
+  x|xno)
+    VALGRIND_TOOL=no
+    ;;
+  *)
+    AC_MSG_ERROR([Please specify --enable-valgrind@<:@=memcheck,drd@:>@])
+    ;;
+esac
 
 AC_ARG_WITH([previous-options],
         [AS_HELP_STRING([--with-previous-options],
@@ -671,6 +730,14 @@ if test "x$enable_fuse_client" != "xno"; then
 fi
 
 AC_SUBST(FUSE_CLIENT_SUBDIR)
+
+AC_ARG_ENABLE([fuse-notifications],
+  AS_HELP_STRING([--disable-fuse-notifications], [Disable FUSE notifications]))
+
+AS_IF([test "x$enable_fuse_notifications" != "xno"], [
+  AC_DEFINE([HAVE_FUSE_NOTIFICATIONS], [1], [Use FUSE notifications])
+])
+
 # end FUSE section
 
 
@@ -718,6 +785,9 @@ AC_ARG_ENABLE([georeplication],
 
 BUILD_SYNCDAEMON=no
 case $host_os in
+     freebsd*)
+#do nothing
+       ;;
      linux*)
 #do nothing
        ;;
@@ -756,6 +826,17 @@ if test "x${with_server}" = "xyes" -a "x$enable_georeplication" != "xno"; then
 fi
 AC_SUBST(GEOREP_EXTRAS_SUBDIR)
 AM_CONDITIONAL(USE_GEOREP, test "x$enable_georeplication" != "xno")
+
+# METADISP section
+AC_ARG_ENABLE([metadisp],
+              AC_HELP_STRING([--enable-metadisp],
+                             [Enable the metadata dispersal xlator]))
+BUILD_METADISP=no
+if test "x${enable_metadisp}" = "xyes"; then
+  BUILD_METADISP=yes
+fi
+AM_CONDITIONAL([BUILD_METADISP], [test "x$BUILD_METADISP" = "xyes"])
+# end METADISP section
 
 # Events section
 AC_ARG_ENABLE([events],
@@ -895,6 +976,25 @@ if test "x${have_backtrace}" = "xyes"; then
 fi
 AC_SUBST(HAVE_BACKTRACE)
 
+dnl Old (before C11) compiler can compile (but not link) this:
+dnl
+dnl int main () {
+dnl     _Static_assert(1, "True");
+dnl     return 0;
+dnl }
+dnl
+dnl assuming that _Static_assert is an implicitly declared function. So
+dnl we're trying to link just to make sure that this is not the case.
+
+AC_MSG_CHECKING([whether $CC supports C11 _Static_assert])
+AC_TRY_LINK([], [_Static_assert(1, "True");],
+            [STATIC_ASSERT=yes], [STATIC_ASSERT=no])
+
+AC_MSG_RESULT([$STATIC_ASSERT])
+if test x$STATIC_ASSERT = "xyes"; then
+   AC_DEFINE(HAVE_STATIC_ASSERT, 1, [Define if C11 _Static_assert is supported.])
+fi
+
 if test "x${have_backtrace}" != "xyes"; then
 AC_TRY_COMPILE([#include <math.h>], [double x=0.0; x=ceil(0.0);],
    [],
@@ -902,11 +1002,11 @@ AC_TRY_COMPILE([#include <math.h>], [double x=0.0; x=ceil(0.0);],
 fi
 
 dnl glusterfs prints memory usage to stderr by sending it SIGUSR1
-AC_CHECK_FUNC([malloc_stats], [have_malloc_stats=yes])
-if test "x${have_malloc_stats}" = "xyes"; then
-   AC_DEFINE(HAVE_MALLOC_STATS, 1, [define if found malloc_stats])
+AC_CHECK_FUNC([mallinfo], [have_mallinfo=yes])
+if test "x${have_mallinfo}" = "xyes"; then
+   AC_DEFINE(HAVE_MALLINFO, 1, [define if found mallinfo])
 fi
-AC_SUBST(HAVE_MALLOC_STATS)
+AC_SUBST(HAVE_MALLINFO)
 
 dnl Linux, Solaris, Cygwin
 AC_CHECK_MEMBERS([struct stat.st_atim.tv_nsec])
@@ -931,6 +1031,9 @@ dnl check for argp, FreeBSD has the header in /usr/local/include
 case $host_os in
     *freebsd*)
     CFLAGS="${CFLAGS} -isystem /usr/local/include"
+    ARGP_LDADD=-largp
+    ;;
+    *netbsd*)
     ARGP_LDADD=-largp
     ;;
 esac
@@ -998,6 +1101,19 @@ else
    AC_CHECK_DECL([SYS_copy_file_range], , , [#include <sys/syscall.h>])
    if test "x${ac_cv_have_decl_SYS_copy_file_range}" = "xyes"; then
       AC_DEFINE(HAVE_COPY_FILE_RANGE_SYS, 1, [define if SYS_copy_file_range is available])
+   fi
+   CFLAGS=${OLD_CFLAGS}
+fi
+
+AC_CHECK_FUNC([syncfs], [have_syncfs=yes])
+if test "x${have_syncfs}" = "xyes"; then
+   AC_DEFINE(HAVE_SYNCFS, 1, [define if syncfs exists])
+else
+   OLD_CFLAGS=${CFLAGS}
+   CFLAGS="-D_GNU_SOURCE"
+   AC_CHECK_DECL([SYS_syncfs], , , [#include <sys/syscall.h>])
+   if test "x${ac_cv_have_decl_SYS_syncfs}" = "xyes"; then
+      AC_DEFINE(HAVE_SYNCFS_SYS, 1, [define if SYS_syncfs is available])
    fi
    CFLAGS=${OLD_CFLAGS}
 fi
@@ -1194,10 +1310,6 @@ case $host_os in
         ;;
      *freebsd*)
         GF_HOST_OS="GF_BSD_HOST_OS"
-        GF_CFLAGS="${GF_CFLAGS} -O0"
-        GF_CFLAGS="${GF_CFLAGS} -DTHREAD_UNSAFE_BASENAME"
-        GF_CFLAGS="${GF_CFLAGS} -DTHREAD_UNSAFE_DIRNAME"
-        GF_CFLAGS="${GF_CFLAGS} -D_LIBGEN_H_"
         GF_CFLAGS="${GF_CFLAGS} -DO_DSYNC=0"
         GF_CFLAGS="${GF_CFLAGS} -Dxdr_quad_t=xdr_longlong_t"
         GF_CFLAGS="${GF_CFLAGS} -Dxdr_u_quad_t=xdr_u_longlong_t"
@@ -1317,6 +1429,7 @@ AC_ARG_ENABLE([gnfs],
                              [Enable legacy gnfs server xlator.]))
 if test "x${with_server}" = "xyes" -a "x$enable_gnfs" = "xyes"; then
     BUILD_GNFS="yes"
+    GF_CFLAGS="$GF_CFLAGS -DBUILD_GNFS"
     RPCBIND_SERVICE="rpcbind.service"
 fi
 AM_CONDITIONAL([BUILD_GNFS], [test x$BUILD_GNFS = xyes])
@@ -1477,9 +1590,9 @@ case $host_os in
     ;;
 esac
 dnl GF_XLATOR_DEFAULT_LDFLAGS is for most xlators that expose a common set of symbols
-GF_XLATOR_DEFAULT_LDFLAGS='-avoid-version -export-symbols $(top_srcdir)/xlators/xlator.sym $(UUID_LIBS) $(GF_NO_UNDEFINED)'
+GF_XLATOR_DEFAULT_LDFLAGS='-avoid-version -export-symbols $(top_srcdir)/xlators/xlator.sym $(UUID_LIBS) $(GF_NO_UNDEFINED) $(TIRPC_LIBS)'
 dnl GF_XLATOR_LDFLAGS is for xlators that expose extra symbols, e.g. dht
-GF_XLATOR_LDFLAGS='-avoid-version $(UUID_LIBS) $(GF_NO_UNDEFINED)'
+GF_XLATOR_LDFLAGS='-avoid-version $(UUID_LIBS) $(GF_NO_UNDEFINED) $(TIRPC_LIBS)'
 
 AC_SUBST(GF_HOST_OS)
 AC_SUBST(GF_CFLAGS)
@@ -1494,6 +1607,13 @@ AC_SUBST(AM_LIBTOOLFLAGS)
 AC_SUBST(GF_NO_UNDEFINED)
 AC_SUBST(GF_XLATOR_DEFAULT_LDFLAGS)
 AC_SUBST(GF_XLATOR_LDFLAGS)
+AC_SUBST(GF_XLATOR_MGNT_LIBADD)
+
+case $host_os in
+     *freebsd*)
+        GF_XLATOR_MGNT_LIBADD="-lutil -lprocstat"
+        ;;
+esac
 
 CONTRIBDIR='$(top_srcdir)/contrib'
 AC_SUBST(CONTRIBDIR)
@@ -1565,8 +1685,8 @@ echo "readline             : $BUILD_READLINE"
 echo "georeplication       : $BUILD_SYNCDAEMON"
 echo "Linux-AIO            : $BUILD_LIBAIO"
 echo "Enable Debug         : $BUILD_DEBUG"
-echo "Enable ASAN          : $BUILD_ASAN"
-echo "Enable TSAN          : $BUILD_TSAN"
+echo "Run with Valgrind    : $VALGRIND_TOOL"
+echo "Sanitizer enabled    : $SANITIZER"
 echo "Use syslog           : $USE_SYSLOG"
 echo "XML output           : $BUILD_XML_OUTPUT"
 echo "Unit Tests           : $BUILD_UNITTEST"
@@ -1584,16 +1704,14 @@ echo "IPV6 default         : $with_ipv6_default"
 echo "Use TIRPC            : $with_libtirpc"
 echo "With Python          : ${PYTHON_VERSION}"
 echo "Cloudsync            : $BUILD_CLOUDSYNC"
+echo "Metadata dispersal   : $BUILD_METADISP"
+echo "Link with TCMALLOC   : $BUILD_TCMALLOC"
 echo
 
-if test "x$BUILD_ASAN" = "xyes"; then
-    echo "### Run below command before executing your tests if your system"
-    echo "### has 'gcc --version' above 7.x (works on Fedora 27 and Above)"
-    echo "export ASAN_OPTIONS=log_path=/var/log/glusterfs/asan-output.log"
-    echo ""
-    echo "### Above is required to get details of asan run, as glusterfs"
-    echo "### processes are daemon processes. Further details and more"
-    echo "### options can be found under 'Run-time flags' at"
-    echo "### https://github.com/google/sanitizers/wiki/AddressSanitizerFlags"
-    echo
+# dnl Note: ${X^^} capitalization assumes bash >= 4.x
+if test "x$SANITIZER" != "xnone"; then
+        echo "Note: since glusterfs processes are daemon processes, use"
+        echo "'export ${SANITIZER^^}_OPTIONS=log_path=/path/to/xxx.log' to collect"
+        echo "sanitizer output. Further details and more options can be"
+        echo "found at https://github.com/google/sanitizers."
 fi

@@ -22,6 +22,7 @@
 #include "changelog-encoders.h"
 #include "changelog-rpc-common.h"
 #include <pthread.h>
+#include <time.h>
 
 static void
 changelog_cleanup_free_mutex(void *arg_mutex)
@@ -41,16 +42,15 @@ changelog_thread_cleanup(xlator_t *this, pthread_t thr_id)
     /* send a cancel request to the thread */
     ret = pthread_cancel(thr_id);
     if (ret != 0) {
-        gf_msg(this->name, GF_LOG_ERROR, errno,
-               CHANGELOG_MSG_PTHREAD_CANCEL_FAILED, "could not cancel thread");
+        gf_smsg(this->name, GF_LOG_ERROR, errno,
+                CHANGELOG_MSG_PTHREAD_CANCEL_FAILED, NULL);
         goto out;
     }
 
     ret = pthread_join(thr_id, &retval);
     if ((ret != 0) || (retval != PTHREAD_CANCELED)) {
-        gf_msg(this->name, GF_LOG_ERROR, errno,
-               CHANGELOG_MSG_PTHREAD_CANCEL_FAILED,
-               "cancel request not adhered as expected");
+        gf_smsg(this->name, GF_LOG_ERROR, errno,
+                CHANGELOG_MSG_PTHREAD_CANCEL_FAILED, NULL);
     }
 
 out:
@@ -242,8 +242,7 @@ changelog_write(int fd, char *buffer, size_t len)
 }
 
 int
-htime_update(xlator_t *this, changelog_priv_t *priv, unsigned long ts,
-             char *buffer)
+htime_update(xlator_t *this, changelog_priv_t *priv, time_t ts, char *buffer)
 {
     char changelog_path[PATH_MAX + 1] = {
         0,
@@ -273,7 +272,7 @@ htime_update(xlator_t *this, changelog_priv_t *priv, unsigned long ts,
         goto out;
     }
 
-    len = snprintf(x_value, sizeof(x_value), "%lu:%d", ts,
+    len = snprintf(x_value, sizeof(x_value), "%ld:%d", ts,
                    priv->rollover_count);
     if (len >= sizeof(x_value)) {
         ret = -1;
@@ -325,15 +324,15 @@ cl_is_empty(xlator_t *this, int fd)
 
     ret = sys_fstat(fd, &stbuf);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSTAT_OP_FAILED,
-               "Could not stat (CHANGELOG)");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSTAT_OP_FAILED,
+                NULL);
         goto out;
     }
 
     ret = sys_lseek(fd, 0, SEEK_SET);
     if (ret == -1) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_LSEEK_OP_FAILED,
-               "Could not lseek (CHANGELOG)");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_LSEEK_OP_FAILED,
+                NULL);
         goto out;
     }
 
@@ -369,8 +368,8 @@ update_path(xlator_t *this, char *cl_path)
     found = strstr(cl_path, up_cl);
 
     if (found == NULL) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_LSEEK_OP_FAILED,
-               "Could not find CHANGELOG in changelog path");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_PATH_NOT_FOUND,
+                NULL);
         goto out;
     } else {
         memcpy(found, low_cl, sizeof(low_cl) - 1);
@@ -382,16 +381,20 @@ out:
 }
 
 static int
-changelog_rollover_changelog(xlator_t *this, changelog_priv_t *priv,
-                             unsigned long ts)
+changelog_rollover_changelog(xlator_t *this, changelog_priv_t *priv, time_t ts)
 {
     int ret = -1;
     int notify = 0;
     int cl_empty_flag = 0;
+    struct tm *gmt;
+    char yyyymmdd[40];
     char ofile[PATH_MAX] = {
         0,
     };
     char nfile[PATH_MAX] = {
+        0,
+    };
+    char nfile_dir[PATH_MAX] = {
         0,
     };
     changelog_event_t ev = {
@@ -401,26 +404,31 @@ changelog_rollover_changelog(xlator_t *this, changelog_priv_t *priv,
     if (priv->changelog_fd != -1) {
         ret = sys_fsync(priv->changelog_fd);
         if (ret < 0) {
-            gf_msg(this->name, GF_LOG_ERROR, errno,
-                   CHANGELOG_MSG_FSYNC_OP_FAILED, "fsync failed");
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    CHANGELOG_MSG_FSYNC_OP_FAILED, NULL);
         }
         ret = cl_is_empty(this, priv->changelog_fd);
         if (ret == 1) {
             cl_empty_flag = 1;
         } else if (ret == -1) {
             /* Log error but proceed as usual */
-            gf_msg(this->name, GF_LOG_WARNING, 0,
-                   CHANGELOG_MSG_DETECT_EMPTY_CHANGELOG_FAILED,
-                   "Error detecting empty changelog");
+            gf_smsg(this->name, GF_LOG_WARNING, 0,
+                    CHANGELOG_MSG_DETECT_EMPTY_CHANGELOG_FAILED, NULL);
         }
         sys_close(priv->changelog_fd);
         priv->changelog_fd = -1;
     }
 
+    /* Get GMT time. */
+    gmt = gmtime(&ts);
+
+    strftime(yyyymmdd, sizeof(yyyymmdd), "%Y/%m/%d", gmt);
+
     (void)snprintf(ofile, PATH_MAX, "%s/" CHANGELOG_FILE_NAME,
                    priv->changelog_dir);
-    (void)snprintf(nfile, PATH_MAX, "%s/" CHANGELOG_FILE_NAME ".%lu",
-                   priv->changelog_dir, ts);
+    (void)snprintf(nfile, PATH_MAX, "%s/%s/" CHANGELOG_FILE_NAME ".%ld",
+                   priv->changelog_dir, yyyymmdd, ts);
+    (void)snprintf(nfile_dir, PATH_MAX, "%s/%s", priv->changelog_dir, yyyymmdd);
 
     if (cl_empty_flag == 1) {
         ret = sys_unlink(ofile);
@@ -433,6 +441,19 @@ changelog_rollover_changelog(xlator_t *this, changelog_priv_t *priv,
         }
     } else {
         ret = sys_rename(ofile, nfile);
+
+        /* Changelog file rename gets ENOENT when parent dir doesn't exist */
+        if (errno == ENOENT) {
+            ret = mkdir_p(nfile_dir, 0600, _gf_true);
+
+            if ((ret == -1) && (EEXIST != errno)) {
+                gf_smsg(this->name, GF_LOG_ERROR, errno,
+                        CHANGELOG_MSG_MKDIR_ERROR, "%s", nfile_dir, NULL);
+                goto out;
+            }
+
+            ret = sys_rename(ofile, nfile);
+        }
 
         if (ret && (errno == ENOENT)) {
             ret = 0;
@@ -479,10 +500,8 @@ out:
         {
             if (ret) {
                 priv->bn.bnotify_error = _gf_true;
-                gf_msg(this->name, GF_LOG_ERROR, 0,
-                       CHANGELOG_MSG_EXPLICIT_ROLLOVER_FAILED,
-                       "Fail snapshot because of "
-                       "previous errors");
+                gf_smsg(this->name, GF_LOG_ERROR, 0,
+                        CHANGELOG_MSG_EXPLICIT_ROLLOVER_FAILED, NULL);
             } else {
                 gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_BNOTIFY_INFO,
                         "changelog=%s", nfile, NULL);
@@ -531,8 +550,8 @@ find_current_htime(int ht_dir_fd, const char *ht_dir_path, char *ht_file_bname)
 
     cnt = scandir(ht_dir_path, &namelist, filter_cur_par_dirs, alphasort);
     if (cnt < 0) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_SCAN_DIR_FAILED,
-               "scandir failed");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_SCAN_DIR_FAILED,
+                NULL);
     } else if (cnt > 0) {
         if (snprintf(ht_file_bname, NAME_MAX, "%s",
                      namelist[cnt - 1]->d_name) >= NAME_MAX) {
@@ -541,16 +560,15 @@ find_current_htime(int ht_dir_fd, const char *ht_dir_path, char *ht_file_bname)
         }
         if (sys_fsetxattr(ht_dir_fd, HTIME_CURRENT, ht_file_bname,
                           strlen(ht_file_bname), 0)) {
-            gf_msg(this->name, GF_LOG_ERROR, errno,
-                   CHANGELOG_MSG_FSETXATTR_FAILED,
-                   "fsetxattr failed: HTIME_CURRENT");
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    CHANGELOG_MSG_FSETXATTR_FAILED, "HTIME_CURRENT", NULL);
             ret = -1;
             goto out;
         }
 
         if (sys_fsync(ht_dir_fd) < 0) {
-            gf_msg(this->name, GF_LOG_ERROR, errno,
-                   CHANGELOG_MSG_FSYNC_OP_FAILED, "fsync failed");
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    CHANGELOG_MSG_FSYNC_OP_FAILED, NULL);
             ret = -1;
             goto out;
         }
@@ -571,7 +589,7 @@ out:
  * returns -1 on failure or error
  */
 int
-htime_open(xlator_t *this, changelog_priv_t *priv, unsigned long ts)
+htime_open(xlator_t *this, changelog_priv_t *priv, time_t ts)
 {
     int ht_file_fd = -1;
     int ht_dir_fd = -1;
@@ -701,7 +719,7 @@ out:
  * returns -1 on failure or error
  */
 int
-htime_create(xlator_t *this, changelog_priv_t *priv, unsigned long ts)
+htime_create(xlator_t *this, changelog_priv_t *priv, time_t ts)
 {
     int ht_file_fd = -1;
     int ht_dir_fd = -1;
@@ -719,12 +737,12 @@ htime_create(xlator_t *this, changelog_priv_t *priv, unsigned long ts)
     int32_t len = 0;
 
     gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_NEW_HTIME_FILE,
-            "name=%lu", ts, NULL);
+            "name=%ld", ts, NULL);
 
     CHANGELOG_FILL_HTIME_DIR(priv->changelog_dir, ht_dir_path);
 
     /* get the htime file name in ht_file_path */
-    len = snprintf(ht_file_path, PATH_MAX, "%s/%s.%lu", ht_dir_path,
+    len = snprintf(ht_file_path, PATH_MAX, "%s/%s.%ld", ht_dir_path,
                    HTIME_FILE_NAME, ts);
     if ((len < 0) || (len >= PATH_MAX)) {
         ret = -1;
@@ -743,16 +761,16 @@ htime_create(xlator_t *this, changelog_priv_t *priv, unsigned long ts)
 
     if (sys_fsetxattr(ht_file_fd, HTIME_KEY, HTIME_INITIAL_VALUE,
                       sizeof(HTIME_INITIAL_VALUE) - 1, 0)) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSETXATTR_FAILED,
-               "Htime xattr initialization failed");
+        gf_smsg(this->name, GF_LOG_ERROR, errno,
+                CHANGELOG_MSG_XATTR_INIT_FAILED, NULL);
         ret = -1;
         goto out;
     }
 
     ret = sys_fsync(ht_file_fd);
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSYNC_OP_FAILED,
-               "fsync failed");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSYNC_OP_FAILED,
+                NULL);
         goto out;
     }
 
@@ -770,21 +788,20 @@ htime_create(xlator_t *this, changelog_priv_t *priv, unsigned long ts)
         goto out;
     }
 
-    (void)snprintf(ht_file_bname, sizeof(ht_file_bname), "%s.%lu",
+    (void)snprintf(ht_file_bname, sizeof(ht_file_bname), "%s.%ld",
                    HTIME_FILE_NAME, ts);
     if (sys_fsetxattr(ht_dir_fd, HTIME_CURRENT, ht_file_bname,
                       strlen(ht_file_bname), 0)) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSETXATTR_FAILED,
-               "fsetxattr failed:"
-               " HTIME_CURRENT");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSETXATTR_FAILED,
+                " HTIME_CURRENT", NULL);
         ret = -1;
         goto out;
     }
 
     ret = sys_fsync(ht_dir_fd);
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSYNC_OP_FAILED,
-               "fsync failed");
+        gf_smsg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_FSYNC_OP_FAILED,
+                NULL);
         goto out;
     }
 
@@ -870,8 +887,8 @@ changelog_snap_logging_start(xlator_t *this, changelog_priv_t *priv)
     int ret = 0;
 
     ret = changelog_snap_open(this, priv);
-    gf_msg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_SNAP_INFO,
-           "Now starting to log in call path");
+    gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_SNAP_INFO, "starting",
+            NULL);
 
     return ret;
 }
@@ -891,8 +908,8 @@ changelog_snap_logging_stop(xlator_t *this, changelog_priv_t *priv)
     sys_close(priv->c_snap_fd);
     priv->c_snap_fd = -1;
 
-    gf_msg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_SNAP_INFO,
-           "Stopped to log in call path");
+    gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_SNAP_INFO, "Stopped",
+            NULL);
 
     return ret;
 }
@@ -942,8 +959,8 @@ out:
 }
 
 int
-changelog_start_next_change(xlator_t *this, changelog_priv_t *priv,
-                            unsigned long ts, gf_boolean_t finale)
+changelog_start_next_change(xlator_t *this, changelog_priv_t *priv, time_t ts,
+                            gf_boolean_t finale)
 {
     int ret = -1;
 
@@ -964,21 +981,12 @@ changelog_entry_length()
     return sizeof(changelog_log_data_t);
 }
 
-int
+void
 changelog_fill_rollover_data(changelog_log_data_t *cld, gf_boolean_t is_last)
 {
-    struct timeval tv = {
-        0,
-    };
-
     cld->cld_type = CHANGELOG_TYPE_ROLLOVER;
-
-    if (gettimeofday(&tv, NULL))
-        return -1;
-
-    cld->cld_roll_time = (unsigned long)tv.tv_sec;
+    cld->cld_roll_time = gf_time();
     cld->cld_finale = is_last;
-    return 0;
 }
 
 int
@@ -1036,11 +1044,10 @@ changelog_snap_handle_ascii_change(xlator_t *this, changelog_log_data_t *cld)
     ret = changelog_snap_write_change(priv, buffer, off);
 
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_WRITE_FAILED,
-               "error writing csnap to disk");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_WRITE_FAILED,
+                "csnap", NULL);
     }
-    gf_msg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_SNAP_INFO,
-           "Successfully wrote to csnap");
+    gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_WROTE_TO_CSNAP, NULL);
     ret = 0;
 out:
     return ret;
@@ -1057,9 +1064,8 @@ changelog_handle_change(xlator_t *this, changelog_priv_t *priv,
         ret = changelog_start_next_change(this, priv, cld->cld_roll_time,
                                           cld->cld_finale);
         if (ret)
-            gf_msg(this->name, GF_LOG_ERROR, 0,
-                   CHANGELOG_MSG_GET_TIME_OP_FAILED,
-                   "Problem rolling over changelog(s)");
+            gf_smsg(this->name, GF_LOG_ERROR, 0,
+                    CHANGELOG_MSG_GET_TIME_OP_FAILED, NULL);
         goto out;
     }
 
@@ -1073,16 +1079,16 @@ changelog_handle_change(xlator_t *this, changelog_priv_t *priv,
     if (CHANGELOG_TYPE_IS_FSYNC(cld->cld_type)) {
         ret = sys_fsync(priv->changelog_fd);
         if (ret < 0) {
-            gf_msg(this->name, GF_LOG_ERROR, errno,
-                   CHANGELOG_MSG_FSYNC_OP_FAILED, "fsync failed");
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    CHANGELOG_MSG_FSYNC_OP_FAILED, NULL);
         }
         goto out;
     }
 
     ret = priv->ce->encode(this, cld);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_WRITE_FAILED,
-               "error writing changelog to disk");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_WRITE_FAILED,
+                "changelog", NULL);
     }
 
 out:
@@ -1105,6 +1111,7 @@ changelog_local_init(xlator_t *this, inode_t *inode, uuid_t gfid,
         gf_msg_callingfn(this->name, GF_LOG_WARNING, 0,
                          CHANGELOG_MSG_INODE_NOT_FOUND,
                          "inode needed for version checking !!!");
+
         goto out;
     }
 
@@ -1254,7 +1261,7 @@ changelog_rollover(void *data)
     while (1) {
         (void)pthread_testcancel();
 
-        tv.tv_sec = time(NULL) + priv->rollover_time;
+        tv.tv_sec = gf_time() + priv->rollover_time;
         tv.tv_nsec = 0;
         ret = 0; /* Reset ret to zero */
 
@@ -1277,12 +1284,12 @@ changelog_rollover(void *data)
         pthread_cleanup_pop(0);
 
         if (ret == 0) {
-            gf_msg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_BARRIER_INFO,
-                   "Explicit wakeup on barrier notify");
+            gf_smsg(this->name, GF_LOG_INFO, 0, CHANGELOG_MSG_BARRIER_INFO,
+                    NULL);
             priv->explicit_rollover = _gf_true;
         } else if (ret && ret != ETIMEDOUT) {
-            gf_msg(this->name, GF_LOG_ERROR, errno, CHANGELOG_MSG_SELECT_FAILED,
-                   "pthread_cond_timedwait failed");
+            gf_smsg(this->name, GF_LOG_ERROR, errno,
+                    CHANGELOG_MSG_SELECT_FAILED, NULL);
             continue;
         } else if (ret && ret == ETIMEDOUT) {
             gf_msg_debug(this->name, 0, "Wokeup on timeout");
@@ -1335,13 +1342,7 @@ changelog_rollover(void *data)
         if (priv->explicit_rollover == _gf_true)
             sleep(1);
 
-        ret = changelog_fill_rollover_data(&cld, _gf_false);
-        if (ret) {
-            gf_msg(this->name, GF_LOG_ERROR, 0,
-                   CHANGELOG_MSG_GET_TIME_OP_FAILED,
-                   "failed to fill rollover data");
-            continue;
-        }
+        changelog_fill_rollover_data(&cld, _gf_false);
 
         _mask_cancellation();
 
@@ -1389,9 +1390,8 @@ changelog_fsync_thread(void *data)
 
         ret = changelog_inject_single_event(this, priv, &cld);
         if (ret)
-            gf_msg(this->name, GF_LOG_ERROR, 0,
-                   CHANGELOG_MSG_INJECT_FSYNC_FAILED,
-                   "failed to inject fsync event");
+            gf_smsg(this->name, GF_LOG_ERROR, 0,
+                    CHANGELOG_MSG_INJECT_FSYNC_FAILED, NULL);
 
         _unmask_cancellation();
     }
@@ -1819,16 +1819,15 @@ changelog_fill_entry_buf(call_frame_t *frame, xlator_t *this, loc_t *loc,
 
     CHANGELOG_INIT_NOCHECK(this, *local, loc->inode, loc->inode->gfid, 5);
     if (!(*local)) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_LOCAL_INIT_FAILED,
-               "changelog local"
-               " initiatilization failed");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_LOCAL_INIT_FAILED,
+                NULL);
         goto err;
     }
 
     co = changelog_get_usable_buffer(*local);
     if (!co) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_NO_MEMORY,
-               "Failed to get buffer");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, CHANGELOG_MSG_GET_BUFFER_FAILED,
+                NULL);
         goto err;
     }
 

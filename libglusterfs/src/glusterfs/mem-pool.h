@@ -202,6 +202,24 @@ out:
     return dup_mem;
 }
 
+#ifdef GF_DISABLE_MEMPOOL
+
+/* No-op memory pool enough to fit current API without massive redesign. */
+
+struct mem_pool {
+    unsigned long sizeof_type;
+};
+
+#define mem_pools_init()                                                       \
+    do {                                                                       \
+    } while (0)
+#define mem_pools_fini()                                                       \
+    do {                                                                       \
+    } while (0)
+#define mem_pool_thread_destructor(pool_list) (void)pool_list
+
+#else /* !GF_DISABLE_MEMPOOL */
+
 /* kind of 'header' for the actual mem_pool_shared structure, this might make
  * it possible to dump some more details in a statedump */
 struct mem_pool {
@@ -209,10 +227,11 @@ struct mem_pool {
     unsigned long sizeof_type;
     unsigned long count; /* requested pool size (unused) */
     char *name;
-    gf_atomic_t active; /* current allocations */
+    char *xl_name;
+    gf_atomic_t active;     /* current allocations */
 #ifdef DEBUG
-    gf_atomic_t hit;  /* number of allocations served from pt_pool */
-    gf_atomic_t miss; /* number of std allocs due to miss */
+    gf_atomic_t hit;        /* number of allocations served from pt_pool */
+    gf_atomic_t miss;       /* number of std allocs due to miss */
 #endif
     struct list_head owner; /* glusterfs_ctx_t->mempool_list */
     glusterfs_ctx_t *ctx;   /* take ctx->lock when updating owner */
@@ -244,24 +263,26 @@ typedef struct per_thread_pool {
 } per_thread_pool_t;
 
 typedef struct per_thread_pool_list {
-    /*
-     * These first two members are protected by the global pool lock.  When
-     * a thread first tries to use any pool, we create one of these.  We
-     * link it into the global list using thr_list so the pool-sweeper
-     * thread can find it, and use pthread_setspecific so this thread can
-     * find it.  When the per-thread destructor runs, we "poison" the pool
-     * list to prevent further allocations.  This also signals to the
-     * pool-sweeper thread that the list should be detached and freed after
-     * the next time it's swept.
-     */
+    /* thr_list is used to place the TLS pool_list into the active global list
+     * (pool_threads) or the inactive global list (pool_free_threads). It's
+     * protected by the global pool_lock. */
     struct list_head thr_list;
-    unsigned int poison;
+
+    /* This lock is used to update poison and the hot/cold lists of members
+     * of 'pools' array. */
+    pthread_spinlock_t lock;
+
+    /* This field is used to mark a pool_list as not being owned by any thread.
+     * This means that the sweeper thread won't be cleaning objects stored in
+     * its pools. mem_put() uses it to decide if the object being released is
+     * placed into its original pool_list or directly destroyed. */
+    bool poison;
+
     /*
      * There's really more than one pool, but the actual number is hidden
      * in the implementation code so we just make it a single-element array
      * here.
      */
-    pthread_spinlock_t lock;
     per_thread_pool_t pools[1];
 } per_thread_pool_list_t;
 
@@ -284,6 +305,10 @@ void
 mem_pools_init(void); /* start the pool_sweeper thread */
 void
 mem_pools_fini(void); /* cleanup memory pools */
+void
+mem_pool_thread_destructor(per_thread_pool_list_t *pool_list);
+
+#endif /* GF_DISABLE_MEMPOOL */
 
 struct mem_pool *
 mem_pool_new_fn(glusterfs_ctx_t *ctx, unsigned long sizeof_type,
@@ -304,9 +329,6 @@ mem_get0(struct mem_pool *pool);
 
 void
 mem_pool_destroy(struct mem_pool *pool);
-
-void
-mem_pool_thread_destructor(void);
 
 void
 gf_mem_acct_enable_set(void *ctx);

@@ -153,8 +153,8 @@ struct quota_inode_ctx {
     int64_t object_soft_lim;
     struct iatt buf;
     struct list_head parents;
-    struct timeval tv;
-    struct timeval prev_log;
+    time_t validate_time;
+    time_t prev_log_time;
     gf_boolean_t ancestry_built;
     gf_lock_t lock;
 };
@@ -199,6 +199,7 @@ struct quota_local {
 typedef struct quota_local quota_local_t;
 
 struct quota_priv {
+    /* FIXME: consider time_t for timeouts. */
     uint32_t soft_timeout;
     uint32_t hard_timeout;
     uint32_t log_timeout;
@@ -214,6 +215,9 @@ struct quota_priv {
     char *volume_uuid;
     uint64_t validation_count;
     int32_t quotad_conn_status;
+    pthread_mutex_t conn_mutex;
+    pthread_cond_t conn_cond;
+    gf_boolean_t conn_status;
 };
 typedef struct quota_priv quota_priv_t;
 

@@ -586,9 +586,6 @@ quota_validate_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
     quota_meta_t size = {
         0,
     };
-    struct timeval tv = {
-        0,
-    };
 
     local = frame->local;
 
@@ -626,13 +623,12 @@ quota_validate_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                                 * loop of validation and checking
                                 * limit when timeout is zero.
                                 */
-    gettimeofday(&tv, NULL);
     LOCK(&ctx->lock);
     {
         ctx->size = size.size;
+        ctx->validate_time = gf_time();
         ctx->file_count = size.file_count;
         ctx->dir_count = size.dir_count;
-        memcpy(&ctx->tv, &tv, sizeof(struct timeval));
     }
     UNLOCK(&ctx->lock);
 
@@ -644,27 +640,10 @@ unwind:
     return 0;
 }
 
-static uint64_t
-quota_time_elapsed(struct timeval *now, struct timeval *then)
+static inline gf_boolean_t
+quota_timeout(time_t t, uint32_t timeout)
 {
-    return (now->tv_sec - then->tv_sec);
-}
-
-int32_t
-quota_timeout(struct timeval *tv, int32_t timeout)
-{
-    struct timeval now = {
-        0,
-    };
-    int32_t timed_out = 0;
-
-    gettimeofday(&now, NULL);
-
-    if (quota_time_elapsed(&now, tv) >= timeout) {
-        timed_out = 1;
-    }
-
-    return timed_out;
+    return (gf_time() - t) >= timeout;
 }
 
 /* Return: 1 if new entry added
@@ -1128,7 +1107,7 @@ quota_check_object_limit(call_frame_t *frame, quota_inode_ctx_t *ctx,
                 timeout = priv->hard_timeout;
             }
 
-            if (!just_validated && quota_timeout(&ctx->tv, timeout)) {
+            if (!just_validated && quota_timeout(ctx->validate_time, timeout)) {
                 need_validate = 1;
             } else if ((object_aggr_count) > ctx->object_hard_lim) {
                 hard_limit_exceeded = 1;
@@ -1195,7 +1174,7 @@ quota_check_size_limit(call_frame_t *frame, quota_inode_ctx_t *ctx,
                 timeout = priv->hard_timeout;
             }
 
-            if (!just_validated && quota_timeout(&ctx->tv, timeout)) {
+            if (!just_validated && quota_timeout(ctx->validate_time, timeout)) {
                 need_validate = 1;
             } else if (wouldbe_size >= ctx->hard_lim) {
                 hard_limit_exceeded = 1;
@@ -4314,9 +4293,6 @@ quota_statfs_validate_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
     quota_meta_t size = {
         0,
     };
-    struct timeval tv = {
-        0,
-    };
 
     local = frame->local;
 
@@ -4348,13 +4324,12 @@ quota_statfs_validate_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         op_errno = EINVAL;
     }
 
-    gettimeofday(&tv, NULL);
     LOCK(&ctx->lock);
     {
         ctx->size = size.size;
+        ctx->validate_time = gf_time();
         ctx->file_count = size.file_count;
         ctx->dir_count = size.dir_count;
-        memcpy(&ctx->tv, &tv, sizeof(struct timeval));
     }
     UNLOCK(&ctx->lock);
 
@@ -4873,7 +4848,7 @@ off:
 
 void
 quota_log_helper(char **usage_str, int64_t cur_size, inode_t *inode,
-                 char **path, struct timeval *cur_time)
+                 char **path, time_t *cur_time)
 {
     xlator_t *this = THIS;
 
@@ -4892,7 +4867,7 @@ quota_log_helper(char **usage_str, int64_t cur_size, inode_t *inode,
     if (!(*path))
         *path = uuid_utoa(inode->gfid);
 
-    gettimeofday(cur_time, NULL);
+    *cur_time = gf_time();
 }
 
 /* Logs if
@@ -4903,9 +4878,7 @@ void
 quota_log_usage(xlator_t *this, quota_inode_ctx_t *ctx, inode_t *inode,
                 int64_t delta)
 {
-    struct timeval cur_time = {
-        0,
-    };
+    time_t cur_time = 0;
     char *usage_str = NULL;
     char *path = NULL;
     int64_t cur_size = 0;
@@ -4931,12 +4904,12 @@ quota_log_usage(xlator_t *this, quota_inode_ctx_t *ctx, inode_t *inode,
                  "path=%s",
                  usage_str, priv->volume_uuid, path);
 
-        ctx->prev_log = cur_time;
+        ctx->prev_log_time = cur_time;
 
     }
     /* Usage is above soft limit */
     else if (cur_size > ctx->soft_lim &&
-             quota_timeout(&ctx->prev_log, priv->log_timeout)) {
+             quota_timeout(ctx->prev_log_time, priv->log_timeout)) {
         quota_log_helper(&usage_str, cur_size, inode, &path, &cur_time);
 
         gf_msg(this->name, GF_LOG_ALERT, 0, Q_MSG_CROSSED_SOFT_LIMIT,
@@ -4947,8 +4920,11 @@ quota_log_usage(xlator_t *this, quota_inode_ctx_t *ctx, inode_t *inode,
                  "path=%s",
                  usage_str, priv->volume_uuid, path);
 
-        ctx->prev_log = cur_time;
+        ctx->prev_log_time = cur_time;
     }
+
+    if (path)
+        GF_FREE(path);
 
     if (usage_str)
         GF_FREE(usage_str);
@@ -5005,6 +4981,43 @@ quota_forget(xlator_t *this, inode_t *inode)
     return 0;
 }
 
+int
+notify(xlator_t *this, int event, void *data, ...)
+{
+    quota_priv_t *priv = NULL;
+    int ret = 0;
+    rpc_clnt_t *rpc = NULL;
+    gf_boolean_t conn_status = _gf_true;
+    xlator_t *victim = data;
+
+    priv = this->private;
+    if (!priv || !priv->is_quota_on)
+        goto out;
+
+    if (event == GF_EVENT_PARENT_DOWN) {
+        rpc = priv->rpc_clnt;
+        if (rpc) {
+            rpc_clnt_disable(rpc);
+            pthread_mutex_lock(&priv->conn_mutex);
+            {
+                conn_status = priv->conn_status;
+                while (conn_status) {
+                    (void)pthread_cond_wait(&priv->conn_cond,
+                                            &priv->conn_mutex);
+                    conn_status = priv->conn_status;
+                }
+            }
+            pthread_mutex_unlock(&priv->conn_mutex);
+            gf_log(this->name, GF_LOG_INFO,
+                   "Notify GF_EVENT_PARENT_DOWN for brick %s", victim->name);
+        }
+    }
+
+out:
+    ret = default_notify(this, event, data);
+    return ret;
+}
+
 int32_t
 init(xlator_t *this)
 {
@@ -5046,6 +5059,10 @@ init(xlator_t *this)
                "failed to create local_t's memory pool");
         goto err;
     }
+
+    pthread_mutex_init(&priv->conn_mutex, NULL);
+    pthread_cond_init(&priv->conn_cond, NULL);
+    priv->conn_status = _gf_false;
 
     if (priv->is_quota_on) {
         rpc = quota_enforcer_init(this, this->options);
@@ -5140,9 +5157,9 @@ quota_priv_dump(xlator_t *this)
     if (ret)
         goto out;
     else {
-        gf_proc_dump_write("soft-timeout", "%d", priv->soft_timeout);
-        gf_proc_dump_write("hard-timeout", "%d", priv->hard_timeout);
-        gf_proc_dump_write("alert-time", "%d", priv->log_timeout);
+        gf_proc_dump_write("soft-timeout", "%u", priv->soft_timeout);
+        gf_proc_dump_write("hard-timeout", "%u", priv->hard_timeout);
+        gf_proc_dump_write("alert-time", "%u", priv->log_timeout);
         gf_proc_dump_write("quota-on", "%d", priv->is_quota_on);
         gf_proc_dump_write("statfs", "%d", priv->consider_statfs);
         gf_proc_dump_write("volume-uuid", "%s", priv->volume_uuid);
@@ -5160,20 +5177,22 @@ fini(xlator_t *this)
 {
     quota_priv_t *priv = NULL;
     rpc_clnt_t *rpc = NULL;
-    int i = 0, cnt = 0;
 
     priv = this->private;
     if (!priv)
         return;
     rpc = priv->rpc_clnt;
     priv->rpc_clnt = NULL;
-    this->private = NULL;
     if (rpc) {
-        cnt = GF_ATOMIC_GET(rpc->refcount);
-        for (i = 0; i < cnt; i++)
-            rpc_clnt_unref(rpc);
+        rpc_clnt_connection_cleanup(&rpc->conn);
+        rpc_clnt_unref(rpc);
     }
+
+    this->private = NULL;
     LOCK_DESTROY(&priv->lock);
+    pthread_mutex_destroy(&priv->conn_mutex);
+    pthread_cond_destroy(&priv->conn_cond);
+
     GF_FREE(priv);
     if (this->local_pool) {
         mem_pool_destroy(this->local_pool);
@@ -5305,6 +5324,7 @@ struct volume_options options[] = {
 xlator_api_t xlator_api = {
     .init = init,
     .fini = fini,
+    .notify = notify,
     .reconfigure = reconfigure,
     .mem_acct_init = mem_acct_init,
     .op_version = {1}, /* Present from the initial version */

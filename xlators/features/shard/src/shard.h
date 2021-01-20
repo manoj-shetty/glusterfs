@@ -254,9 +254,9 @@ typedef int32_t (*shard_post_update_size_fop_handler_t)(call_frame_t *frame,
 typedef struct shard_local {
     int op_ret;
     int op_errno;
-    int first_block;
-    int last_block;
-    int num_blocks;
+    uint64_t first_block;
+    uint64_t last_block;
+    uint64_t num_blocks;
     int call_count;
     int eexist_count;
     int create_count;
@@ -318,6 +318,7 @@ typedef struct shard_local {
     uint32_t deletion_rate;
     gf_boolean_t cleanup_required;
     uuid_t base_gfid;
+    char *name;
 } shard_local_t;
 
 typedef struct shard_inode_ctx {

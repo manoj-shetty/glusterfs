@@ -87,21 +87,24 @@ glusterd_hooks_create_hooks_directory(char *basedir)
     glusterd_conf_t *priv = NULL;
     int32_t len = 0;
 
-    priv = THIS->private;
+    xlator_t *this = NULL;
+    this = THIS;
+    GF_ASSERT(this);
+    priv = this->private;
 
     snprintf(path, sizeof(path), "%s/hooks", basedir);
     ret = mkdir_p(path, 0755, _gf_true);
     if (ret) {
-        gf_msg(THIS->name, GF_LOG_CRITICAL, errno, GD_MSG_CREATE_DIR_FAILED,
-               "Unable to create %s", path);
+        gf_smsg(this->name, GF_LOG_CRITICAL, errno, GD_MSG_CREATE_DIR_FAILED,
+                "Path=%s", path, NULL);
         goto out;
     }
 
     GLUSTERD_GET_HOOKS_DIR(version_dir, GLUSTERD_HOOK_VER, priv);
     ret = mkdir_p(version_dir, 0755, _gf_true);
     if (ret) {
-        gf_msg(THIS->name, GF_LOG_CRITICAL, errno, GD_MSG_CREATE_DIR_FAILED,
-               "Unable to create %s", version_dir);
+        gf_smsg(this->name, GF_LOG_CRITICAL, errno, GD_MSG_CREATE_DIR_FAILED,
+                "Directory=%s", version_dir, NULL);
         goto out;
     }
 
@@ -112,13 +115,14 @@ glusterd_hooks_create_hooks_directory(char *basedir)
 
         len = snprintf(path, sizeof(path), "%s/%s", version_dir, cmd_subdir);
         if ((len < 0) || (len >= sizeof(path))) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
             ret = -1;
             goto out;
         }
         ret = mkdir_p(path, 0755, _gf_true);
         if (ret) {
-            gf_msg(THIS->name, GF_LOG_CRITICAL, errno, GD_MSG_CREATE_DIR_FAILED,
-                   "Unable to create %s", path);
+            gf_smsg(this->name, GF_LOG_CRITICAL, errno,
+                    GD_MSG_CREATE_DIR_FAILED, "Path=%s", path, NULL);
             goto out;
         }
 
@@ -126,13 +130,15 @@ glusterd_hooks_create_hooks_directory(char *basedir)
             len = snprintf(path, sizeof(path), "%s/%s/%s", version_dir,
                            cmd_subdir, type_subdir[type]);
             if ((len < 0) || (len >= sizeof(path))) {
+                gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL,
+                        NULL);
                 ret = -1;
                 goto out;
             }
             ret = mkdir_p(path, 0755, _gf_true);
             if (ret) {
-                gf_msg(THIS->name, GF_LOG_CRITICAL, errno,
-                       GD_MSG_CREATE_DIR_FAILED, "Unable to create %s", path);
+                gf_smsg(this->name, GF_LOG_CRITICAL, errno,
+                        GD_MSG_CREATE_DIR_FAILED, "Path=%s", path, NULL);
                 goto out;
             }
         }
@@ -200,20 +206,31 @@ glusterd_hooks_set_volume_args(dict_t *dict, runner_t *runner)
     int i = 0;
     int count = 0;
     int ret = -1;
+    int flag = 0;
     char query[1024] = {
         0,
     };
     char *key = NULL;
     char *value = NULL;
+    char *inet_family = NULL;
+    xlator_t *this = NULL;
+    this = THIS;
+    GF_ASSERT(this);
 
     ret = dict_get_int32(dict, "count", &count);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_GET_FAILED,
+                "Key=count", NULL);
         goto out;
+    }
 
     /* This will not happen unless op_ctx
      * is corrupted*/
-    if (!count)
+    if (!count) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_INVALID_ENTRY, "count",
+                NULL);
         goto out;
+    }
 
     runner_add_arg(runner, "-o");
     for (i = 1; ret == 0; i++) {
@@ -228,9 +245,23 @@ glusterd_hooks_set_volume_args(dict_t *dict, runner_t *runner)
             continue;
 
         runner_argprintf(runner, "%s=%s", key, value);
+        if ((strncmp(key, "cluster.enable-shared-storage",
+                     SLEN("cluster.enable-shared-storage")) == 0 ||
+             strncmp(key, "enable-shared-storage",
+                     SLEN("enable-shared-storage")) == 0) &&
+            strncmp(value, "enable", SLEN("enable")) == 0)
+            flag = 1;
     }
 
     glusterd_hooks_add_custom_args(dict, runner);
+    if (flag == 1) {
+        ret = dict_get_str_sizen(this->options, "transport.address-family",
+                                 &inet_family);
+        if (!ret) {
+            runner_argprintf(runner, "transport.address-family=%s",
+                             inet_family);
+        }
+    }
 
     ret = 0;
 out:
@@ -357,27 +388,31 @@ glusterd_hooks_run_hooks(char *hooks_path, glusterd_op_t op, dict_t *op_ctx,
 
     lines = GF_CALLOC(1, N * sizeof(*lines), gf_gld_mt_charptr);
     if (!lines) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         ret = -1;
         goto out;
     }
 
     ret = -1;
     line_count = 0;
-    GF_SKIP_IRRELEVANT_ENTRIES(entry, hookdir, scratch);
-    while (entry) {
+
+    while ((entry = sys_readdir(hookdir, scratch))) {
+        if (gf_irrelevant_entry(entry))
+            continue;
         if (line_count == N - 1) {
             N *= 2;
             lines = GF_REALLOC(lines, N * sizeof(char *));
-            if (!lines)
+            if (!lines) {
+                gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY,
+                        NULL);
                 goto out;
+            }
         }
 
         if (glusterd_is_hook_enabled(entry->d_name)) {
             lines[line_count] = gf_strdup(entry->d_name);
             line_count++;
         }
-
-        GF_SKIP_IRRELEVANT_ENTRIES(entry, hookdir, scratch);
     }
 
     lines[line_count] = NULL;
@@ -461,31 +496,40 @@ glusterd_hooks_stub_init(glusterd_hooks_stub_t **stub, char *scriptdir,
     int ret = -1;
     glusterd_hooks_stub_t *hooks_stub = NULL;
 
+    xlator_t *this = NULL;
+    this = THIS;
+    GF_ASSERT(this);
     GF_ASSERT(stub);
     if (!stub)
         goto out;
 
     hooks_stub = GF_CALLOC(1, sizeof(*hooks_stub), gf_gld_mt_hooks_stub_t);
-    if (!hooks_stub)
+    if (!hooks_stub) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     CDS_INIT_LIST_HEAD(&hooks_stub->all_hooks);
     hooks_stub->op = op;
     hooks_stub->scriptdir = gf_strdup(scriptdir);
-    if (!hooks_stub->scriptdir)
+    if (!hooks_stub->scriptdir) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_STRDUP_FAILED,
+                "scriptdir=%s", scriptdir, NULL);
         goto out;
+    }
 
     hooks_stub->op_ctx = dict_copy_with_ref(op_ctx, hooks_stub->op_ctx);
-    if (!hooks_stub->op_ctx)
+    if (!hooks_stub->op_ctx) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_COPY_FAIL, NULL);
         goto out;
+    }
 
     *stub = hooks_stub;
     ret = 0;
 out:
     if (ret) {
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, GD_MSG_POST_HOOK_STUB_INIT_FAIL,
-               "Failed to initialize "
-               "post hooks stub");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, GD_MSG_POST_HOOK_STUB_INIT_FAIL,
+                NULL);
         glusterd_hooks_stub_cleanup(hooks_stub);
     }
 
@@ -547,12 +591,20 @@ glusterd_hooks_priv_init(glusterd_hooks_private_t **new)
     int ret = -1;
     glusterd_hooks_private_t *hooks_priv = NULL;
 
-    if (!new)
+    xlator_t *this = NULL;
+    this = THIS;
+    GF_ASSERT(this);
+
+    if (!new) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_INVALID_ARGUMENT, NULL);
         goto out;
+    }
 
     hooks_priv = GF_CALLOC(1, sizeof(*hooks_priv), gf_gld_mt_hooks_priv_t);
-    if (!hooks_priv)
+    if (!hooks_priv) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto out;
+    }
 
     pthread_mutex_init(&hooks_priv->mutex, NULL);
     pthread_cond_init(&hooks_priv->cond, NULL);

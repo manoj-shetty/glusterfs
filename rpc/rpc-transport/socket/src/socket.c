@@ -11,7 +11,6 @@
 #include "socket.h"
 #include "name.h"
 #include <glusterfs/dict.h>
-#include "rpc-transport.h"
 #include <glusterfs/syscall.h>
 #include <glusterfs/byte-order.h>
 #include <glusterfs/compat-errno.h>
@@ -30,7 +29,6 @@
 #include <netinet/tcp.h>
 #endif
 
-#include <fcntl.h>
 #include <errno.h>
 #include <rpc/xdr.h>
 #include <sys/ioctl.h>
@@ -168,7 +166,7 @@ ssl_setup_connection_params(rpc_transport_t *this);
                                                                                \
         ret = __socket_readv(this, in->pending_vector, 1, &in->pending_vector, \
                              &in->pending_count, &bytes_read);                 \
-        if (ret == -1)                                                         \
+        if (ret < 0)                                                           \
             break;                                                             \
         __socket_proto_update_priv_after_read(priv, ret, bytes_read);          \
     }
@@ -248,7 +246,6 @@ ssl_do(rpc_transport_t *this, void *buf, size_t len, SSL_trinary_func *func)
     int r = (-1);
     socket_private_t *priv = NULL;
 
-    GF_VALIDATE_OR_GOTO(this->name, this->private, out);
     priv = this->private;
 
     if (buf) {
@@ -358,13 +355,11 @@ ssl_set_crl_verify_flags(SSL_CTX *ssl_ctx)
 #endif
 }
 
-int
+static int
 ssl_setup_connection_prefix(rpc_transport_t *this, gf_boolean_t server)
 {
     int ret = -1;
     socket_private_t *priv = NULL;
-
-    GF_VALIDATE_OR_GOTO(this->name, this->private, done);
 
     priv = this->private;
 
@@ -417,7 +412,6 @@ ssl_setup_connection_postfix(rpc_transport_t *this)
     char peer_CN[256] = "";
     socket_private_t *priv = NULL;
 
-    GF_VALIDATE_OR_GOTO(this->name, this->private, done);
     priv = this->private;
 
     /* Make sure _SSL verification_ succeeded, yielding an identity. */
@@ -451,11 +445,10 @@ ssl_error:
 
     SSL_free(priv->ssl_ssl);
     priv->ssl_ssl = NULL;
-done:
     return NULL;
 }
 
-int
+static int
 ssl_complete_connection(rpc_transport_t *this)
 {
     int ret = -1; /*  1 : implies go back to epoll_wait()
@@ -694,7 +687,6 @@ __socket_rwv(rpc_transport_t *this, struct iovec *vector, int count,
     int opcount = 0;
     int moved = 0;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
     GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
@@ -733,7 +725,7 @@ __socket_rwv(rpc_transport_t *this, struct iovec *vector, int count,
                 ret = sys_writev(sock, opvector, IOV_MIN(opcount));
             }
 
-            if (ret == 0 || (ret == -1 && errno == EAGAIN)) {
+            if ((ret == 0) || ((ret < 0) && (errno == EAGAIN))) {
                 /* done for now */
                 break;
             } else if (ret > 0)
@@ -748,7 +740,7 @@ __socket_rwv(rpc_transport_t *this, struct iovec *vector, int count,
                 errno = ENODATA;
                 ret = -1;
             }
-            if (ret == -1 && errno == EAGAIN) {
+            if ((ret < 0) && (errno == EAGAIN)) {
                 /* done for now */
                 break;
             } else if (ret > 0)
@@ -764,7 +756,7 @@ __socket_rwv(rpc_transport_t *this, struct iovec *vector, int count,
             errno = ENOTCONN;
             break;
         }
-        if (ret == -1) {
+        if (ret < 0) {
             if (errno == EINTR)
                 continue;
 
@@ -827,24 +819,16 @@ static int
 __socket_readv(rpc_transport_t *this, struct iovec *vector, int count,
                struct iovec **pending_vector, int *pending_count, size_t *bytes)
 {
-    int ret = -1;
-
-    ret = __socket_rwv(this, vector, count, pending_vector, pending_count,
-                       bytes, 0);
-
-    return ret;
+    return __socket_rwv(this, vector, count, pending_vector, pending_count,
+                        bytes, 0);
 }
 
 static int
 __socket_writev(rpc_transport_t *this, struct iovec *vector, int count,
                 struct iovec **pending_vector, int *pending_count)
 {
-    int ret = -1;
-
-    ret = __socket_rwv(this, vector, count, pending_vector, pending_count, NULL,
-                       1);
-
-    return ret;
+    return __socket_rwv(this, vector, count, pending_vector, pending_count,
+                        NULL, 1);
 }
 
 static int
@@ -871,20 +855,14 @@ __socket_shutdown(rpc_transport_t *this)
 static int
 __socket_teardown_connection(rpc_transport_t *this)
 {
-    int ret = -1;
     socket_private_t *priv = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
 
     if (priv->use_ssl)
         ssl_teardown_connection(priv);
 
-    ret = __socket_shutdown(this);
-out:
-    return ret;
+    return __socket_shutdown(this);
 }
 
 static int
@@ -893,15 +871,12 @@ __socket_disconnect(rpc_transport_t *this)
     int ret = -1;
     socket_private_t *priv = NULL;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     gf_log(this->name, GF_LOG_TRACE, "disconnecting %p, sock=%d", this,
            priv->sock);
 
-    if (priv->sock != -1) {
+    if (priv->sock >= 0) {
         gf_log_callingfn(this->name, GF_LOG_TRACE,
                          "tearing down socket connection");
         ret = __socket_teardown_connection(this);
@@ -912,7 +887,6 @@ __socket_disconnect(rpc_transport_t *this)
         }
     }
 
-out:
     return ret;
 }
 
@@ -929,16 +903,13 @@ __socket_server_bind(rpc_transport_t *this)
     uint16_t sin_port = 0;
     int retries = 0;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
     ctx = this->ctx;
     cmd_args = &ctx->cmd_args;
 
     ret = setsockopt(priv->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log(this->name, GF_LOG_ERROR,
                "setsockopt() for SO_REUSEADDR failed (%s)", strerror(errno));
     }
@@ -951,7 +922,7 @@ __socket_server_bind(rpc_transport_t *this)
         if (reuse_check_sock >= 0) {
             ret = connect(reuse_check_sock, SA(&unix_addr),
                           this->myinfo.sockaddr_len);
-            if ((ret == -1) && (ECONNREFUSED == errno)) {
+            if ((ret != 0) && (ECONNREFUSED == errno)) {
                 sys_unlink(((struct sockaddr_un *)&unix_addr)->sun_path);
             }
             gf_log(this->name, GF_LOG_INFO,
@@ -972,7 +943,7 @@ __socket_server_bind(rpc_transport_t *this)
         while (retries) {
             ret = bind(priv->sock, (struct sockaddr *)&this->myinfo.sockaddr,
                        this->myinfo.sockaddr_len);
-            if (ret == -1) {
+            if (ret != 0) {
                 gf_log(this->name, GF_LOG_ERROR, "binding to %s failed: %s",
                        this->myinfo.identifier, strerror(errno));
                 if (errno == EADDRINUSE) {
@@ -990,7 +961,7 @@ __socket_server_bind(rpc_transport_t *this)
         ret = bind(priv->sock, (struct sockaddr *)&this->myinfo.sockaddr,
                    this->myinfo.sockaddr_len);
 
-        if (ret == -1) {
+        if (ret != 0) {
             gf_log(this->name, GF_LOG_ERROR, "binding to %s failed: %s",
                    this->myinfo.identifier, strerror(errno));
             if (errno == EADDRINUSE) {
@@ -1000,7 +971,7 @@ __socket_server_bind(rpc_transport_t *this)
     }
     if (AF_UNIX != SA(&this->myinfo.sockaddr)->sa_family) {
         if (getsockname(priv->sock, SA(&this->myinfo.sockaddr),
-                        &this->myinfo.sockaddr_len) == -1) {
+                        &this->myinfo.sockaddr_len) != 0) {
             gf_log(this->name, GF_LOG_WARNING,
                    "getsockname on (%d) failed (%s)", priv->sock,
                    strerror(errno));
@@ -1028,7 +999,7 @@ __socket_nonblock(int fd)
 
     flags = fcntl(fd, F_GETFL);
 
-    if (flags != -1)
+    if (flags >= 0)
         ret = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     return ret;
@@ -1058,7 +1029,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
 #endif
 
     ret = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set keep alive option on socket %d", fd);
         goto err;
@@ -1075,7 +1046,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
     ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepaliveintvl,
                      sizeof(keepaliveintvl));
 #endif
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set keep alive interval on socket %d", fd);
         goto err;
@@ -1086,7 +1057,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
 
     ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepaliveidle,
                      sizeof(keepaliveidle));
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set keep idle %d on socket %d, %s", keepaliveidle, fd,
                strerror(errno));
@@ -1094,7 +1065,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
     }
     ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepaliveintvl,
                      sizeof(keepaliveintvl));
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set keep interval %d on socket %d, %s",
                keepaliveintvl, fd, strerror(errno));
@@ -1106,7 +1077,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
         goto done;
     ret = setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout_ms,
                      sizeof(timeout_ms));
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set "
                "TCP_USER_TIMEOUT %d on socket %d, %s",
@@ -1117,7 +1088,7 @@ __socket_keepalive(int fd, int family, int keepaliveintvl, int keepaliveidle,
 #if defined(TCP_KEEPCNT)
     ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepalivecnt,
                      sizeof(keepalivecnt));
-    if (ret == -1) {
+    if (ret != 0) {
         gf_log("socket", GF_LOG_WARNING,
                "failed to set "
                "TCP_KEEPCNT %d on socket %d, %s",
@@ -1159,9 +1130,6 @@ __socket_reset(rpc_transport_t *this)
 {
     socket_private_t *priv = NULL;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     /* TODO: use mem-pool on incoming data */
@@ -1186,7 +1154,7 @@ __socket_reset(rpc_transport_t *this)
         SSL_free(priv->ssl_ssl);
         priv->ssl_ssl = NULL;
     }
-    if (priv->use_ssl && priv->ssl_ctx) {
+    if (priv->ssl_ctx) {
         SSL_CTX_free(priv->ssl_ctx);
         priv->ssl_ctx = NULL;
     }
@@ -1209,8 +1177,6 @@ __socket_reset(rpc_transport_t *this)
         GF_FREE(priv->ssl_ca_list);
         priv->ssl_ca_list = NULL;
     }
-out:
-    return;
 }
 
 static void
@@ -1239,8 +1205,6 @@ __socket_ioq_new(rpc_transport_t *this, rpc_transport_msg_t *msg)
     struct ioq *entry = NULL;
     int count = 0;
     uint32_t size = 0;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
 
     /* TODO: use mem-pool */
     entry = GF_CALLOC(1, sizeof(*entry), gf_common_mt_ioq);
@@ -1296,7 +1260,6 @@ __socket_ioq_new(rpc_transport_t *this, rpc_transport_msg_t *msg)
 
     INIT_LIST_HEAD(&entry->list);
 
-out:
     return entry;
 }
 
@@ -1317,27 +1280,18 @@ out:
 }
 
 static void
-__socket_ioq_flush(rpc_transport_t *this)
+__socket_ioq_flush(socket_private_t *priv)
 {
-    socket_private_t *priv = NULL;
     struct ioq *entry = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
-    priv = this->private;
 
     while (!list_empty(&priv->ioq)) {
         entry = priv->ioq_next;
         __socket_ioq_entry_free(entry);
     }
-
-out:
-    return;
 }
 
 static int
-__socket_ioq_churn_entry(rpc_transport_t *this, struct ioq *entry, int direct)
+__socket_ioq_churn_entry(rpc_transport_t *this, struct ioq *entry)
 {
     int ret = -1;
 
@@ -1360,16 +1314,13 @@ __socket_ioq_churn(rpc_transport_t *this)
     int ret = 0;
     struct ioq *entry = NULL;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     while (!list_empty(&priv->ioq)) {
         /* pick next entry */
         entry = priv->ioq_next;
 
-        ret = __socket_ioq_churn_entry(this, entry, 0);
+        ret = __socket_ioq_churn_entry(this, entry);
 
         if (ret != 0)
             break;
@@ -1381,7 +1332,6 @@ __socket_ioq_churn(rpc_transport_t *this)
                                        priv->idx, -1, 0);
     }
 
-out:
     return ret;
 }
 
@@ -1391,15 +1341,12 @@ socket_event_poll_err(rpc_transport_t *this, int gen, int idx)
     socket_private_t *priv = NULL;
     gf_boolean_t socket_closed = _gf_false;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     pthread_mutex_lock(&priv->out_lock);
     {
-        if ((priv->gen == gen) && (priv->idx == idx) && (priv->sock != -1)) {
-            __socket_ioq_flush(this);
+        if ((priv->gen == gen) && (priv->idx == idx) && (priv->sock >= 0)) {
+            __socket_ioq_flush(priv);
             __socket_reset(this);
             socket_closed = _gf_true;
         }
@@ -1417,7 +1364,6 @@ socket_event_poll_err(rpc_transport_t *this, int gen, int idx)
         rpc_transport_notify(this, RPC_TRANSPORT_DISCONNECT, this);
     }
 
-out:
     return socket_closed;
 }
 
@@ -1427,9 +1373,6 @@ socket_event_poll_out(rpc_transport_t *this)
     socket_private_t *priv = NULL;
     int ret = -1;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     pthread_mutex_lock(&priv->out_lock);
@@ -1437,7 +1380,7 @@ socket_event_poll_out(rpc_transport_t *this)
         if (priv->connected == 1) {
             ret = __socket_ioq_churn(this);
 
-            if (ret == -1) {
+            if (ret < 0) {
                 gf_log(this->name, GF_LOG_TRACE,
                        "__socket_ioq_churn returned -1; "
                        "disconnecting socket");
@@ -1452,7 +1395,7 @@ socket_event_poll_out(rpc_transport_t *this)
 
     if (ret > 0)
         ret = 0;
-out:
+
     return ret;
 }
 
@@ -1495,7 +1438,7 @@ __socket_read_simple_msg(rpc_transport_t *this)
                                      &bytes_read);
             }
 
-            if (ret == -1) {
+            if (ret < 0) {
                 gf_log(this->name, GF_LOG_WARNING,
                        "reading from socket failed. Error (%s), "
                        "peer (%s)",
@@ -1520,12 +1463,6 @@ __socket_read_simple_msg(rpc_transport_t *this)
 
 out:
     return ret;
-}
-
-static int
-__socket_read_simple_request(rpc_transport_t *this)
-{
-    return __socket_read_simple_msg(this);
 }
 
 #define rpc_cred_addr(buf) (buf + RPC_MSGTYPE_SIZE + RPC_CALL_BODY_SIZE - 4)
@@ -1553,9 +1490,6 @@ __socket_read_vectored_request(rpc_transport_t *this,
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
     sp_rpcfrag_request_state_t *request = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
 
@@ -1693,8 +1627,8 @@ __socket_read_vectored_request(rpc_transport_t *this,
 
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
 
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                RPC_LASTFRAG(in->fraghdr))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              RPC_LASTFRAG(in->fraghdr))) {
                 request->vector_state = SP_STATE_VECTORED_REQUEST_INIT;
                 in->payload_vector.iov_len = ((unsigned long)frag->fragcurrent -
                                               (unsigned long)
@@ -1703,7 +1637,6 @@ __socket_read_vectored_request(rpc_transport_t *this,
             break;
     }
 
-out:
     return ret;
 }
 
@@ -1719,9 +1652,6 @@ __socket_read_request(rpc_transport_t *this)
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
     sp_rpcfrag_request_state_t *request = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
 
@@ -1766,20 +1696,19 @@ __socket_read_request(rpc_transport_t *this)
             if (vector_sizer) {
                 ret = __socket_read_vectored_request(this, vector_sizer);
             } else {
-                ret = __socket_read_simple_request(this);
+                ret = __socket_read_simple_msg(this);
             }
 
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
 
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                (RPC_LASTFRAG(in->fraghdr)))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              (RPC_LASTFRAG(in->fraghdr)))) {
                 request->header_state = SP_STATE_REQUEST_HEADER_INIT;
             }
 
             break;
     }
 
-out:
     return ret;
 }
 
@@ -1798,9 +1727,6 @@ __socket_read_accepted_successful_reply(rpc_transport_t *this)
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
     uint32_t remaining_size = 0;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
 
@@ -1902,8 +1828,8 @@ __socket_read_accepted_successful_reply(rpc_transport_t *this)
             /* now read the entire remaining msg into new iobuf */
             ret = __socket_read_simple_msg(this);
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                RPC_LASTFRAG(in->fraghdr))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              RPC_LASTFRAG(in->fraghdr))) {
                 frag->call_body.reply.accepted_success_state =
                     SP_STATE_ACCEPTED_SUCCESS_REPLY_INIT;
             }
@@ -1930,9 +1856,6 @@ __socket_read_accepted_successful_reply_v2(rpc_transport_t *this)
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
     uint32_t remaining_size = 0;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
 
@@ -2035,8 +1958,8 @@ __socket_read_accepted_successful_reply_v2(rpc_transport_t *this)
             /* now read the entire remaining msg into new iobuf */
             ret = __socket_read_simple_msg(this);
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                RPC_LASTFRAG(in->fraghdr))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              RPC_LASTFRAG(in->fraghdr))) {
                 frag->call_body.reply.accepted_success_state =
                     SP_STATE_ACCEPTED_SUCCESS_REPLY_INIT;
             }
@@ -2061,9 +1984,6 @@ __socket_read_accepted_reply(rpc_transport_t *this)
     uint32_t remaining_size = 0;
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
     /* used to reduce the indirection */
@@ -2135,8 +2055,8 @@ __socket_read_accepted_reply(rpc_transport_t *this)
 
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
 
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                (RPC_LASTFRAG(in->fraghdr)))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              (RPC_LASTFRAG(in->fraghdr)))) {
                 frag->call_body.reply
                     .accepted_state = SP_STATE_ACCEPTED_REPLY_INIT;
             }
@@ -2144,7 +2064,6 @@ __socket_read_accepted_reply(rpc_transport_t *this)
             break;
     }
 
-out:
     return ret;
 }
 
@@ -2165,9 +2084,6 @@ __socket_read_vectored_reply(rpc_transport_t *this)
     uint32_t remaining_size = 0;
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
     in = &priv->incoming;
@@ -2201,8 +2117,8 @@ __socket_read_vectored_reply(rpc_transport_t *this)
 
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
 
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                (RPC_LASTFRAG(in->fraghdr)))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              (RPC_LASTFRAG(in->fraghdr)))) {
                 frag->call_body.reply
                     .status_state = SP_STATE_VECTORED_REPLY_STATUS_INIT;
                 in->payload_vector.iov_len = (unsigned long)frag->fragcurrent -
@@ -2212,7 +2128,6 @@ __socket_read_vectored_reply(rpc_transport_t *this)
             break;
     }
 
-out:
     return ret;
 }
 
@@ -2234,9 +2149,6 @@ __socket_read_reply(rpc_transport_t *this)
     char map_xid = 0;
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
     in = &priv->incoming;
@@ -2269,7 +2181,7 @@ __socket_read_reply(rpc_transport_t *this)
         /* Transition back to externally visible state. */
         frag->state = SP_STATE_READ_MSGTYPE;
 
-        if (ret == -1) {
+        if (ret < 0) {
             gf_log(this->name, GF_LOG_WARNING,
                    "notify for event MAP_XID failed for %s",
                    this->peerinfo.identifier);
@@ -2302,9 +2214,6 @@ __socket_read_frag(rpc_transport_t *this)
     uint32_t remaining_size = 0;
     struct gf_sock_incoming *in = NULL;
     struct gf_sock_incoming_frag *frag = NULL;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
 
     priv = this->private;
     /* used to reduce the indirection */
@@ -2347,8 +2256,8 @@ __socket_read_frag(rpc_transport_t *this)
 
             remaining_size = RPC_FRAGSIZE(in->fraghdr) - frag->bytes_read;
 
-            if ((ret == -1) || ((ret == 0) && (remaining_size == 0) &&
-                                (RPC_LASTFRAG(in->fraghdr)))) {
+            if ((ret < 0) || ((ret == 0) && (remaining_size == 0) &&
+                              (RPC_LASTFRAG(in->fraghdr)))) {
                 /* frag->state = SP_STATE_NADA; */
                 frag->state = SP_STATE_RPCFRAG_INIT;
             }
@@ -2363,7 +2272,6 @@ __socket_read_frag(rpc_transport_t *this)
             break;
     }
 
-out:
     return ret;
 }
 
@@ -2432,7 +2340,7 @@ __socket_proto_state_machine(rpc_transport_t *this,
                 ret = __socket_readv(this, in->pending_vector, 1,
                                      &in->pending_vector, &in->pending_count,
                                      NULL);
-                if (ret == -1)
+                if (ret < 0)
                     goto out;
 
                 if (ret > 0) {
@@ -2454,7 +2362,7 @@ __socket_proto_state_machine(rpc_transport_t *this,
                 in->total_bytes_read += RPC_FRAGSIZE(in->fraghdr);
 
                 if (in->total_bytes_read >= GF_UNIT_GB) {
-                    ret = -ENOMEM;
+                    ret = -1;
                     goto out;
                 }
 
@@ -2462,7 +2370,7 @@ __socket_proto_state_machine(rpc_transport_t *this,
                     this->ctx->iobuf_pool,
                     (in->total_bytes_read + sizeof(in->fraghdr)));
                 if (!iobuf) {
-                    ret = -ENOMEM;
+                    ret = -1;
                     goto out;
                 }
 
@@ -2489,7 +2397,7 @@ __socket_proto_state_machine(rpc_transport_t *this,
             case SP_STATE_READING_FRAG:
                 ret = __socket_read_frag(this);
 
-                if ((ret == -1) ||
+                if ((ret < 0) ||
                     (frag->bytes_read != RPC_FRAGSIZE(in->fraghdr))) {
                     goto out;
                 }
@@ -2577,14 +2485,7 @@ static int
 socket_proto_state_machine(rpc_transport_t *this,
                            rpc_transport_pollin_t **pollin)
 {
-    int ret = -1;
-
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-
-    ret = __socket_proto_state_machine(this, pollin);
-
-out:
-    return ret;
+    return __socket_proto_state_machine(this, pollin);
 }
 
 static void
@@ -2634,7 +2535,7 @@ socket_event_poll_in(rpc_transport_t *this, gf_boolean_t notify_handled)
         pthread_mutex_unlock(&priv->notify.lock);
     }
 
-    if (notify_handled && (ret != -1))
+    if (notify_handled && (ret >= 0))
         gf_event_handled(ctx->event_pool, priv->sock, priv->idx, priv->gen);
 
     if (pollin) {
@@ -2653,9 +2554,6 @@ socket_connect_finish(rpc_transport_t *this)
     rpc_transport_event_t event = 0;
     char notify_rpc = 0;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     pthread_mutex_lock(&priv->out_lock);
@@ -2667,10 +2565,10 @@ socket_connect_finish(rpc_transport_t *this)
 
         ret = __socket_connect_finish(priv->sock);
 
-        if (ret == -1 && errno == EINPROGRESS)
+        if ((ret < 0) && (errno == EINPROGRESS))
             ret = 1;
 
-        if (ret == -1 && errno != EINPROGRESS) {
+        if ((ret < 0) && (errno != EINPROGRESS)) {
             if (!priv->connect_finish_log) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "connection to %s failed (%s); "
@@ -2689,7 +2587,7 @@ socket_connect_finish(rpc_transport_t *this)
 
             ret = getsockname(priv->sock, SA(&this->myinfo.sockaddr),
                               &this->myinfo.sockaddr_len);
-            if (ret == -1) {
+            if (ret != 0) {
                 gf_log(this->name, GF_LOG_WARNING,
                        "getsockname on (%d) failed (%s) - "
                        "disconnecting socket",
@@ -2710,7 +2608,7 @@ unlock:
     if (notify_rpc) {
         rpc_transport_notify(this, event, this);
     }
-out:
+
     return ret;
 }
 
@@ -2719,12 +2617,8 @@ socket_disconnect(rpc_transport_t *this, gf_boolean_t wait);
 
 /* socket_is_connected() is for use only in socket_event_handler() */
 static inline gf_boolean_t
-socket_is_connected(rpc_transport_t *this)
+socket_is_connected(socket_private_t *priv)
 {
-    socket_private_t *priv = NULL;
-
-    priv = this->private;
-
     if (priv->use_ssl) {
         return priv->is_server ? priv->ssl_accepted : priv->ssl_connected;
     } else {
@@ -2821,7 +2715,7 @@ ssl_handle_client_connection_attempt(rpc_transport_t *this)
     /* SSL client */
     if (priv->connect_failed) {
         gf_log(this->name, GF_LOG_TRACE, ">>> disconnecting SSL socket");
-        ret = socket_disconnect(this, _gf_false);
+        (void)socket_disconnect(this, _gf_false);
         /* Force ret to be -1, as we are officially done with
            this socket */
         ret = -1;
@@ -2851,7 +2745,7 @@ ssl_handle_client_connection_attempt(rpc_transport_t *this)
                 ret = 1;
             } else {
                 /* this is a connection failure */
-                ret = socket_connect_finish(this);
+                (void)socket_connect_finish(this);
                 gf_log(this->name, GF_LOG_TRACE,
                        "ssl_complete_connection "
                        "returned error");
@@ -2973,6 +2867,13 @@ socket_event_handler(int fd, int idx, int gen, void *data, int poll_in,
         return;
     }
 
+    /* At this point we are sure no other thread is using the transport because
+     * we cannot receive more events until we call gf_event_handled(). However
+     * this function may call gf_event_handled() in some cases. When this is
+     * done, the transport may be destroyed at any moment if another thread
+     * handled an error event. To prevent that we take a reference here. */
+    rpc_transport_ref(this);
+
     GF_VALIDATE_OR_GOTO("socket", this, out);
     GF_VALIDATE_OR_GOTO("socket", this->private, out);
     GF_VALIDATE_OR_GOTO("socket", this->xl, out);
@@ -2993,7 +2894,7 @@ socket_event_handler(int fd, int idx, int gen, void *data, int poll_in,
            poll_out, poll_err);
 
     if (!poll_err) {
-        if (!socket_is_connected(this)) {
+        if (!socket_is_connected(priv)) {
             gf_log(this->name, GF_LOG_TRACE,
                    "%s (sock:%d) socket is not connected, "
                    "completing connection",
@@ -3009,7 +2910,7 @@ socket_event_handler(int fd, int idx, int gen, void *data, int poll_in,
             if (ret > 0) {
                 gf_log(this->name, GF_LOG_TRACE,
                        "(sock:%d) returning to wait on socket", priv->sock);
-                return;
+                goto out;
             }
         } else {
             char *sock_type = (priv->is_server ? "Server" : "Client");
@@ -3049,6 +2950,13 @@ socket_event_handler(int fd, int idx, int gen, void *data, int poll_in,
         socket_dump_info(sa, priv->is_server, priv->use_ssl, priv->sock,
                          this->name, "disconnecting from");
 
+        /* Dump the SSL error stack to clear any errors that may otherwise
+         * resurface in the future.
+         */
+        if (priv->use_ssl && priv->ssl_ssl) {
+            ssl_dump_error_stack(this->name);
+        }
+
         /* Logging has happened already in earlier cases */
         gf_log("transport", ((ret >= 0) ? GF_LOG_INFO : GF_LOG_DEBUG),
                "EPOLLERR - disconnecting (sock:%d) (%s)", priv->sock,
@@ -3064,7 +2972,7 @@ socket_event_handler(int fd, int idx, int gen, void *data, int poll_in,
     }
 
 out:
-    return;
+    rpc_transport_unref(this);
 }
 
 static void
@@ -3123,29 +3031,31 @@ socket_server_event_handler(int fd, int idx, int gen, void *data, int poll_in,
 
         gf_event_handled(ctx->event_pool, fd, idx, gen);
 
-        if (new_sock == -1) {
+        if (new_sock < 0) {
             gf_log(this->name, GF_LOG_WARNING, "accept on %d failed (%s)",
                    priv->sock, strerror(errno));
             goto out;
         }
 
-        if (priv->nodelay && (new_sockaddr.ss_family != AF_UNIX)) {
-            ret = __socket_nodelay(new_sock);
-            if (ret == -1) {
-                gf_log(this->name, GF_LOG_WARNING,
-                       "setsockopt() failed for "
-                       "NODELAY (%s)",
-                       strerror(errno));
+        if (new_sockaddr.ss_family != AF_UNIX) {
+            if (priv->nodelay) {
+                ret = __socket_nodelay(new_sock);
+                if (ret != 0) {
+                    gf_log(this->name, GF_LOG_WARNING,
+                           "setsockopt() failed for "
+                           "NODELAY (%s)",
+                           strerror(errno));
+                }
             }
-        }
 
-        if (priv->keepalive && new_sockaddr.ss_family != AF_UNIX) {
-            ret = __socket_keepalive(new_sock, new_sockaddr.ss_family,
-                                     priv->keepaliveintvl, priv->keepaliveidle,
-                                     priv->keepalivecnt, priv->timeout);
-            if (ret == -1)
-                gf_log(this->name, GF_LOG_WARNING,
-                       "Failed to set keep-alive: %s", strerror(errno));
+            if (priv->keepalive) {
+                ret = __socket_keepalive(
+                    new_sock, new_sockaddr.ss_family, priv->keepaliveintvl,
+                    priv->keepaliveidle, priv->keepalivecnt, priv->timeout);
+                if (ret != 0)
+                    gf_log(this->name, GF_LOG_WARNING,
+                           "Failed to set keep-alive: %s", strerror(errno));
+            }
         }
 
         new_trans = GF_CALLOC(1, sizeof(*new_trans), gf_common_mt_rpc_trans_t);
@@ -3159,7 +3069,7 @@ socket_server_event_handler(int fd, int idx, int gen, void *data, int poll_in,
         }
 
         ret = pthread_mutex_init(&new_trans->lock, NULL);
-        if (ret == -1) {
+        if (ret != 0) {
             gf_log(this->name, GF_LOG_WARNING,
                    "pthread_mutex_init() failed: %s; closing newly accepted "
                    "socket %d",
@@ -3179,7 +3089,7 @@ socket_server_event_handler(int fd, int idx, int gen, void *data, int poll_in,
 
         ret = getsockname(new_sock, SA(&new_trans->myinfo.sockaddr),
                           &new_trans->myinfo.sockaddr_len);
-        if (ret == -1) {
+        if (ret != 0) {
             gf_log(this->name, GF_LOG_WARNING,
                    "getsockname on socket %d "
                    "failed (errno:%s); closing newly accepted socket",
@@ -3285,7 +3195,7 @@ socket_server_event_handler(int fd, int idx, int gen, void *data, int poll_in,
              */
             ret = rpc_transport_notify(this, RPC_TRANSPORT_ACCEPT, new_trans);
 
-            if (ret != -1) {
+            if (ret >= 0) {
                 new_priv->idx = gf_event_register(
                     ctx->event_pool, new_sock, socket_event_handler, new_trans,
                     1, 0, new_trans->notify_poller_death);
@@ -3323,7 +3233,7 @@ socket_server_event_handler(int fd, int idx, int gen, void *data, int poll_in,
             rpc_transport_unref(new_trans);
         }
 
-        if (ret == -1) {
+        if (ret < 0) {
             gf_log(this->name, GF_LOG_WARNING, "closing newly accepted socket");
             sys_close(new_sock);
             /* this unref is to actually cause the destruction of
@@ -3342,9 +3252,6 @@ socket_disconnect(rpc_transport_t *this, gf_boolean_t wait)
     socket_private_t *priv = NULL;
     int ret = -1;
 
-    GF_VALIDATE_OR_GOTO("socket", this, out);
-    GF_VALIDATE_OR_GOTO("socket", this->private, out);
-
     priv = this->private;
 
     pthread_mutex_lock(&priv->out_lock);
@@ -3353,7 +3260,6 @@ socket_disconnect(rpc_transport_t *this, gf_boolean_t wait)
     }
     pthread_mutex_unlock(&priv->out_lock);
 
-out:
     return ret;
 }
 
@@ -3454,7 +3360,7 @@ socket_connect(rpc_transport_t *this, int port)
 
     pthread_mutex_lock(&priv->out_lock);
     {
-        if (priv->sock != -1) {
+        if (priv->sock >= 0) {
             gf_log_callingfn(this->name, GF_LOG_TRACE,
                              "connect () called on transport "
                              "already connected");
@@ -3468,7 +3374,7 @@ socket_connect(rpc_transport_t *this, int port)
 
         ret = socket_client_get_remote_sockaddr(this, &sock_union.sa,
                                                 &sockaddr_len, &sa_family);
-        if (ret == -1) {
+        if (ret < 0) {
             /* logged inside client_get_remote_sockaddr */
             goto unlock;
         }
@@ -3487,7 +3393,7 @@ socket_connect(rpc_transport_t *this, int port)
         this->peerinfo.sockaddr_len = sockaddr_len;
 
         priv->sock = sys_socket(sa_family, SOCK_STREAM, 0);
-        if (priv->sock == -1) {
+        if (priv->sock < 0) {
             gf_log(this->name, GF_LOG_ERROR, "socket creation failed (%s)",
                    strerror(errno));
             ret = -1;
@@ -3499,7 +3405,7 @@ socket_connect(rpc_transport_t *this, int port)
          */
         if (priv->windowsize != 0) {
             if (setsockopt(priv->sock, SOL_SOCKET, SO_RCVBUF, &priv->windowsize,
-                           sizeof(priv->windowsize)) < 0) {
+                           sizeof(priv->windowsize)) != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "setting receive window "
                        "size failed: %d: %d: %s",
@@ -3507,7 +3413,7 @@ socket_connect(rpc_transport_t *this, int port)
             }
 
             if (setsockopt(priv->sock, SOL_SOCKET, SO_SNDBUF, &priv->windowsize,
-                           sizeof(priv->windowsize)) < 0) {
+                           sizeof(priv->windowsize)) != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "setting send window size "
                        "failed: %d: %d: %s",
@@ -3529,30 +3435,32 @@ socket_connect(rpc_transport_t *this, int port)
         }
 #endif
 
-        if (priv->nodelay && (sa_family != AF_UNIX)) {
-            ret = __socket_nodelay(priv->sock);
-
-            if (ret == -1) {
-                gf_log(this->name, GF_LOG_ERROR, "NODELAY on %d failed (%s)",
-                       priv->sock, strerror(errno));
+        if (sa_family != AF_UNIX) {
+            if (priv->nodelay) {
+                ret = __socket_nodelay(priv->sock);
+                if (ret != 0) {
+                    gf_log(this->name, GF_LOG_ERROR,
+                           "NODELAY on %d failed (%s)", priv->sock,
+                           strerror(errno));
+                }
             }
-        }
 
-        if (priv->keepalive && sa_family != AF_UNIX) {
-            ret = __socket_keepalive(priv->sock, sa_family,
-                                     priv->keepaliveintvl, priv->keepaliveidle,
-                                     priv->keepalivecnt, priv->timeout);
-            if (ret == -1)
-                gf_log(this->name, GF_LOG_ERROR, "Failed to set keep-alive: %s",
-                       strerror(errno));
+            if (priv->keepalive) {
+                ret = __socket_keepalive(
+                    priv->sock, sa_family, priv->keepaliveintvl,
+                    priv->keepaliveidle, priv->keepalivecnt, priv->timeout);
+                if (ret != 0)
+                    gf_log(this->name, GF_LOG_ERROR,
+                           "Failed to set keep-alive: %s", strerror(errno));
+            }
         }
 
         SA(&this->myinfo.sockaddr)->sa_family = SA(&this->peerinfo.sockaddr)
                                                     ->sa_family;
 
         /* If a source addr is explicitly specified, use it */
-        ret = dict_get_str(this->options, "transport.socket.source-addr",
-                           &local_addr);
+        ret = dict_get_str_sizen(this->options, "transport.socket.source-addr",
+                                 &local_addr);
         if (!ret && SA(&this->myinfo.sockaddr)->sa_family == AF_INET) {
             addr = (struct sockaddr_in *)(&this->myinfo.sockaddr);
             ret = inet_pton(AF_INET, local_addr, &(addr->sin_addr.s_addr));
@@ -3564,7 +3472,7 @@ socket_connect(rpc_transport_t *this, int port)
 
         ret = client_bind(this, SA(&this->myinfo.sockaddr),
                           &this->myinfo.sockaddr_len, priv->sock);
-        if (ret == -1) {
+        if (ret < 0) {
             gf_log(this->name, GF_LOG_WARNING, "client bind failed: %s",
                    strerror(errno));
             goto handler;
@@ -3573,7 +3481,7 @@ socket_connect(rpc_transport_t *this, int port)
         /* make socket non-blocking for all types of sockets */
         if (!priv->bio) {
             ret = __socket_nonblock(priv->sock);
-            if (ret == -1) {
+            if (ret != 0) {
                 gf_log(this->name, GF_LOG_ERROR, "NBIO on %d failed (%s)",
                        priv->sock, strerror(errno));
                 goto handler;
@@ -3600,7 +3508,7 @@ socket_connect(rpc_transport_t *this, int port)
 
         connect_attempted = _gf_true;
 
-        if (ret == -1 && errno == ENOENT && ign_enoent) {
+        if ((ret != 0) && (errno == ENOENT) && ign_enoent) {
             gf_log(this->name, GF_LOG_WARNING,
                    "Ignore failed connection attempt on %s, (%s) ",
                    this->peerinfo.identifier, strerror(errno));
@@ -3618,7 +3526,7 @@ socket_connect(rpc_transport_t *this, int port)
             goto handler;
         }
 
-        if (ret == -1 && ((errno != EINPROGRESS) && (errno != ENOENT))) {
+        if ((ret != 0) && (errno != EINPROGRESS) && (errno != ENOENT)) {
             /* For unix path based sockets, the socket path is
              * cryptic (md5sum of path) and may not be useful for
              * the user in debugging so log it in DEBUG
@@ -3682,8 +3590,8 @@ socket_connect(rpc_transport_t *this, int port)
     pthread_mutex_unlock(&priv->out_lock);
 
 err:
-    /* if sock != -1, then cleanup is done from the event handler */
-    if (ret == -1 && sock == -1) {
+    /* if sock >= 0, then cleanup is done from the event handler */
+    if ((ret < 0) && (sock < 0)) {
         /* Cleaup requires to send notification to upper layer which
            intern holds the big_lock. There can be dead-lock situation
            if big_lock is already held by the current thread.
@@ -3737,20 +3645,20 @@ socket_listen(rpc_transport_t *this)
     }
     pthread_mutex_unlock(&priv->out_lock);
 
-    if (sock != -1) {
+    if (sock >= 0) {
         gf_log_callingfn(this->name, GF_LOG_DEBUG, "already listening");
         return ret;
     }
 
     ret = socket_server_get_local_sockaddr(this, SA(&sockaddr), &sockaddr_len,
                                            &sa_family);
-    if (ret == -1) {
+    if (ret < 0) {
         return ret;
     }
 
     pthread_mutex_lock(&priv->out_lock);
     {
-        if (priv->sock != -1) {
+        if (priv->sock >= 0) {
             gf_log(this->name, GF_LOG_DEBUG, "already listening");
             goto unlock;
         }
@@ -3760,7 +3668,7 @@ socket_listen(rpc_transport_t *this)
 
         priv->sock = sys_socket(sa_family, SOCK_STREAM, 0);
 
-        if (priv->sock == -1) {
+        if (priv->sock < 0) {
             gf_log(this->name, GF_LOG_ERROR, "socket creation failed (%s)",
                    strerror(errno));
             goto unlock;
@@ -3771,7 +3679,7 @@ socket_listen(rpc_transport_t *this)
          */
         if (priv->windowsize != 0) {
             if (setsockopt(priv->sock, SOL_SOCKET, SO_RCVBUF, &priv->windowsize,
-                           sizeof(priv->windowsize)) < 0) {
+                           sizeof(priv->windowsize)) != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "setting receive window size "
                        "failed: %d: %d: %s",
@@ -3779,7 +3687,7 @@ socket_listen(rpc_transport_t *this)
             }
 
             if (setsockopt(priv->sock, SOL_SOCKET, SO_SNDBUF, &priv->windowsize,
-                           sizeof(priv->windowsize)) < 0) {
+                           sizeof(priv->windowsize)) != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "setting send window size failed:"
                        " %d: %d: %s",
@@ -3789,7 +3697,7 @@ socket_listen(rpc_transport_t *this)
 
         if (priv->nodelay && (sa_family != AF_UNIX)) {
             ret = __socket_nodelay(priv->sock);
-            if (ret == -1) {
+            if (ret != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "setsockopt() failed for NODELAY (%s)", strerror(errno));
             }
@@ -3798,7 +3706,7 @@ socket_listen(rpc_transport_t *this)
         if (!priv->bio) {
             ret = __socket_nonblock(priv->sock);
 
-            if (ret == -1) {
+            if (ret != 0) {
                 gf_log(this->name, GF_LOG_ERROR,
                        "NBIO on socket %d failed "
                        "(errno:%s); closing socket",
@@ -3812,7 +3720,7 @@ socket_listen(rpc_transport_t *this)
         /* coverity[SLEEP] */
         ret = __socket_server_bind(this);
 
-        if ((ret == -EADDRINUSE) || (ret == -1)) {
+        if (ret < 0) {
             /* logged inside __socket_server_bind() */
             gf_log(this->name, GF_LOG_ERROR,
                    "__socket_server_bind failed;"
@@ -3828,7 +3736,7 @@ socket_listen(rpc_transport_t *this)
 
         ret = listen(priv->sock, priv->backlog);
 
-        if (ret == -1) {
+        if (ret != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "could not set socket %d to listen mode (errno:%s); "
                    "closing socket",
@@ -3895,7 +3803,7 @@ socket_submit_outgoing_msg(rpc_transport_t *this, rpc_transport_msg_t *msg)
             goto unlock;
 
         if (list_empty(&priv->ioq)) {
-            ret = __socket_ioq_churn_entry(this, entry, 1);
+            ret = __socket_ioq_churn_entry(this, entry);
 
             if (ret == 0) {
                 need_append = 0;
@@ -4067,7 +3975,7 @@ reconfigure(rpc_transport_t *this, dict_t *options)
 
     if (dict_get_str_sizen(options, "transport.socket.keepalive", &optstr) ==
         0) {
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "'transport.socket.keepalive' takes only "
                    "boolean options, not taking any action");
@@ -4085,34 +3993,36 @@ reconfigure(rpc_transport_t *this, dict_t *options)
                              &(priv->timeout)) != 0)
         priv->timeout = GF_NETWORK_TIMEOUT;
     gf_log(this->name, GF_LOG_DEBUG,
-           "Reconfigued transport.tcp-user-timeout=%d", priv->timeout);
+           "Reconfigured transport.tcp-user-timeout=%d", priv->timeout);
 
     if (dict_get_uint32(options, "transport.listen-backlog", &backlog) == 0) {
         priv->backlog = backlog;
         gf_log(this->name, GF_LOG_DEBUG,
-               "Reconfigued transport.listen-backlog=%d", priv->backlog);
+               "Reconfigured transport.listen-backlog=%d", priv->backlog);
     }
 
-    if (dict_get_int32_sizen(options, "transport.socket.keepalive-time",
-                             &(priv->keepaliveidle)) != 0)
-        priv->keepaliveidle = GF_KEEPALIVE_TIME;
-    gf_log(this->name, GF_LOG_DEBUG,
-           "Reconfigued transport.socket.keepalive-time=%d",
-           priv->keepaliveidle);
+    if (priv->keepalive) {
+        if (dict_get_int32_sizen(options, "transport.socket.keepalive-time",
+                                 &(priv->keepaliveidle)) != 0)
+            priv->keepaliveidle = GF_KEEPALIVE_TIME;
+        gf_log(this->name, GF_LOG_DEBUG,
+               "Reconfigured transport.socket.keepalive-time=%d",
+               priv->keepaliveidle);
 
-    if (dict_get_int32_sizen(options, "transport.socket.keepalive-interval",
-                             &(priv->keepaliveintvl)) != 0)
-        priv->keepaliveintvl = GF_KEEPALIVE_INTERVAL;
-    gf_log(this->name, GF_LOG_DEBUG,
-           "Reconfigued transport.socket.keepalive-interval=%d",
-           priv->keepaliveintvl);
+        if (dict_get_int32_sizen(options, "transport.socket.keepalive-interval",
+                                 &(priv->keepaliveintvl)) != 0)
+            priv->keepaliveintvl = GF_KEEPALIVE_INTERVAL;
+        gf_log(this->name, GF_LOG_DEBUG,
+               "Reconfigured transport.socket.keepalive-interval=%d",
+               priv->keepaliveintvl);
 
-    if (dict_get_int32_sizen(options, "transport.socket.keepalive-count",
-                             &(priv->keepalivecnt)) != 0)
-        priv->keepalivecnt = GF_KEEPALIVE_COUNT;
-    gf_log(this->name, GF_LOG_DEBUG,
-           "Reconfigued transport.socket.keepalive-count=%d",
-           priv->keepalivecnt);
+        if (dict_get_int32_sizen(options, "transport.socket.keepalive-count",
+                                 &(priv->keepalivecnt)) != 0)
+            priv->keepalivecnt = GF_KEEPALIVE_COUNT;
+        gf_log(this->name, GF_LOG_DEBUG,
+               "Reconfigured transport.socket.keepalive-count=%d",
+               priv->keepalivecnt);
+    }
 
     optstr = NULL;
     if (dict_get_str_sizen(options, "tcp-window-size", &optstr) == 0) {
@@ -4129,7 +4039,7 @@ reconfigure(rpc_transport_t *this, dict_t *options)
     if (data) {
         optstr = data_to_str(data);
 
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "'non-blocking-io' takes only boolean options,"
                    " not taking any action");
@@ -4144,7 +4054,7 @@ reconfigure(rpc_transport_t *this, dict_t *options)
 
     if (!priv->bio) {
         ret = __socket_nonblock(priv->sock);
-        if (ret == -1) {
+        if (ret != 0) {
             gf_log(this->name, GF_LOG_WARNING, "NBIO on %d failed (%s)",
                    priv->sock, strerror(errno));
             goto out;
@@ -4258,6 +4168,34 @@ static void __attribute__((destructor)) fini_openssl_mt(void)
     ERR_free_strings();
 }
 
+/* The function returns 0 if AES bit is enabled on the CPU */
+static int
+ssl_check_aes_bit(void)
+{
+    FILE *fp = fopen("/proc/cpuinfo", "r");
+    int ret = 1;
+    size_t len = 0;
+    char *line = NULL;
+    char *match = NULL;
+
+    GF_ASSERT(fp != NULL);
+
+    while (getline(&line, &len, fp) > 0) {
+        if (!strncmp(line, "flags", 5)) {
+            match = strstr(line, " aes");
+            if ((match != NULL) && ((match[4] == ' ') || (match[4] == 0))) {
+                ret = 0;
+                break;
+            }
+        }
+    }
+
+    free(line);
+    fclose(fp);
+
+    return ret;
+}
+
 static int
 ssl_setup_connection_params(rpc_transport_t *this)
 {
@@ -4268,12 +4206,21 @@ ssl_setup_connection_params(rpc_transport_t *this)
     char *cipher_list = DEFAULT_CIPHER_LIST;
     char *dh_param = DEFAULT_DH_PARAM;
     char *ec_curve = DEFAULT_EC_CURVE;
+    gf_boolean_t dh_flag = _gf_false;
 
     priv = this->private;
 
     if (priv->ssl_ctx != NULL) {
         gf_log(this->name, GF_LOG_TRACE, "found old SSL context!");
         return 0;
+    }
+
+    if (!priv->ssl_enabled && !priv->mgmt_ssl) {
+        return 0;
+    }
+
+    if (!ssl_check_aes_bit()) {
+        cipher_list = "AES128:" DEFAULT_CIPHER_LIST;
     }
 
     priv->ssl_own_cert = DEFAULT_CERT_PATH;
@@ -4322,28 +4269,25 @@ ssl_setup_connection_params(rpc_transport_t *this)
             priv->crl_path = gf_strdup(optstr);
     }
 
-    gf_log(this->name, priv->ssl_enabled ? GF_LOG_INFO : GF_LOG_DEBUG,
-           "SSL support on the I/O path is %s",
-           priv->ssl_enabled ? "ENABLED" : "NOT enabled");
-    gf_log(this->name, priv->mgmt_ssl ? GF_LOG_INFO : GF_LOG_DEBUG,
-           "SSL support for glusterd is %s",
-           priv->mgmt_ssl ? "ENABLED" : "NOT enabled");
-
     if (!priv->mgmt_ssl) {
         if (!dict_get_int32_sizen(this->options, SSL_CERT_DEPTH_OPT,
                                   &cert_depth)) {
-            gf_log(this->name, GF_LOG_INFO, "using certificate depth %d",
-                   cert_depth);
         }
     } else {
         cert_depth = this->ctx->ssl_cert_depth;
-        gf_log(this->name, GF_LOG_INFO, "using certificate depth %d",
-               cert_depth);
     }
+    gf_log(this->name, priv->ssl_enabled ? GF_LOG_INFO : GF_LOG_DEBUG,
+           "SSL support for MGMT is %s IO path is %s certificate depth is %d "
+           "for peer %s",
+           (priv->mgmt_ssl ? "ENABLED" : "NOT enabled"),
+           (priv->ssl_enabled ? "ENABLED" : "NOT enabled"), cert_depth,
+           this->peerinfo.identifier);
+
     if (!dict_get_str_sizen(this->options, SSL_CIPHER_LIST_OPT, &cipher_list)) {
         gf_log(this->name, GF_LOG_INFO, "using cipher list %s", cipher_list);
     }
     if (!dict_get_str_sizen(this->options, SSL_DH_PARAM_OPT, &dh_param)) {
+        dh_flag = _gf_true;
         gf_log(this->name, GF_LOG_INFO, "using DH parameters %s", dh_param);
     }
     if (!dict_get_str_sizen(this->options, SSL_EC_CURVE_OPT, &ec_curve)) {
@@ -4378,12 +4322,15 @@ ssl_setup_connection_params(rpc_transport_t *this)
 #ifdef SSL_OP_NO_COMPRESSION
         SSL_CTX_set_options(priv->ssl_ctx, SSL_OP_NO_COMPRESSION);
 #endif
-
-        if ((bio = BIO_new_file(dh_param, "r")) == NULL) {
-            gf_log(this->name, GF_LOG_INFO,
-                   "failed to open %s, "
-                   "DH ciphers are disabled",
-                   dh_param);
+        /* Upload file to bio wrapper only if dh param is configured
+         */
+        if (dh_flag) {
+            if ((bio = BIO_new_file(dh_param, "r")) == NULL) {
+                gf_log(this->name, GF_LOG_ERROR,
+                       "failed to open %s, "
+                       "DH ciphers are disabled",
+                       dh_param);
+            }
         }
 
         if (bio != NULL) {
@@ -4539,7 +4486,7 @@ socket_init(rpc_transport_t *this)
     if (data) {
         optstr = data_to_str(data);
 
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "'non-blocking-io' takes only boolean options,"
                    " not taking any action");
@@ -4559,7 +4506,7 @@ socket_init(rpc_transport_t *this)
     if (data) {
         optstr = data_to_str(data);
 
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "'transport.socket.nodelay' takes only "
                    "boolean options, not taking any action");
@@ -4590,7 +4537,7 @@ socket_init(rpc_transport_t *this)
     priv->keepalivecnt = GF_KEEPALIVE_COUNT;
     if (dict_get_str_sizen(this->options, "transport.socket.keepalive",
                            &optstr) == 0) {
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_ERROR,
                    "'transport.socket.keepalive' takes only "
                    "boolean options, not taking any action");
@@ -4604,25 +4551,29 @@ socket_init(rpc_transport_t *this)
     if (dict_get_int32_sizen(this->options, "transport.tcp-user-timeout",
                              &(priv->timeout)) != 0)
         priv->timeout = GF_NETWORK_TIMEOUT;
-    gf_log(this->name, GF_LOG_DEBUG, "Configued transport.tcp-user-timeout=%d",
+    gf_log(this->name, GF_LOG_DEBUG, "Configured transport.tcp-user-timeout=%d",
            priv->timeout);
 
-    if (dict_get_int32_sizen(this->options, "transport.socket.keepalive-time",
-                             &(priv->keepaliveidle)) != 0) {
-        priv->keepaliveidle = GF_KEEPALIVE_TIME;
-    }
+    if (priv->keepalive) {
+        if (dict_get_int32_sizen(this->options,
+                                 "transport.socket.keepalive-time",
+                                 &(priv->keepaliveidle)) != 0) {
+            priv->keepaliveidle = GF_KEEPALIVE_TIME;
+        }
 
-    if (dict_get_int32_sizen(this->options,
-                             "transport.socket.keepalive-interval",
-                             &(priv->keepaliveintvl)) != 0) {
-        priv->keepaliveintvl = GF_KEEPALIVE_INTERVAL;
-    }
+        if (dict_get_int32_sizen(this->options,
+                                 "transport.socket.keepalive-interval",
+                                 &(priv->keepaliveintvl)) != 0) {
+            priv->keepaliveintvl = GF_KEEPALIVE_INTERVAL;
+        }
 
-    if (dict_get_int32_sizen(this->options, "transport.socket.keepalive-count",
-                             &(priv->keepalivecnt)) != 0)
-        priv->keepalivecnt = GF_KEEPALIVE_COUNT;
-    gf_log(this->name, GF_LOG_DEBUG, "Reconfigued transport.keepalivecnt=%d",
-           priv->keepalivecnt);
+        if (dict_get_int32_sizen(this->options,
+                                 "transport.socket.keepalive-count",
+                                 &(priv->keepalivecnt)) != 0)
+            priv->keepalivecnt = GF_KEEPALIVE_COUNT;
+        gf_log(this->name, GF_LOG_DEBUG,
+               "Reconfigured transport.keepalivecnt=%d", priv->keepalivecnt);
+    }
 
     if (dict_get_uint32(this->options, "transport.listen-backlog",
                         &(priv->backlog)) != 0) {
@@ -4636,7 +4587,7 @@ socket_init(rpc_transport_t *this)
     data = dict_get_sizen(this->options, "transport.socket.read-fail-log");
     if (data) {
         optstr = data_to_str(data);
-        if (gf_string2boolean(optstr, &tmp_bool) == -1) {
+        if (gf_string2boolean(optstr, &tmp_bool) != 0) {
             gf_log(this->name, GF_LOG_WARNING,
                    "'transport.socket.read-fail-log' takes only "
                    "boolean options; logging socket read fails");
@@ -4673,10 +4624,10 @@ fini(rpc_transport_t *this)
 
     priv = this->private;
     if (priv) {
-        if (priv->sock != -1) {
+        if (priv->sock >= 0) {
             pthread_mutex_lock(&priv->out_lock);
             {
-                __socket_ioq_flush(this);
+                __socket_ioq_flush(priv);
                 __socket_reset(this);
             }
             pthread_mutex_unlock(&priv->out_lock);
@@ -4686,12 +4637,17 @@ fini(rpc_transport_t *this)
         pthread_mutex_destroy(&priv->out_lock);
         pthread_mutex_destroy(&priv->cond_lock);
         pthread_cond_destroy(&priv->cond);
+
+        GF_ASSERT(priv->notify.in_progress == 0);
+        pthread_mutex_destroy(&priv->notify.lock);
+        pthread_cond_destroy(&priv->notify.cond);
+
         if (priv->use_ssl && priv->ssl_ssl) {
             SSL_clear(priv->ssl_ssl);
             SSL_free(priv->ssl_ssl);
             priv->ssl_ssl = NULL;
         }
-        if (priv->use_ssl && priv->ssl_ctx) {
+        if (priv->ssl_ctx) {
             SSL_CTX_free(priv->ssl_ctx);
             priv->ssl_ctx = NULL;
         }
@@ -4720,7 +4676,7 @@ init(rpc_transport_t *this)
 
     ret = socket_init(this);
 
-    if (ret == -1) {
+    if (ret < 0) {
         gf_log(this->name, GF_LOG_DEBUG, "socket_init() failed");
     }
 
@@ -4770,7 +4726,6 @@ struct volume_options options[] = {
     {.key = {"transport.socket.nodelay"},
      .type = GF_OPTION_TYPE_BOOL,
      .default_value = "1"},
-    {.key = {"transport.socket.lowlat"}, .type = GF_OPTION_TYPE_BOOL},
     {.key = {"transport.socket.keepalive"},
      .type = GF_OPTION_TYPE_BOOL,
      .op_version = {1},

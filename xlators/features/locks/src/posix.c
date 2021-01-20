@@ -148,16 +148,46 @@ fetch_pathinfo(xlator_t *, inode_t *, int32_t *, char **);
         }                                                                      \
     } while (0)
 
+#define PL_INODE_REMOVE(_fop, _frame, _xl, _loc1, _loc2, _cont, _cbk,          \
+                        _args...)                                              \
+    ({                                                                         \
+        struct list_head contend;                                              \
+        pl_inode_t *__pl_inode;                                                \
+        call_stub_t *__stub;                                                   \
+        int32_t __error;                                                       \
+        INIT_LIST_HEAD(&contend);                                              \
+        __error = pl_inode_remove_prepare(_xl, _frame, _loc2 ? _loc2 : _loc1,  \
+                                          &__pl_inode, &contend);              \
+        if (__error < 0) {                                                     \
+            __stub = fop_##_fop##_stub(_frame, _cont, ##_args);                \
+            __error = pl_inode_remove_complete(_xl, __pl_inode, __stub,        \
+                                               &contend);                      \
+        } else if (__error == 0) {                                             \
+            PL_LOCAL_GET_REQUESTS(_frame, _xl, xdata, ((fd_t *)NULL), _loc1,   \
+                                  _loc2);                                      \
+            STACK_WIND_COOKIE(_frame, _cbk, __pl_inode, FIRST_CHILD(_xl),      \
+                              FIRST_CHILD(_xl)->fops->_fop, ##_args);          \
+        }                                                                      \
+        __error;                                                               \
+    })
+
 gf_boolean_t
 pl_has_xdata_requests(dict_t *xdata)
 {
-    static char *reqs[] = {GLUSTERFS_ENTRYLK_COUNT,     GLUSTERFS_INODELK_COUNT,
-                           GLUSTERFS_INODELK_DOM_COUNT, GLUSTERFS_POSIXLK_COUNT,
-                           GLUSTERFS_PARENT_ENTRYLK,    NULL};
-    static int reqs_size[] = {
-        SLEN(GLUSTERFS_ENTRYLK_COUNT),     SLEN(GLUSTERFS_INODELK_COUNT),
-        SLEN(GLUSTERFS_INODELK_DOM_COUNT), SLEN(GLUSTERFS_POSIXLK_COUNT),
-        SLEN(GLUSTERFS_PARENT_ENTRYLK),    0};
+    static char *reqs[] = {GLUSTERFS_ENTRYLK_COUNT,
+                           GLUSTERFS_INODELK_COUNT,
+                           GLUSTERFS_INODELK_DOM_COUNT,
+                           GLUSTERFS_POSIXLK_COUNT,
+                           GLUSTERFS_PARENT_ENTRYLK,
+                           GLUSTERFS_MULTIPLE_DOM_LK_CNT_REQUESTS,
+                           NULL};
+    static int reqs_size[] = {SLEN(GLUSTERFS_ENTRYLK_COUNT),
+                              SLEN(GLUSTERFS_INODELK_COUNT),
+                              SLEN(GLUSTERFS_INODELK_DOM_COUNT),
+                              SLEN(GLUSTERFS_POSIXLK_COUNT),
+                              SLEN(GLUSTERFS_PARENT_ENTRYLK),
+                              SLEN(GLUSTERFS_MULTIPLE_DOM_LK_CNT_REQUESTS),
+                              0};
     int i = 0;
 
     if (!xdata)
@@ -170,11 +200,21 @@ pl_has_xdata_requests(dict_t *xdata)
     return _gf_false;
 }
 
+static int
+dict_delete_domain_key(dict_t *dict, char *key, data_t *value, void *data)
+{
+    dict_del(dict, key);
+    return 0;
+}
+
 void
 pl_get_xdata_requests(pl_local_t *local, dict_t *xdata)
 {
     if (!local || !xdata)
         return;
+
+    GF_ASSERT(local->xdata == NULL);
+    local->xdata = dict_copy_with_ref(xdata, NULL);
 
     if (dict_get_sizen(xdata, GLUSTERFS_ENTRYLK_COUNT)) {
         local->entrylk_count_req = 1;
@@ -183,6 +223,12 @@ pl_get_xdata_requests(pl_local_t *local, dict_t *xdata)
     if (dict_get_sizen(xdata, GLUSTERFS_INODELK_COUNT)) {
         local->inodelk_count_req = 1;
         dict_del_sizen(xdata, GLUSTERFS_INODELK_COUNT);
+    }
+    if (dict_get_sizen(xdata, GLUSTERFS_MULTIPLE_DOM_LK_CNT_REQUESTS)) {
+        local->multiple_dom_lk_requests = 1;
+        dict_del_sizen(xdata, GLUSTERFS_MULTIPLE_DOM_LK_CNT_REQUESTS);
+        dict_foreach_fnmatch(xdata, GLUSTERFS_INODELK_DOM_PREFIX "*",
+                             dict_delete_domain_key, NULL);
     }
 
     local->inodelk_dom_count_req = dict_get_sizen(xdata,
@@ -211,7 +257,7 @@ pl_needs_xdata_response(pl_local_t *local)
 
     if (local->parent_entrylk_req || local->entrylk_count_req ||
         local->inodelk_dom_count_req || local->inodelk_count_req ||
-        local->posixlk_count_req)
+        local->posixlk_count_req || local->multiple_dom_lk_requests)
         return _gf_true;
 
     return _gf_false;
@@ -411,6 +457,80 @@ pl_posixlk_xattr_fill(xlator_t *this, inode_t *inode, dict_t *dict,
 }
 
 void
+pl_inodelk_xattr_fill_each(xlator_t *this, inode_t *inode, dict_t *dict,
+                           char *domname, gf_boolean_t keep_max, char *key)
+{
+    int32_t count = 0;
+    int32_t maxcount = -1;
+    int ret = -1;
+
+    if (keep_max) {
+        ret = dict_get_int32(dict, key, &maxcount);
+        if (ret < 0)
+            gf_msg_debug(this->name, 0, " Failed to fetch the value for key %s",
+                         GLUSTERFS_INODELK_COUNT);
+    }
+    count = get_inodelk_count(this, inode, domname);
+    if (maxcount >= count)
+        return;
+
+    ret = dict_set_int32(dict, key, count);
+    if (ret < 0) {
+        gf_msg_debug(this->name, 0,
+                     "Failed to set count for "
+                     "key %s",
+                     key);
+    }
+
+    return;
+}
+
+static int
+pl_inodelk_xattr_fill_multiple(dict_t *this, char *key, data_t *value,
+                               void *data)
+{
+    multi_dom_lk_data *d = data;
+    char *tmp_key = NULL;
+    char *save_ptr = NULL;
+
+    tmp_key = gf_strdup(key);
+    if (!tmp_key)
+        return -1;
+
+    strtok_r(tmp_key, ":", &save_ptr);
+    if (!*save_ptr) {
+        if (tmp_key)
+            GF_FREE(tmp_key);
+        gf_msg(THIS->name, GF_LOG_ERROR, 0, EINVAL,
+               "Could not tokenize domain string from key %s", key);
+        return -1;
+    }
+
+    pl_inodelk_xattr_fill_each(d->this, d->inode, d->xdata_rsp, save_ptr,
+                               d->keep_max, key);
+    if (tmp_key)
+        GF_FREE(tmp_key);
+
+    return 0;
+}
+
+void
+pl_fill_multiple_dom_lk_requests(xlator_t *this, pl_local_t *local,
+                                 inode_t *inode, dict_t *dict,
+                                 gf_boolean_t keep_max)
+{
+    multi_dom_lk_data data;
+
+    data.this = this;
+    data.inode = inode;
+    data.xdata_rsp = dict;
+    data.keep_max = keep_max;
+
+    dict_foreach_fnmatch(local->xdata, GLUSTERFS_INODELK_DOM_PREFIX "*",
+                         pl_inodelk_xattr_fill_multiple, &data);
+}
+
+void
 pl_set_xdata_response(xlator_t *this, pl_local_t *local, inode_t *parent,
                       inode_t *inode, char *name, dict_t *xdata,
                       gf_boolean_t max_lock)
@@ -437,6 +557,9 @@ pl_set_xdata_response(xlator_t *this, pl_local_t *local, inode_t *parent,
 
     if (local->posixlk_count_req)
         pl_posixlk_xattr_fill(this, inode, xdata, max_lock);
+
+    if (local->multiple_dom_lk_requests)
+        pl_fill_multiple_dom_lk_requests(this, local, inode, xdata, max_lock);
 }
 
 /* Checks whether the region where fop is acting upon conflicts
@@ -775,9 +898,6 @@ pl_truncate_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 {
     pl_local_t *local = frame->local;
 
-    if (local->xdata)
-        dict_unref(local->xdata);
-
     pl_track_io_fop_count(local, this, DECREMENT);
 
     if (local->op == GF_FOP_TRUNCATE)
@@ -934,9 +1054,6 @@ unwind:
                "truncate failed with "
                "ret: %d, error: %s",
                op_ret, strerror(op_errno));
-
-        if (local->xdata)
-            dict_unref(local->xdata);
 
         switch (local->op) {
             case GF_FOP_TRUNCATE:
@@ -2871,11 +2988,85 @@ out:
     return ret;
 }
 
+static int32_t
+pl_request_link_count(dict_t **pxdata)
+{
+    dict_t *xdata;
+
+    xdata = *pxdata;
+    if (xdata == NULL) {
+        xdata = dict_new();
+        if (xdata == NULL) {
+            return ENOMEM;
+        }
+    } else {
+        dict_ref(xdata);
+    }
+
+    if (dict_set_uint32(xdata, GET_LINK_COUNT, 0) != 0) {
+        dict_unref(xdata);
+        return ENOMEM;
+    }
+
+    *pxdata = xdata;
+
+    return 0;
+}
+
+static int32_t
+pl_check_link_count(dict_t *xdata)
+{
+    int32_t count;
+
+    /* In case we are unable to read the link count from xdata, we take a
+     * conservative approach and return -2, which will prevent the inode from
+     * being considered deleted. In fact it will cause link tracking for this
+     * inode to be disabled completely to avoid races. */
+
+    if (xdata == NULL) {
+        return -2;
+    }
+
+    if (dict_get_int32(xdata, GET_LINK_COUNT, &count) != 0) {
+        return -2;
+    }
+
+    return count;
+}
+
 int32_t
 pl_lookup_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
               int32_t op_errno, inode_t *inode, struct iatt *buf, dict_t *xdata,
               struct iatt *postparent)
 {
+    pl_inode_t *pl_inode;
+
+    if (op_ret >= 0) {
+        pl_inode = pl_inode_get(this, inode, NULL);
+        if (pl_inode == NULL) {
+            PL_STACK_UNWIND(lookup, xdata, frame, -1, ENOMEM, NULL, NULL, NULL,
+                            NULL);
+            return 0;
+        }
+
+        pthread_mutex_lock(&pl_inode->mutex);
+
+        /* We only update the link count if we previously didn't know it.
+         * Doing it always can lead to races since lookup is not executed
+         * atomically most of the times. */
+        if (pl_inode->links == -2) {
+            pl_inode->links = pl_check_link_count(xdata);
+            if (buf->ia_type == IA_IFDIR) {
+                /* Directories have at least 2 links. To avoid special handling
+                 * for directories, we simply decrement the value here to make
+                 * them equivalent to regular files. */
+                pl_inode->links--;
+            }
+        }
+
+        pthread_mutex_unlock(&pl_inode->mutex);
+    }
+
     PL_STACK_UNWIND(lookup, xdata, frame, op_ret, op_errno, inode, buf, xdata,
                     postparent);
     return 0;
@@ -2884,9 +3075,17 @@ pl_lookup_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
 int32_t
 pl_lookup(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
 {
-    PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), loc, NULL);
-    STACK_WIND(frame, pl_lookup_cbk, FIRST_CHILD(this),
-               FIRST_CHILD(this)->fops->lookup, loc, xdata);
+    int32_t error;
+
+    error = pl_request_link_count(&xdata);
+    if (error == 0) {
+        PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), loc, NULL);
+        STACK_WIND(frame, pl_lookup_cbk, FIRST_CHILD(this),
+                   FIRST_CHILD(this)->fops->lookup, loc, xdata);
+        dict_unref(xdata);
+    } else {
+        STACK_UNWIND_STRICT(lookup, frame, -1, error, NULL, NULL, NULL, NULL);
+    }
     return 0;
 }
 
@@ -3411,10 +3610,10 @@ pl_dump_lock(char *str, int size, struct gf_flock *flock, gf_lkowner_t *owner,
              time_t *blkd_time, gf_boolean_t active)
 {
     char *type_str = NULL;
-    char granted[256] = {
+    char granted[GF_TIMESTR_SIZE] = {
         0,
     };
-    char blocked[256] = {
+    char blocked[GF_TIMESTR_SIZE] = {
         0,
     };
 
@@ -3465,10 +3664,10 @@ __dump_entrylks(pl_inode_t *pl_inode)
 {
     pl_dom_list_t *dom = NULL;
     pl_entry_lock_t *lock = NULL;
-    char blocked[256] = {
+    char blocked[GF_TIMESTR_SIZE] = {
         0,
     };
-    char granted[256] = {
+    char granted[GF_TIMESTR_SIZE] = {
         0,
     };
     int count = 0;
@@ -3488,10 +3687,10 @@ __dump_entrylks(pl_inode_t *pl_inode)
 
         list_for_each_entry(lock, &dom->entrylk_list, domain_list)
         {
-            gf_time_fmt(granted, sizeof(granted), lock->granted_time.tv_sec,
+            gf_time_fmt(granted, sizeof(granted), lock->granted_time,
                         gf_timefmt_FT);
             gf_proc_dump_build_key(key, k, "entrylk[%d](ACTIVE)", count);
-            if (lock->blkd_time.tv_sec == 0) {
+            if (lock->blkd_time == 0) {
                 snprintf(tmp, sizeof(tmp), ENTRY_GRNTD_FMT,
                          lock->type == ENTRYLK_RDLCK ? "ENTRYLK_RDLCK"
                                                      : "ENTRYLK_WRLCK",
@@ -3499,7 +3698,7 @@ __dump_entrylks(pl_inode_t *pl_inode)
                          lkowner_utoa(&lock->owner), lock->client,
                          lock->connection_id, granted);
             } else {
-                gf_time_fmt(blocked, sizeof(blocked), lock->blkd_time.tv_sec,
+                gf_time_fmt(blocked, sizeof(blocked), lock->blkd_time,
                             gf_timefmt_FT);
                 snprintf(tmp, sizeof(tmp), ENTRY_BLKD_GRNTD_FMT,
                          lock->type == ENTRYLK_RDLCK ? "ENTRYLK_RDLCK"
@@ -3516,7 +3715,7 @@ __dump_entrylks(pl_inode_t *pl_inode)
 
         list_for_each_entry(lock, &dom->blocked_entrylks, blocked_locks)
         {
-            gf_time_fmt(blocked, sizeof(blocked), lock->blkd_time.tv_sec,
+            gf_time_fmt(blocked, sizeof(blocked), lock->blkd_time,
                         gf_timefmt_FT);
 
             gf_proc_dump_build_key(key, k, "entrylk[%d](BLOCKED)", count);
@@ -3568,9 +3767,8 @@ __dump_inodelks(pl_inode_t *pl_inode)
 
             SET_FLOCK_PID(&lock->user_flock, lock);
             pl_dump_lock(tmp, sizeof(tmp), &lock->user_flock, &lock->owner,
-                         lock->client, lock->connection_id,
-                         &lock->granted_time.tv_sec, &lock->blkd_time.tv_sec,
-                         _gf_true);
+                         lock->client, lock->connection_id, &lock->granted_time,
+                         &lock->blkd_time, _gf_true);
             gf_proc_dump_write(key, "%s", tmp);
 
             count++;
@@ -3582,8 +3780,8 @@ __dump_inodelks(pl_inode_t *pl_inode)
                                    count);
             SET_FLOCK_PID(&lock->user_flock, lock);
             pl_dump_lock(tmp, sizeof(tmp), &lock->user_flock, &lock->owner,
-                         lock->client, lock->connection_id, 0,
-                         &lock->blkd_time.tv_sec, _gf_false);
+                         lock->client, lock->connection_id, 0, &lock->blkd_time,
+                         _gf_false);
             gf_proc_dump_write(key, "%s", tmp);
 
             count++;
@@ -3616,9 +3814,8 @@ __dump_posixlks(pl_inode_t *pl_inode)
         gf_proc_dump_build_key(key, "posixlk", "posixlk[%d](%s)", count,
                                lock->blocked ? "BLOCKED" : "ACTIVE");
         pl_dump_lock(tmp, sizeof(tmp), &lock->user_flock, &lock->owner,
-                     lock->client, lock->client_uid, &lock->granted_time.tv_sec,
-                     &lock->blkd_time.tv_sec,
-                     (lock->blocked) ? _gf_false : _gf_true);
+                     lock->client, lock->client_uid, &lock->granted_time,
+                     &lock->blkd_time, (lock->blocked) ? _gf_false : _gf_true);
         gf_proc_dump_write(key, "%s", tmp);
 
         count++;
@@ -3702,6 +3899,10 @@ unlock:
             gf_proc_dump_write("posixlk-count", "%d", count);
             __dump_posixlks(pl_inode);
         }
+
+        gf_proc_dump_write("links", "%d", pl_inode->links);
+        gf_proc_dump_write("removes_pending", "%u", pl_inode->remove_running);
+        gf_proc_dump_write("removed", "%u", pl_inode->removed);
     }
     pthread_mutex_unlock(&pl_inode->mutex);
 
@@ -4013,6 +4214,10 @@ fini(xlator_t *this)
     if (!priv)
         return;
     this->private = NULL;
+    if (this->local_pool) {
+        mem_pool_destroy(this->local_pool);
+        this->local_pool = NULL;
+    }
     GF_FREE(priv->brickname);
     GF_FREE(priv);
 
@@ -4043,8 +4248,11 @@ pl_rename_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
               struct iatt *postoldparent, struct iatt *prenewparent,
               struct iatt *postnewparent, dict_t *xdata)
 {
+    pl_inode_remove_cbk(this, cookie, op_ret < 0 ? op_errno : 0);
+
     PL_STACK_UNWIND(rename, xdata, frame, op_ret, op_errno, buf, preoldparent,
                     postoldparent, prenewparent, postnewparent, xdata);
+
     return 0;
 }
 
@@ -4052,10 +4260,15 @@ int32_t
 pl_rename(call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
           dict_t *xdata)
 {
-    PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), oldloc, newloc);
+    int32_t error;
 
-    STACK_WIND(frame, pl_rename_cbk, FIRST_CHILD(this),
-               FIRST_CHILD(this)->fops->rename, oldloc, newloc, xdata);
+    error = PL_INODE_REMOVE(rename, frame, this, oldloc, newloc, pl_rename,
+                            pl_rename_cbk, oldloc, newloc, xdata);
+    if (error > 0) {
+        STACK_UNWIND_STRICT(rename, frame, -1, error, NULL, NULL, NULL, NULL,
+                            NULL, NULL);
+    }
+
     return 0;
 }
 
@@ -4179,8 +4392,11 @@ pl_unlink_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
               int32_t op_errno, struct iatt *preparent, struct iatt *postparent,
               dict_t *xdata)
 {
+    pl_inode_remove_cbk(this, cookie, op_ret < 0 ? op_errno : 0);
+
     PL_STACK_UNWIND(unlink, xdata, frame, op_ret, op_errno, preparent,
                     postparent, xdata);
+
     return 0;
 }
 
@@ -4188,9 +4404,14 @@ int32_t
 pl_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
           dict_t *xdata)
 {
-    PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), loc, NULL);
-    STACK_WIND(frame, pl_unlink_cbk, FIRST_CHILD(this),
-               FIRST_CHILD(this)->fops->unlink, loc, xflag, xdata);
+    int32_t error;
+
+    error = PL_INODE_REMOVE(unlink, frame, this, loc, NULL, pl_unlink,
+                            pl_unlink_cbk, loc, xflag, xdata);
+    if (error > 0) {
+        STACK_UNWIND_STRICT(unlink, frame, -1, error, NULL, NULL, NULL);
+    }
+
     return 0;
 }
 
@@ -4257,8 +4478,11 @@ pl_rmdir_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
              int32_t op_errno, struct iatt *preparent, struct iatt *postparent,
              dict_t *xdata)
 {
+    pl_inode_remove_cbk(this, cookie, op_ret < 0 ? op_errno : 0);
+
     PL_STACK_UNWIND_FOR_CLIENT(rmdir, xdata, frame, op_ret, op_errno, preparent,
                                postparent, xdata);
+
     return 0;
 }
 
@@ -4266,9 +4490,14 @@ int
 pl_rmdir(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflags,
          dict_t *xdata)
 {
-    PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), loc, NULL);
-    STACK_WIND(frame, pl_rmdir_cbk, FIRST_CHILD(this),
-               FIRST_CHILD(this)->fops->rmdir, loc, xflags, xdata);
+    int32_t error;
+
+    error = PL_INODE_REMOVE(rmdir, frame, this, loc, NULL, pl_rmdir,
+                            pl_rmdir_cbk, loc, xflags, xdata);
+    if (error > 0) {
+        STACK_UNWIND_STRICT(rmdir, frame, -1, error, NULL, NULL, NULL);
+    }
+
     return 0;
 }
 
@@ -4298,6 +4527,19 @@ pl_link_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int32_t op_ret,
             int32_t op_errno, inode_t *inode, struct iatt *buf,
             struct iatt *preparent, struct iatt *postparent, dict_t *xdata)
 {
+    pl_inode_t *pl_inode = (pl_inode_t *)cookie;
+
+    if (op_ret >= 0) {
+        pthread_mutex_lock(&pl_inode->mutex);
+
+        /* TODO: can happen pl_inode->links == 0 ? */
+        if (pl_inode->links >= 0) {
+            pl_inode->links++;
+        }
+
+        pthread_mutex_unlock(&pl_inode->mutex);
+    }
+
     PL_STACK_UNWIND_FOR_CLIENT(link, xdata, frame, op_ret, op_errno, inode, buf,
                                preparent, postparent, xdata);
     return 0;
@@ -4307,9 +4549,18 @@ int
 pl_link(call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
         dict_t *xdata)
 {
+    pl_inode_t *pl_inode;
+
+    pl_inode = pl_inode_get(this, oldloc->inode, NULL);
+    if (pl_inode == NULL) {
+        STACK_UNWIND_STRICT(link, frame, -1, ENOMEM, NULL, NULL, NULL, NULL,
+                            NULL);
+        return 0;
+    }
+
     PL_LOCAL_GET_REQUESTS(frame, this, xdata, ((fd_t *)NULL), oldloc, newloc);
-    STACK_WIND(frame, pl_link_cbk, FIRST_CHILD(this),
-               FIRST_CHILD(this)->fops->link, oldloc, newloc, xdata);
+    STACK_WIND_COOKIE(frame, pl_link_cbk, pl_inode, FIRST_CHILD(this),
+                      FIRST_CHILD(this)->fops->link, oldloc, newloc, xdata);
     return 0;
 }
 

@@ -16,8 +16,8 @@
 #include "glusterfs/compat-errno.h"  // for ENODATA on BSD
 
 #define GF_DISK_SECTOR_SIZE 512
-#define DHT_REBALANCE_PID 4242              /* Change it if required */
-#define DHT_REBALANCE_BLKSIZE (1024 * 1024) /* 1 MB */
+#define DHT_REBALANCE_PID 4242        /* Change it if required */
+#define DHT_REBALANCE_BLKSIZE 1048576 /* 1 MB */
 #define MAX_MIGRATE_QUEUE_COUNT 500
 #define MIN_MIGRATE_QUEUE_COUNT 200
 #define MAX_REBAL_TYPE_SIZE 16
@@ -45,7 +45,10 @@ gf_defrag_free_dir_dfmeta(struct dir_dfmeta *meta, int local_subvols_cnt)
 
     if (meta) {
         for (i = 0; i < local_subvols_cnt; i++) {
-            gf_dirent_free(&meta->equeue[i]);
+            if (meta->equeue)
+                gf_dirent_free(&meta->equeue[i]);
+            if (meta->lfd && meta->lfd[i])
+                fd_unref(meta->lfd[i]);
         }
 
         GF_FREE(meta->equeue);
@@ -53,6 +56,7 @@ gf_defrag_free_dir_dfmeta(struct dir_dfmeta *meta, int local_subvols_cnt)
         GF_FREE(meta->iterator);
         GF_FREE(meta->offset_var);
         GF_FREE(meta->fetch_entries);
+        GF_FREE(meta->lfd);
         GF_FREE(meta);
     }
 }
@@ -84,26 +88,6 @@ dht_set_global_defrag_error(gf_defrag_info_t *defrag, int ret)
     return;
 }
 
-static gf_boolean_t
-dht_is_tier_command(int cmd)
-{
-    gf_boolean_t is_tier = _gf_false;
-
-    switch (cmd) {
-        case GF_DEFRAG_CMD_START_TIER:
-        case GF_DEFRAG_CMD_STATUS_TIER:
-        case GF_DEFRAG_CMD_START_DETACH_TIER:
-        case GF_DEFRAG_CMD_STOP_DETACH_TIER:
-        case GF_DEFRAG_CMD_PAUSE_TIER:
-        case GF_DEFRAG_CMD_RESUME_TIER:
-            is_tier = _gf_true;
-            break;
-        default:
-            break;
-    }
-    return is_tier;
-}
-
 static int
 dht_send_rebalance_event(xlator_t *this, int cmd, gf_defrag_status_t status)
 {
@@ -112,8 +96,6 @@ dht_send_rebalance_event(xlator_t *this, int cmd, gf_defrag_status_t status)
     char *tmpstr = NULL;
     char *ptr = NULL;
     char *suffix = "-dht";
-    dht_conf_t *conf = NULL;
-    gf_defrag_info_t *defrag = NULL;
     int len = 0;
 
     eventtypes_t event = EVENT_LAST;
@@ -132,21 +114,14 @@ dht_send_rebalance_event(xlator_t *this, int cmd, gf_defrag_status_t status)
             break;
     }
 
-    if (dht_is_tier_command(cmd)) {
-        /* We should have the tier volume name*/
-        conf = this->private;
-        defrag = conf->defrag;
-        volname = defrag->tier_conf.volname;
-    } else {
-        /* DHT volume */
-        len = strlen(this->name) - strlen(suffix);
-        tmpstr = gf_strdup(this->name);
-        if (tmpstr) {
-            ptr = tmpstr + len;
-            if (!strcmp(ptr, suffix)) {
-                tmpstr[len] = '\0';
-                volname = tmpstr;
-            }
+    /* DHT volume */
+    len = strlen(this->name) - strlen(suffix);
+    tmpstr = gf_strdup(this->name);
+    if (tmpstr) {
+        ptr = tmpstr + len;
+        if (!strcmp(ptr, suffix)) {
+            tmpstr[len] = '\0';
+            volname = tmpstr;
         }
     }
 
@@ -170,75 +145,6 @@ dht_strip_out_acls(dict_t *dict)
         dict_del(dict, "trusted.SGI_ACL_FILE");
         dict_del(dict, POSIX_ACL_ACCESS_XATTR);
     }
-}
-
-static int
-dht_write_with_holes(xlator_t *to, fd_t *fd, struct iovec *vec, int count,
-                     int32_t size, off_t offset, struct iobref *iobref,
-                     int *fop_errno)
-{
-    int i = 0;
-    int ret = -1;
-    int start_idx = 0;
-    int tmp_offset = 0;
-    int write_needed = 0;
-    int buf_len = 0;
-    int size_pending = 0;
-    char *buf = NULL;
-
-    /* loop through each vector */
-    for (i = 0; i < count; i++) {
-        buf = vec[i].iov_base;
-        buf_len = vec[i].iov_len;
-
-        for (start_idx = 0; (start_idx + GF_DISK_SECTOR_SIZE) <= buf_len;
-             start_idx += GF_DISK_SECTOR_SIZE) {
-            if (mem_0filled(buf + start_idx, GF_DISK_SECTOR_SIZE) != 0) {
-                write_needed = 1;
-                continue;
-            }
-
-            if (write_needed) {
-                ret = syncop_write(
-                    to, fd, (buf + tmp_offset), (start_idx - tmp_offset),
-                    (offset + tmp_offset), iobref, 0, NULL, NULL);
-                /* 'path' will be logged in calling function */
-                if (ret < 0) {
-                    gf_log(THIS->name, GF_LOG_WARNING, "failed to write (%s)",
-                           strerror(-ret));
-                    *fop_errno = -ret;
-                    ret = -1;
-                    goto out;
-                }
-
-                write_needed = 0;
-            }
-            tmp_offset = start_idx + GF_DISK_SECTOR_SIZE;
-        }
-
-        if ((start_idx < buf_len) || write_needed) {
-            /* This means, last chunk is not yet written.. write it */
-            ret = syncop_write(to, fd, (buf + tmp_offset),
-                               (buf_len - tmp_offset), (offset + tmp_offset),
-                               iobref, 0, NULL, NULL);
-            if (ret < 0) {
-                /* 'path' will be logged in calling function */
-                gf_log(THIS->name, GF_LOG_WARNING, "failed to write (%s)",
-                       strerror(-ret));
-                *fop_errno = -ret;
-                ret = -1;
-                goto out;
-            }
-        }
-
-        size_pending = (size - buf_len);
-        if (!size_pending)
-            break;
-    }
-
-    ret = size;
-out:
-    return ret;
 }
 
 /*
@@ -648,7 +554,7 @@ out:
 static int
 __dht_rebalance_create_dst_file(xlator_t *this, xlator_t *to, xlator_t *from,
                                 loc_t *loc, struct iatt *stbuf, fd_t **dst_fd,
-                                int *fop_errno)
+                                int *fop_errno, int file_has_holes)
 {
     int ret = -1;
     int ret2 = -1;
@@ -703,26 +609,23 @@ __dht_rebalance_create_dst_file(xlator_t *this, xlator_t *to, xlator_t *from,
         goto out;
     }
 
-    if (!!dht_is_tier_xlator(this)) {
-        xdata = dict_new();
-        if (!xdata) {
-            *fop_errno = ENOMEM;
-            ret = -1;
-            gf_msg(this->name, GF_LOG_ERROR, ENOMEM,
-                   DHT_MSG_MIGRATE_FILE_FAILED, "%s: dict_new failed)",
-                   loc->path);
-            goto out;
-        }
+    xdata = dict_new();
+    if (!xdata) {
+        *fop_errno = ENOMEM;
+        ret = -1;
+        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_MIGRATE_FILE_FAILED,
+               "%s: dict_new failed)", loc->path);
+        goto out;
+    }
 
-        ret = dict_set_int32(xdata, GF_CLEAN_WRITE_PROTECTION, 1);
-        if (ret) {
-            *fop_errno = ENOMEM;
-            ret = -1;
-            gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-                   "%s: failed to set dictionary value: key = %s ", loc->path,
-                   GF_CLEAN_WRITE_PROTECTION);
-            goto out;
-        }
+    ret = dict_set_int32_sizen(xdata, GF_CLEAN_WRITE_PROTECTION, 1);
+    if (ret) {
+        *fop_errno = ENOMEM;
+        ret = -1;
+        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
+               "%s: failed to set dictionary value: key = %s ", loc->path,
+               GF_CLEAN_WRITE_PROTECTION);
+        goto out;
     }
 
     ret = syncop_lookup(to, loc, &new_stbuf, NULL, xdata, NULL);
@@ -817,7 +720,7 @@ __dht_rebalance_create_dst_file(xlator_t *this, xlator_t *to, xlator_t *from,
 
     /* No need to bother about 0 byte size files */
     if (stbuf->ia_size > 0) {
-        if (conf->use_fallocate) {
+        if (conf->use_fallocate && !file_has_holes) {
             ret = syncop_fallocate(to, fd, 0, 0, stbuf->ia_size, NULL, NULL);
             if (ret < 0) {
                 if (ret == -EOPNOTSUPP || ret == -EINVAL || ret == -ENOSYS) {
@@ -844,9 +747,7 @@ __dht_rebalance_create_dst_file(xlator_t *this, xlator_t *to, xlator_t *from,
                     goto out;
                 }
             }
-        }
-
-        if (!conf->use_fallocate) {
+        } else {
             ret = syncop_ftruncate(to, fd, stbuf->ia_size, NULL, NULL, NULL,
                                    NULL);
             if (ret < 0) {
@@ -1097,22 +998,90 @@ __dht_rebalance_migrate_data(xlator_t *this, gf_defrag_info_t *defrag,
     int ret = 0;
     int count = 0;
     off_t offset = 0;
+    off_t data_offset = 0;
+    off_t hole_offset = 0;
     struct iovec *vector = NULL;
     struct iobref *iobref = NULL;
     uint64_t total = 0;
     size_t read_size = 0;
+    size_t data_block_size = 0;
     dict_t *xdata = NULL;
     dht_conf_t *conf = NULL;
 
     conf = this->private;
+
     /* if file size is '0', no need to enter this loop */
     while (total < ia_size) {
-        read_size = (((ia_size - total) > DHT_REBALANCE_BLKSIZE)
-                         ? DHT_REBALANCE_BLKSIZE
-                         : (ia_size - total));
+        /* This is a regular file - read it sequentially */
+        if (!hole_exists) {
+            read_size = (((ia_size - total) > DHT_REBALANCE_BLKSIZE)
+                             ? DHT_REBALANCE_BLKSIZE
+                             : (ia_size - total));
+        } else {
+            /* This is a sparse file - read only the data segments in the file
+             */
+
+            /* If the previous data block is fully copied, find the next data
+             * segment
+             * starting at the offset of the last read and written byte,  */
+            if (data_block_size <= 0) {
+                ret = syncop_seek(from, src, offset, GF_SEEK_DATA, NULL,
+                                  &data_offset);
+                if (ret) {
+                    if (ret == -ENXIO)
+                        ret = 0; /* No more data segments */
+                    else
+                        *fop_errno = -ret; /* Error occurred */
+
+                    break;
+                }
+
+                /* If the position of the current data segment is greater than
+                 * the position of the next hole, find the next hole in order to
+                 * calculate the length of the new data segment */
+                if (data_offset > hole_offset) {
+                    /* Starting at the offset of the last data segment, find the
+                     * next hole */
+                    ret = syncop_seek(from, src, data_offset, GF_SEEK_HOLE,
+                                      NULL, &hole_offset);
+                    if (ret) {
+                        /* If an error occurred here it's a real error because
+                         * if the seek for a data segment was successful then
+                         * necessarily another hole must exist (EOF is a hole)
+                         */
+                        *fop_errno = -ret;
+                        break;
+                    }
+
+                    /* Calculate the total size of the current data block */
+                    data_block_size = hole_offset - data_offset;
+                }
+            } else {
+                /* There is still data in the current segment, move the
+                 * data_offset to the position of the last written byte */
+                data_offset = offset;
+            }
+
+            /* Calculate how much data needs to be read and written. If the data
+             * segment's length is bigger than DHT_REBALANCE_BLKSIZE, read and
+             * write DHT_REBALANCE_BLKSIZE data length and the rest in the
+             * next iteration(s) */
+            read_size = ((data_block_size > DHT_REBALANCE_BLKSIZE)
+                             ? DHT_REBALANCE_BLKSIZE
+                             : data_block_size);
+
+            /* Calculate the remaining size of the data block - maybe there's no
+             * need to seek for data in the next iteration */
+            data_block_size -= read_size;
+
+            /* Set offset to the offset of the data segment so read and write
+             * will have the correct position */
+            offset = data_offset;
+        }
 
         ret = syncop_readv(from, src, read_size, offset, 0, &vector, &count,
                            &iobref, NULL, NULL, NULL);
+
         if (!ret || (ret < 0)) {
             if (!ret) {
                 /* File was probably truncated*/
@@ -1124,57 +1093,42 @@ __dht_rebalance_migrate_data(xlator_t *this, gf_defrag_info_t *defrag,
             break;
         }
 
-        if (hole_exists) {
-            ret = dht_write_with_holes(to, dst, vector, count, ret, offset,
-                                       iobref, fop_errno);
-        } else {
-            if (!conf->force_migration && !dht_is_tier_xlator(this)) {
+        if (!conf->force_migration) {
+            if (!xdata) {
+                xdata = dict_new();
                 if (!xdata) {
-                    xdata = dict_new();
-                    if (!xdata) {
-                        gf_msg("dht", GF_LOG_ERROR, 0,
-                               DHT_MSG_MIGRATE_FILE_FAILED,
-                               "insufficient memory");
-                        ret = -1;
-                        *fop_errno = ENOMEM;
-                        break;
-                    }
+                    gf_msg("dht", GF_LOG_ERROR, 0, DHT_MSG_MIGRATE_FILE_FAILED,
+                           "insufficient memory");
+                    ret = -1;
+                    *fop_errno = ENOMEM;
+                    break;
+                }
 
-                    /* Fail this write and abort rebalance if we
-                     * detect a write from client since migration of
-                     * this file started. This is done to avoid
-                     * potential data corruption due to out of order
-                     * writes from rebalance and client to the same
-                     * region (as compared between src and dst
-                     * files). See
-                     * https://github.com/gluster/glusterfs/issues/308
-                     * for more details.
-                     */
-                    ret = dict_set_int32(xdata, GF_AVOID_OVERWRITE, 1);
-                    if (ret) {
-                        gf_msg("dht", GF_LOG_ERROR, 0, ENOMEM,
-                               "failed to set dict");
-                        ret = -1;
-                        *fop_errno = ENOMEM;
-                        break;
-                    }
+                /* Fail this write and abort rebalance if we
+                 * detect a write from client since migration of
+                 * this file started. This is done to avoid
+                 * potential data corruption due to out of order
+                 * writes from rebalance and client to the same
+                 * region (as compared between src and dst
+                 * files). See
+                 * https://github.com/gluster/glusterfs/issues/308
+                 * for more details.
+                 */
+                ret = dict_set_int32_sizen(xdata, GF_AVOID_OVERWRITE, 1);
+                if (ret) {
+                    gf_msg("dht", GF_LOG_ERROR, 0, ENOMEM,
+                           "failed to set dict");
+                    ret = -1;
+                    *fop_errno = ENOMEM;
+                    break;
                 }
             }
-            ret = syncop_writev(to, dst, vector, count, offset, iobref, 0, NULL,
-                                NULL, xdata, NULL);
-            if (ret < 0) {
-                *fop_errno = -ret;
-            }
         }
 
-        if ((defrag && defrag->cmd == GF_DEFRAG_CMD_START_TIER) &&
-            (gf_defrag_get_pause_state(&defrag->tier_conf) != TIER_RUNNING)) {
-            gf_msg("tier", GF_LOG_INFO, 0, DHT_MSG_TIER_PAUSED,
-                   "Migrate file paused");
-            ret = -1;
-        }
-
+        ret = syncop_writev(to, dst, vector, count, offset, iobref, 0, NULL,
+                            NULL, xdata, NULL);
         if (ret < 0) {
+            *fop_errno = -ret;
             break;
         }
 
@@ -1568,6 +1522,7 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
     xlator_t *old_target = NULL;
     xlator_t *hashed_subvol = NULL;
     fd_t *linkto_fd = NULL;
+    dict_t *xdata = NULL;
 
     if (from == to) {
         gf_msg_debug(this->name, 0,
@@ -1577,20 +1532,6 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
         ret = 0;
         goto out;
     }
-
-    /* If defrag is NULL, it should be assumed that migration is triggered
-     * from client */
-    defrag = conf->defrag;
-
-    /* migration of files from clients is restricted to non-tiered clients
-     * for now */
-    if (!defrag && dht_is_tier_xlator(this)) {
-        ret = ENOTSUP;
-        goto out;
-    }
-
-    if (defrag && defrag->tier_conf.is_tier)
-        log_level = GF_LOG_TRACE;
 
     gf_log(this->name, log_level, "%s: attempting to move from %s to %s",
            loc->path, from->name, to->name);
@@ -1633,6 +1574,10 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
                " for file: %s",
                loc->path);
     }
+
+    /* The file is locked to prevent a rename during a migration. Renames
+     * and migrations on the file at the same time can lead to data loss.
+     */
 
     ret = dht_build_parent_loc(this, &parent_loc, loc, fop_errno);
     if (ret < 0) {
@@ -1734,9 +1679,13 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
         goto out;
     }
 
+    /* Try to preserve 'holes' while migrating data */
+    if (stbuf.ia_size > (stbuf.ia_blocks * GF_DISK_SECTOR_SIZE))
+        file_has_holes = 1;
+
     /* create the destination, with required modes/xattr */
     ret = __dht_rebalance_create_dst_file(this, to, from, loc, &stbuf, &dst_fd,
-                                          fop_errno);
+                                          fop_errno, file_has_holes);
     if (ret) {
         gf_msg(this->name, GF_LOG_ERROR, 0, 0,
                "Create dst failed"
@@ -1780,8 +1729,8 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
          * destination. We need to do update this only post migration
          * as in case of failure the linkto needs to point to the source
          * subvol */
-        ret = __dht_rebalance_create_dst_file(this, to, from, loc, &stbuf,
-                                              &dst_fd, fop_errno);
+        ret = __dht_rebalance_create_dst_file(
+            this, to, from, loc, &stbuf, &dst_fd, fop_errno, file_has_holes);
         if (ret) {
             gf_log(this->name, GF_LOG_ERROR,
                    "Create dst failed"
@@ -1868,9 +1817,6 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
             ret = 0;
         goto out;
     }
-    /* Try to preserve 'holes' while migrating data */
-    if (stbuf.ia_size > (stbuf.ia_blocks * GF_DISK_SECTOR_SIZE))
-        file_has_holes = 1;
 
     ret = __dht_rebalance_migrate_data(this, defrag, from, to, src_fd, dst_fd,
                                        stbuf.ia_size, file_has_holes,
@@ -1885,7 +1831,15 @@ dht_migrate_file(xlator_t *this, loc_t *loc, xlator_t *from, xlator_t *to,
 
     /* TODO: Sync the locks */
 
-    ret = syncop_fsync(to, dst_fd, 0, NULL, NULL, NULL, NULL);
+    xdata = dict_new();
+    if (!xdata || dict_set_int8(xdata, "last-fsync", 1)) {
+        gf_log(this->name, GF_LOG_ERROR,
+               "%s: failed to set last-fsync flag on "
+               "%s (%s)",
+               loc->path, to->name, strerror(ENOMEM));
+    }
+
+    ret = syncop_fsync(to, dst_fd, 0, NULL, NULL, xdata, NULL);
     if (ret) {
         gf_log(this->name, GF_LOG_WARNING, "%s: failed to fsync on %s (%s)",
                loc->path, to->name, strerror(-ret));
@@ -2328,14 +2282,12 @@ out:
         }
     }
 
-    if (!dht_is_tier_xlator(this)) {
-        lk_ret = syncop_removexattr(to, loc, GF_PROTECT_FROM_EXTERNAL_WRITES,
-                                    NULL, NULL);
-        if (lk_ret && (lk_ret != -ENODATA) && (lk_ret != -ENOATTR)) {
-            gf_msg(this->name, GF_LOG_WARNING, -lk_ret, 0,
-                   "%s: removexattr failed key %s", loc->path,
-                   GF_PROTECT_FROM_EXTERNAL_WRITES);
-        }
+    lk_ret = syncop_removexattr(to, loc, GF_PROTECT_FROM_EXTERNAL_WRITES, NULL,
+                                NULL);
+    if (lk_ret && (lk_ret != -ENODATA) && (lk_ret != -ENOATTR)) {
+        gf_msg(this->name, GF_LOG_WARNING, -lk_ret, 0,
+               "%s: removexattr failed key %s", loc->path,
+               GF_PROTECT_FROM_EXTERNAL_WRITES);
     }
 
     if (dict)
@@ -2348,10 +2300,14 @@ out:
 
     if (dst_fd)
         syncop_close(dst_fd);
+
     if (src_fd)
         syncop_close(src_fd);
     if (linkto_fd)
         syncop_close(linkto_fd);
+
+    if (xdata)
+        dict_unref(xdata);
 
     loc_wipe(&tmp_loc);
     loc_wipe(&parent_loc);
@@ -2582,10 +2538,10 @@ out:
  * all hardlinks.
  */
 
-int
+gf_boolean_t
 gf_defrag_should_i_migrate(xlator_t *this, int local_subvol_index, uuid_t gfid)
 {
-    int ret = 0;
+    gf_boolean_t ret = _gf_false;
     int i = local_subvol_index;
     char *str = NULL;
     uint32_t hashval = 0;
@@ -2607,12 +2563,11 @@ gf_defrag_should_i_migrate(xlator_t *this, int local_subvol_index, uuid_t gfid)
     }
 
     str = uuid_utoa_r(gfid, buf);
-    ret = dht_hash_compute(this, 0, str, &hashval);
-    if (ret == 0) {
+    if (dht_hash_compute(this, 0, str, &hashval) == 0) {
         index = (hashval % entry->count);
         if (entry->elements[index].info == REBAL_NODEUUID_MINE) {
             /* Index matches this node's nodeuuid.*/
-            ret = 1;
+            ret = _gf_true;
             goto out;
         }
 
@@ -2625,12 +2580,12 @@ gf_defrag_should_i_migrate(xlator_t *this, int local_subvol_index, uuid_t gfid)
                 /* None of the bricks in the subvol are up.
                  * CHILD_DOWN will kill the process soon */
 
-                return 0;
+                return _gf_false;
             }
 
             if (entry->elements[index].info == REBAL_NODEUUID_MINE) {
                 /* Index matches this node's nodeuuid.*/
-                ret = 1;
+                ret = _gf_true;
                 goto out;
             }
         }
@@ -2679,6 +2634,7 @@ gf_defrag_migrate_single_file(void *opaque)
     struct iatt *iatt_ptr = NULL;
     gf_boolean_t update_skippedcount = _gf_true;
     int i = 0;
+    gf_boolean_t should_i_migrate = 0;
 
     rebal_entry = (struct dht_container *)opaque;
     if (!rebal_entry) {
@@ -2733,11 +2689,29 @@ gf_defrag_migrate_single_file(void *opaque)
         goto out;
     }
 
+    should_i_migrate = gf_defrag_should_i_migrate(
+        this, rebal_entry->local_subvol_index, entry->d_stat.ia_gfid);
+
     gf_uuid_copy(entry_loc.gfid, entry->d_stat.ia_gfid);
 
     gf_uuid_copy(entry_loc.pargfid, loc->gfid);
 
     ret = syncop_lookup(this, &entry_loc, &iatt, NULL, NULL, NULL);
+
+    if (!should_i_migrate) {
+        /* this node isn't supposed to migrate the file. suppressing any
+         * potential error from lookup as this file is under migration by
+         * another node */
+        if (ret) {
+            gf_msg_debug(this->name, -ret,
+                         "Ignoring lookup failure: node isn't migrating %s",
+                         entry_loc.path);
+            ret = 0;
+        }
+        gf_msg_debug(this->name, 0, "Don't migrate %s ", entry_loc.path);
+        goto out;
+    }
+
     if (ret) {
         gf_msg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_MIGRATE_FILE_FAILED,
                "Migrate file failed: %s lookup failed", entry_loc.path);
@@ -2755,12 +2729,6 @@ gf_defrag_migrate_single_file(void *opaque)
         }
 
         ret = 0;
-        goto out;
-    }
-
-    if (!gf_defrag_should_i_migrate(this, rebal_entry->local_subvol_index,
-                                    entry->d_stat.ia_gfid)) {
-        gf_msg_debug(this->name, 0, "Don't migrate %s ", entry_loc.path);
         goto out;
     }
 
@@ -2906,8 +2874,7 @@ gf_defrag_migrate_single_file(void *opaque)
 
     if (defrag->stats == _gf_true) {
         gettimeofday(&end, NULL);
-        elapsed = (end.tv_sec - start.tv_sec) * 1e6 +
-                  (end.tv_usec - start.tv_usec);
+        elapsed = gf_tvdiff(&start, &end);
         gf_log(this->name, GF_LOG_INFO,
                "Migration of "
                "file:%s size:%" PRIu64
@@ -3086,9 +3053,9 @@ int static gf_defrag_get_entry(xlator_t *this, int i,
                                dht_conf_t *conf, gf_defrag_info_t *defrag,
                                fd_t *fd, dict_t *migrate_data,
                                struct dir_dfmeta *dir_dfmeta, dict_t *xattr_req,
-                               int *should_commit_hash, int *perrno)
+                               int *perrno)
 {
-    int ret = -1;
+    int ret = 0;
     char is_linkfile = 0;
     gf_dirent_t *df_entry = NULL;
     struct dht_container *tmp_container = NULL;
@@ -3104,6 +3071,13 @@ int static gf_defrag_get_entry(xlator_t *this, int i,
     }
 
     if (dir_dfmeta->fetch_entries[i] == 1) {
+        if (!fd) {
+            dir_dfmeta->fetch_entries[i] = 0;
+            dir_dfmeta->offset_var[i].readdir_done = 1;
+            ret = 0;
+            goto out;
+        }
+
         ret = syncop_readdirp(conf->local_subvols[i], fd, 131072,
                               dir_dfmeta->offset_var[i].offset,
                               &(dir_dfmeta->equeue[i]), xattr_req, NULL);
@@ -3263,7 +3237,6 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                       dict_t *migrate_data, int *perrno)
 {
     int ret = -1;
-    fd_t *fd = NULL;
     dht_conf_t *conf = NULL;
     gf_dirent_t entries;
     dict_t *xattr_req = NULL;
@@ -3284,7 +3257,7 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
     int dfc_index = 0;
     int throttle_up = 0;
     struct dir_dfmeta *dir_dfmeta = NULL;
-    int should_commit_hash = 1;
+    xlator_t *old_THIS = NULL;
 
     gf_log(this->name, GF_LOG_INFO, "migrate data called on %s", loc->path);
     gettimeofday(&dir_start, NULL);
@@ -3297,28 +3270,53 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         goto out;
     }
 
-    fd = fd_create(loc->inode, defrag->pid);
-    if (!fd) {
-        gf_log(this->name, GF_LOG_ERROR, "Failed to create fd");
-        ret = -1;
-        goto out;
-    }
+    old_THIS = THIS;
+    THIS = this;
 
-    ret = syncop_opendir(this, loc, fd, NULL, NULL);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_WARNING, -ret, DHT_MSG_MIGRATE_DATA_FAILED,
-               "Migrate data failed: Failed to open dir %s", loc->path);
-        *perrno = -ret;
-        ret = -1;
-        goto out;
-    }
-
-    fd_bind(fd);
     dir_dfmeta = GF_CALLOC(1, sizeof(*dir_dfmeta), gf_common_mt_pointer);
     if (!dir_dfmeta) {
         gf_log(this->name, GF_LOG_ERROR, "dir_dfmeta is NULL");
         ret = -1;
         goto out;
+    }
+
+    dir_dfmeta->lfd = GF_CALLOC(local_subvols_cnt, sizeof(fd_t *),
+                                gf_common_mt_pointer);
+    if (!dir_dfmeta->lfd) {
+        gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_INSUFF_MEMORY,
+                "for dir_dfmeta", NULL);
+        ret = -1;
+        *perrno = ENOMEM;
+        goto out;
+    }
+
+    for (i = 0; i < local_subvols_cnt; i++) {
+        dir_dfmeta->lfd[i] = fd_create(loc->inode, defrag->pid);
+        if (!dir_dfmeta->lfd[i]) {
+            gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_FD_CREATE_FAILED,
+                    NULL);
+            *perrno = ENOMEM;
+            ret = -1;
+            goto out;
+        }
+
+        ret = syncop_opendir(conf->local_subvols[i], loc, dir_dfmeta->lfd[i],
+                             NULL, NULL);
+        if (ret) {
+            fd_unref(dir_dfmeta->lfd[i]);
+            dir_dfmeta->lfd[i] = NULL;
+            gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_FAILED_TO_OPEN,
+                    "dir: %s", loc->path, "subvol: %s",
+                    conf->local_subvols[i]->name, NULL);
+
+            if (conf->decommission_in_progress) {
+                *perrno = -ret;
+                ret = -1;
+                goto out;
+            }
+        } else {
+            fd_bind(dir_dfmeta->lfd[i]);
+        }
     }
 
     dir_dfmeta->head = GF_CALLOC(local_subvols_cnt, sizeof(*(dir_dfmeta->head)),
@@ -3353,6 +3351,7 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         ret = -1;
         goto out;
     }
+
     ret = gf_defrag_ctx_subvols_init(dir_dfmeta->offset_var, this);
     if (ret) {
         gf_log(this->name, GF_LOG_ERROR,
@@ -3365,7 +3364,8 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
     dir_dfmeta->fetch_entries = GF_CALLOC(local_subvols_cnt, sizeof(int),
                                           gf_common_mt_int);
     if (!dir_dfmeta->fetch_entries) {
-        gf_log(this->name, GF_LOG_ERROR, "dir_dfmeta->fetch_entries is NULL");
+        gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_INSUFF_MEMORY,
+                "for dir_dfmeta->fetch_entries", NULL);
         ret = -1;
         goto out;
     }
@@ -3435,8 +3435,13 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
             ldfq_count <= MAX_MIGRATE_QUEUE_COUNT &&
             !dht_dfreaddirp_done(dir_dfmeta->offset_var, local_subvols_cnt)) {
             ret = gf_defrag_get_entry(this, dfc_index, &container, loc, conf,
-                                      defrag, fd, migrate_data, dir_dfmeta,
-                                      xattr_req, &should_commit_hash, perrno);
+                                      defrag, dir_dfmeta->lfd[dfc_index],
+                                      migrate_data, dir_dfmeta, xattr_req,
+                                      perrno);
+
+            if (defrag->defrag_status == GF_DEFRAG_STATUS_STOPPED) {
+                goto out;
+            }
 
             if (ret) {
                 gf_log(this->name, GF_LOG_WARNING,
@@ -3476,26 +3481,18 @@ gf_defrag_process_dir(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
     }
 
     gettimeofday(&end, NULL);
-    elapsed = (end.tv_sec - dir_start.tv_sec) * 1e6 +
-              (end.tv_usec - dir_start.tv_usec);
+    elapsed = gf_tvdiff(&dir_start, &end);
     gf_log(this->name, GF_LOG_INFO,
            "Migration operation on dir %s took "
            "%.2f secs",
            loc->path, elapsed / 1e6);
     ret = 0;
 out:
-
+    THIS = old_THIS;
     gf_defrag_free_dir_dfmeta(dir_dfmeta, local_subvols_cnt);
 
     if (xattr_req)
         dict_unref(xattr_req);
-
-    if (fd)
-        fd_unref(fd);
-
-    if (ret == 0 && should_commit_hash == 0) {
-        ret = 2;
-    }
 
     /* It does not matter if it errored out - this number is
      * used to calculate rebalance estimated time to complete.
@@ -3504,6 +3501,7 @@ out:
     defrag->num_dirs_processed++;
     return ret;
 }
+
 int
 gf_defrag_settle_hash(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                       dict_t *fix_layout)
@@ -3518,7 +3516,6 @@ gf_defrag_settle_hash(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
      * rebalance is complete.
      */
     if (defrag->cmd == GF_DEFRAG_CMD_START_LAYOUT_FIX ||
-        defrag->cmd == GF_DEFRAG_CMD_START_DETACH_TIER ||
         defrag->cmd == GF_DEFRAG_CMD_DETACH_START) {
         return 0;
     }
@@ -3564,114 +3561,6 @@ gf_defrag_settle_hash(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
     return 0;
 }
 
-/* Function for doing a named lookup on file inodes during an attach tier
- * So that a hardlink lookup heal i.e gfid to parent gfid lookup heal
- * happens on pre-existing data. This is required so that the ctr database has
- * hardlinks of all the exisitng file in the volume. CTR xlator on the
- * brick/server side does db update/insert of the hardlink on a namelookup.
- * Currently the namedlookup is done synchronous to the fixlayout that is
- * triggered by attach tier. This is not performant, adding more time to
- * fixlayout. The performant approach is record the hardlinks on a compressed
- * datastore and then do the namelookup asynchronously later, giving the ctr db
- * eventual consistency
- * */
-int
-gf_fix_layout_tier_attach_lookup(xlator_t *this, loc_t *parent_loc,
-                                 gf_dirent_t *file_dentry)
-{
-    int ret = -1;
-    dict_t *lookup_xdata = NULL;
-    dht_conf_t *conf = NULL;
-    loc_t file_loc = {
-        0,
-    };
-    struct iatt iatt = {
-        0,
-    };
-
-    GF_VALIDATE_OR_GOTO("tier", this, out);
-
-    GF_VALIDATE_OR_GOTO(this->name, parent_loc, out);
-
-    GF_VALIDATE_OR_GOTO(this->name, file_dentry, out);
-
-    GF_VALIDATE_OR_GOTO(this->name, this->private, out);
-
-    if (!parent_loc->inode) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "%s/%s parent is NULL", parent_loc->path, file_dentry->d_name);
-        goto out;
-    }
-
-    conf = this->private;
-
-    loc_wipe(&file_loc);
-
-    if (gf_uuid_is_null(file_dentry->d_stat.ia_gfid)) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "%s/%s gfid not present", parent_loc->path, file_dentry->d_name);
-        goto out;
-    }
-
-    gf_uuid_copy(file_loc.gfid, file_dentry->d_stat.ia_gfid);
-
-    if (gf_uuid_is_null(parent_loc->gfid)) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "%s/%s"
-               " gfid not present",
-               parent_loc->path, file_dentry->d_name);
-        goto out;
-    }
-
-    gf_uuid_copy(file_loc.pargfid, parent_loc->gfid);
-
-    ret = dht_build_child_loc(this, &file_loc, parent_loc, file_dentry->d_name);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "Child loc build failed");
-        ret = -1;
-        goto out;
-    }
-
-    lookup_xdata = dict_new();
-    if (!lookup_xdata) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "Failed creating lookup dict for %s", file_dentry->d_name);
-        goto out;
-    }
-
-    ret = dict_set_int32(lookup_xdata, CTR_ATTACH_TIER_LOOKUP, 1);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LOG_TIER_ERROR,
-               "Failed to set lookup flag");
-        goto out;
-    }
-
-    gf_uuid_copy(file_loc.parent->gfid, parent_loc->gfid);
-
-    /* Sending lookup to cold tier only */
-    ret = syncop_lookup(conf->subvolumes[0], &file_loc, &iatt, NULL,
-                        lookup_xdata, NULL);
-    if (ret) {
-        /* If the file does not exist on the cold tier than it must */
-        /* have been discovered on the hot tier. This is not an error. */
-        gf_msg(this->name, GF_LOG_INFO, 0, DHT_MSG_LOG_TIER_STATUS,
-               "%s lookup to cold tier on attach heal failed", file_loc.path);
-        goto out;
-    }
-
-    ret = 0;
-
-out:
-
-    loc_wipe(&file_loc);
-
-    if (lookup_xdata)
-        dict_unref(lookup_xdata);
-
-    return ret;
-}
-
 int
 gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                      dict_t *fix_layout, dict_t *migrate_data)
@@ -3691,7 +3580,6 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
     };
     inode_t *linked_inode = NULL, *inode = NULL;
     dht_conf_t *conf = NULL;
-    int should_commit_hash = 1;
     int perrno = 0;
 
     conf = this->private;
@@ -3794,16 +3682,6 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
             if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
                 continue;
             if (!IA_ISDIR(entry->d_stat.ia_type)) {
-                /* If its a fix layout during the attach
-                 * tier operation do lookups on files
-                 * on cold subvolume so that there is a
-                 * CTR DB Lookup Heal triggered on existing
-                 * data.
-                 * */
-                if (defrag->cmd == GF_DEFRAG_CMD_START_TIER) {
-                    gf_fix_layout_tier_attach_lookup(this, loc, entry);
-                }
-
                 continue;
             }
             loc_wipe(&entry_loc);
@@ -3820,8 +3698,6 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
 
                     goto out;
                 } else {
-                    should_commit_hash = 0;
-
                     continue;
                 }
             }
@@ -3884,7 +3760,6 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                         ret = -1;
                         goto out;
                     } else {
-                        should_commit_hash = 0;
                         continue;
                     }
                 }
@@ -3897,7 +3772,12 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
             ret = gf_defrag_fix_layout(this, defrag, &entry_loc, fix_layout,
                                        migrate_data);
 
-            if (ret && ret != 2) {
+            if (defrag->defrag_status == GF_DEFRAG_STATUS_STOPPED ||
+                defrag->defrag_status == GF_DEFRAG_STATUS_FAILED) {
+                goto out;
+            }
+
+            if (ret) {
                 gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_LAYOUT_FIX_FAILED,
                        "Fix layout failed for %s", entry_loc.path);
 
@@ -3920,7 +3800,25 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         INIT_LIST_HEAD(&entries.list);
     }
 
+    /* A directory layout is fixed only after its subdirs are healed to
+     * any newly added bricks. If the layout is fixed before subdirs are
+     * healed, the newly added brick will get a non-null layout.
+     * Any subdirs which hash to that layout will no longer show up
+     * in a directory listing until they are healed.
+     */
+
     ret = syncop_setxattr(this, loc, fix_layout, 0, NULL, NULL);
+
+    /* In case of a race where the directory is deleted just before
+     * layout setxattr, the errors are updated in the layout structure.
+     * We can use this information to make a decision whether the directory
+     * is deleted entirely.
+     */
+    if (ret == 0) {
+        ret = dht_dir_layout_error_check(this, loc->inode);
+        ret = -ret;
+    }
+
     if (ret) {
         if (-ret == ENOENT || -ret == ESTALE) {
             gf_msg(this->name, GF_LOG_INFO, -ret, DHT_MSG_LAYOUT_FIX_FAILED,
@@ -3931,6 +3829,7 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                 defrag->total_failures++;
             }
             ret = 0;
+            goto out;
         } else {
             gf_msg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_LAYOUT_FIX_FAILED,
                    "Setxattr failed for %s", loc->path);
@@ -3945,11 +3844,10 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         }
     }
 
-    if ((defrag->cmd != GF_DEFRAG_CMD_START_TIER) &&
-        (defrag->cmd != GF_DEFRAG_CMD_START_LAYOUT_FIX)) {
+    if (defrag->cmd != GF_DEFRAG_CMD_START_LAYOUT_FIX) {
         ret = gf_defrag_process_dir(this, defrag, loc, migrate_data, &perrno);
 
-        if (ret && (ret != 2)) {
+        if (ret) {
             if (perrno == ENOENT || perrno == ESTALE) {
                 ret = 0;
                 goto out;
@@ -3965,18 +3863,13 @@ gf_defrag_fix_layout(xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
                 if (conf->decommission_in_progress) {
                     goto out;
                 }
-
-                should_commit_hash = 0;
             }
-        } else if (ret == 2) {
-            should_commit_hash = 0;
         }
     }
 
     gf_msg_trace(this->name, 0, "fix layout called on %s", loc->path);
 
-    if (should_commit_hash &&
-        gf_defrag_settle_hash(this, defrag, loc, fix_layout) != 0) {
+    if (gf_defrag_settle_hash(this, defrag, loc, fix_layout) != 0) {
         defrag->total_failures++;
 
         gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_SETTLE_HASH_FAILED,
@@ -4000,244 +3893,33 @@ out:
     if (fd)
         fd_unref(fd);
 
-    if (ret == 0 && should_commit_hash == 0) {
-        ret = 2;
-    }
-
     return ret;
 }
-
-/******************************************************************************
- *                      Tier background Fix layout functions
- ******************************************************************************/
-/* This is the background tier fixlayout thread */
-void *
-gf_tier_do_fix_layout(void *args)
-{
-    gf_tier_fix_layout_arg_t *tier_fix_layout_arg = args;
-    int ret = -1;
-    xlator_t *this = NULL;
-    dht_conf_t *conf = NULL;
-    gf_defrag_info_t *defrag = NULL;
-    dict_t *dict = NULL;
-    loc_t loc = {
-        0,
-    };
-    struct iatt iatt = {
-        0,
-    };
-    struct iatt parent = {
-        0,
-    };
-
-    GF_VALIDATE_OR_GOTO("tier", tier_fix_layout_arg, out);
-    GF_VALIDATE_OR_GOTO("tier", tier_fix_layout_arg->this, out);
-    this = tier_fix_layout_arg->this;
-
-    conf = this->private;
-    GF_VALIDATE_OR_GOTO(this->name, conf, out);
-
-    defrag = conf->defrag;
-    GF_VALIDATE_OR_GOTO(this->name, defrag, out);
-    GF_VALIDATE_OR_GOTO(this->name, defrag->root_inode, out);
-
-    GF_VALIDATE_OR_GOTO(this->name, tier_fix_layout_arg->fix_layout, out);
-
-    /* Get Root loc_t */
-    dht_build_root_loc(defrag->root_inode, &loc);
-    ret = syncop_lookup(this, &loc, &iatt, &parent, NULL, NULL);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_REBALANCE_START_FAILED,
-               "Lookup on root failed.");
-        ret = -1;
-        goto out;
-    }
-
-    /* Start the crawl */
-    gf_msg(this->name, GF_LOG_INFO, 0, DHT_MSG_LOG_TIER_STATUS,
-           "Tiering Fixlayout started");
-
-    ret = gf_defrag_fix_layout(this, defrag, &loc,
-                               tier_fix_layout_arg->fix_layout, NULL);
-    if (ret && ret != 2) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_REBALANCE_FAILED,
-               "Tiering fixlayout failed.");
-        ret = -1;
-        goto out;
-    }
-
-    if (ret != 2 &&
-        gf_defrag_settle_hash(this, defrag, &loc,
-                              tier_fix_layout_arg->fix_layout) != 0) {
-        defrag->total_failures++;
-        ret = -1;
-        goto out;
-    }
-
-    dict = dict_new();
-    if (!dict) {
-        ret = -1;
-        goto out;
-    }
-
-    ret = dict_set_str(dict, GF_XATTR_TIER_LAYOUT_FIXED_KEY, "yes");
-    if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_REBALANCE_FAILED,
-               "Failed to set dictionary value: key = %s",
-               GF_XATTR_TIER_LAYOUT_FIXED_KEY);
-        ret = -1;
-        goto out;
-    }
-
-    /* Marking the completion of tiering fix layout via a xattr on root */
-    ret = syncop_setxattr(this, &loc, dict, 0, NULL, NULL);
-    if (ret) {
-        gf_log(this->name, GF_LOG_ERROR,
-               "Failed to set tiering fix "
-               "layout completed xattr on %s",
-               loc.path);
-        ret = -1;
-        goto out;
-    }
-
-    ret = 0;
-out:
-    if (ret && defrag)
-        defrag->total_failures++;
-
-    if (dict)
-        dict_unref(dict);
-
-    return NULL;
-}
-
-int
-gf_tier_start_fix_layout(xlator_t *this, loc_t *loc, gf_defrag_info_t *defrag,
-                         dict_t *fix_layout)
-{
-    int ret = -1;
-    dict_t *tier_dict = NULL;
-    gf_tier_fix_layout_arg_t *tier_fix_layout_arg = NULL;
-
-    tier_dict = dict_new();
-    if (!tier_dict) {
-        gf_log("tier", GF_LOG_ERROR,
-               "Tier fix layout failed :"
-               "Creation of tier_dict failed");
-        ret = -1;
-        goto out;
-    }
-
-    /* Check if layout is fixed already */
-    ret = syncop_getxattr(this, loc, &tier_dict, GF_XATTR_TIER_LAYOUT_FIXED_KEY,
-                          NULL, NULL);
-    if (ret != 0) {
-        tier_fix_layout_arg = &defrag->tier_conf.tier_fix_layout_arg;
-
-        /*Fill crawl arguments */
-        tier_fix_layout_arg->this = this;
-        tier_fix_layout_arg->fix_layout = fix_layout;
-
-        /* Spawn the fix layout thread so that its done in the
-         * background */
-        ret = gf_thread_create(&tier_fix_layout_arg->thread_id, NULL,
-                               gf_tier_do_fix_layout, tier_fix_layout_arg,
-                               "tierfixl");
-        if (ret) {
-            gf_log("tier", GF_LOG_ERROR,
-                   "Thread creation failed. "
-                   "Background fix layout for tiering will not "
-                   "work.");
-            defrag->total_failures++;
-            goto out;
-        }
-    }
-    ret = 0;
-out:
-    if (tier_dict)
-        dict_unref(tier_dict);
-
-    return ret;
-}
-
-void
-gf_tier_clear_fix_layout(xlator_t *this, loc_t *loc, gf_defrag_info_t *defrag)
-{
-    int ret = -1;
-    dict_t *dict = NULL;
-
-    GF_VALIDATE_OR_GOTO("tier", this, out);
-    GF_VALIDATE_OR_GOTO(this->name, loc, out);
-    GF_VALIDATE_OR_GOTO(this->name, defrag, out);
-
-    /* Check if background fixlayout is completed. This is not
-     * multi-process safe i.e there is a possibility that by the time
-     * we move to remove the xattr there it might have been cleared by some
-     * other detach process from other node. We ignore the error if such
-     * a thing happens */
-    ret = syncop_getxattr(this, loc, &dict, GF_XATTR_TIER_LAYOUT_FIXED_KEY,
-                          NULL, NULL);
-    if (ret) {
-        /* Background fixlayout not complete - nothing to clear*/
-        gf_msg(this->name, GF_LOG_WARNING, -ret, DHT_MSG_LOG_TIER_STATUS,
-               "Unable to retrieve fixlayout xattr."
-               "Assume background fix layout not complete");
-        goto out;
-    }
-
-    ret = syncop_removexattr(this, loc, GF_XATTR_TIER_LAYOUT_FIXED_KEY, NULL,
-                             NULL);
-    if (ret) {
-        gf_msg(this->name, GF_LOG_WARNING, -ret, DHT_MSG_LOG_TIER_STATUS,
-               "Failed removing tier fix layout "
-               "xattr from %s",
-               loc->path);
-        goto out;
-    }
-    ret = 0;
-out:
-    if (dict)
-        dict_unref(dict);
-}
-
-void
-gf_tier_wait_fix_lookup(gf_defrag_info_t *defrag)
-{
-    if (defrag->tier_conf.tier_fix_layout_arg.thread_id) {
-        pthread_join(defrag->tier_conf.tier_fix_layout_arg.thread_id, NULL);
-    }
-}
-/******************Tier background Fix layout functions END********************/
 
 int
 dht_init_local_subvols_and_nodeuuids(xlator_t *this, dht_conf_t *conf,
                                      loc_t *loc)
 {
     dict_t *dict = NULL;
-    gf_defrag_info_t *defrag = NULL;
     uuid_t *uuid_ptr = NULL;
     int ret = -1;
     int i = 0;
     int j = 0;
 
-    defrag = conf->defrag;
-
-    if (defrag->cmd != GF_DEFRAG_CMD_START_TIER) {
-        /* Find local subvolumes */
-        ret = syncop_getxattr(this, loc, &dict, GF_REBAL_FIND_LOCAL_SUBVOL,
-                              NULL, NULL);
-        if (ret && (ret != -ENODATA)) {
-            gf_msg(this->name, GF_LOG_ERROR, -ret, 0,
-                   "local "
-                   "subvolume determination failed with error: %d",
-                   -ret);
-            ret = -1;
-            goto out;
-        }
-
-        if (!ret)
-            goto out;
+    /* Find local subvolumes */
+    ret = syncop_getxattr(this, loc, &dict, GF_REBAL_FIND_LOCAL_SUBVOL, NULL,
+                          NULL);
+    if (ret && (ret != -ENODATA)) {
+        gf_msg(this->name, GF_LOG_ERROR, -ret, 0,
+               "local "
+               "subvolume determination failed with error: %d",
+               -ret);
+        ret = -1;
+        goto out;
     }
+
+    if (!ret)
+        goto out;
 
     ret = syncop_getxattr(this, loc, &dict, GF_REBAL_OLD_FIND_LOCAL_SUBVOL,
                           NULL, NULL);
@@ -4329,9 +4011,6 @@ dht_file_counter_thread(void *args)
     struct timespec time_to_wait = {
         0,
     };
-    struct timeval now = {
-        0,
-    };
     uint64_t tmp_size = 0;
 
     if (!args)
@@ -4341,9 +4020,8 @@ dht_file_counter_thread(void *args)
     dht_build_root_loc(defrag->root_inode, &root_loc);
 
     while (defrag->defrag_status == GF_DEFRAG_STATUS_STARTED) {
-        gettimeofday(&now, NULL);
-        time_to_wait.tv_sec = now.tv_sec + 600;
-        time_to_wait.tv_nsec = 0;
+        timespec_now(&time_to_wait);
+        time_to_wait.tv_sec += 600;
 
         pthread_mutex_lock(&defrag->fc_mutex);
         pthread_cond_timedwait(&defrag->fc_wakeup_cond, &defrag->fc_mutex,
@@ -4416,7 +4094,7 @@ gf_defrag_estimates_init(xlator_t *this, loc_t *loc, pthread_t *filecnt_thread)
         goto out;
     }
 
-    ret = gf_thread_create(filecnt_thread, NULL, &dht_file_counter_thread,
+    ret = gf_thread_create(filecnt_thread, NULL, dht_file_counter_thread,
                            (void *)defrag, "dhtfcnt");
 
     if (ret) {
@@ -4473,7 +4151,7 @@ gf_defrag_parallel_migration_init(xlator_t *this, gf_defrag_info_t *defrag,
 
     /*Spawn Threads Here*/
     while (index < thread_spawn_count) {
-        ret = gf_thread_create(&(tid[index]), NULL, &gf_defrag_task,
+        ret = gf_thread_create(&(tid[index]), NULL, gf_defrag_task,
                                (void *)defrag, "dhtmig%d", (index + 1) & 0x3ff);
         if (ret != 0) {
             gf_msg("DHT", GF_LOG_ERROR, ret, 0, "Thread[%d] creation failed. ",
@@ -4547,7 +4225,6 @@ gf_defrag_start_crawl(void *data)
     dict_t *migrate_data = NULL;
     dict_t *status = NULL;
     glusterfs_ctx_t *ctx = NULL;
-    dht_methods_t *methods = NULL;
     call_frame_t *statfs_frame = NULL;
     xlator_t *old_THIS = NULL;
     int ret = -1;
@@ -4563,7 +4240,6 @@ gf_defrag_start_crawl(void *data)
     int thread_index = 0;
     pthread_t *tid = NULL;
     pthread_t filecnt_thread;
-    gf_boolean_t is_tier_detach = _gf_false;
     gf_boolean_t fc_thread_started = _gf_false;
 
     this = data;
@@ -4582,7 +4258,8 @@ gf_defrag_start_crawl(void *data)
     if (!defrag)
         goto exit;
 
-    gettimeofday(&defrag->start_time, NULL);
+    defrag->start_time = gf_time();
+
     dht_build_root_inode(this, &defrag->root_inode);
     if (!defrag->root_inode)
         goto out;
@@ -4716,43 +4393,17 @@ gf_defrag_start_crawl(void *data)
         }
     }
 
-    if (defrag->cmd == GF_DEFRAG_CMD_START_TIER) {
-        /* Fix layout for attach tier */
-        ret = gf_tier_start_fix_layout(this, &loc, defrag, fix_layout);
-        if (ret) {
-            goto out;
-        }
+    ret = gf_defrag_fix_layout(this, defrag, &loc, fix_layout, migrate_data);
+    if (ret) {
+        defrag->total_failures++;
+        ret = -1;
+        goto out;
+    }
 
-        methods = &(conf->methods);
-
-        /* Calling tier_start of tier.c */
-        methods->migration_other(this, defrag);
-        if (defrag->cmd == GF_DEFRAG_CMD_START_DETACH_TIER ||
-            defrag->cmd == GF_DEFRAG_CMD_DETACH_START) {
-            ret = dict_set_str(migrate_data, GF_XATTR_FILE_MIGRATE_KEY,
-                               "force");
-            if (ret)
-                goto out;
-        }
-    } else {
-        ret = gf_defrag_fix_layout(this, defrag, &loc, fix_layout,
-                                   migrate_data);
-        if (ret && ret != 2) {
-            defrag->total_failures++;
-            ret = -1;
-            goto out;
-        }
-
-        if (ret != 2 &&
-            gf_defrag_settle_hash(this, defrag, &loc, fix_layout) != 0) {
-            defrag->total_failures++;
-            ret = -1;
-            goto out;
-        }
-
-        if (defrag->cmd == GF_DEFRAG_CMD_START_DETACH_TIER ||
-            defrag->cmd == GF_DEFRAG_CMD_DETACH_START)
-            is_tier_detach = _gf_true;
+    if (gf_defrag_settle_hash(this, defrag, &loc, fix_layout) != 0) {
+        defrag->total_failures++;
+        ret = -1;
+        goto out;
     }
 
     gf_log("DHT", GF_LOG_INFO, "crawling file-system completed");
@@ -4764,19 +4415,6 @@ out:
 
     if (ret) {
         defrag->defrag_status = GF_DEFRAG_STATUS_FAILED;
-    }
-
-    if (defrag->cmd == GF_DEFRAG_CMD_START_TIER) {
-        /* Wait for the tier fixlayout to
-         * complete if its was started.*/
-        gf_tier_wait_fix_lookup(defrag);
-    }
-
-    if (is_tier_detach && ret == 0) {
-        /* If it was a detach remove the tier fix-layout
-         * xattr on root. Ignoring the failure, as nothing has to be
-         * done, logging is done in gf_tier_clear_fix_layout */
-        gf_tier_clear_fix_layout(this, &loc, defrag);
     }
 
     gf_defrag_parallel_migration_cleanup(defrag, tid, thread_index);
@@ -4877,9 +4515,6 @@ gf_defrag_get_estimates_based_on_size(dht_conf_t *conf)
     uint64_t total_processed = 0;
     uint64_t tmp_count = 0;
     uint64_t time_to_complete = 0;
-    struct timeval now = {
-        0,
-    };
     double elapsed = 0;
 
     defrag = conf->defrag;
@@ -4887,8 +4522,7 @@ gf_defrag_get_estimates_based_on_size(dht_conf_t *conf)
     if (!g_totalsize)
         goto out;
 
-    gettimeofday(&now, NULL);
-    elapsed = now.tv_sec - defrag->start_time.tv_sec;
+    elapsed = gf_time() - defrag->start_time;
 
     /* Don't calculate the estimates for the first 10 minutes.
      * It is unlikely to be accurate and estimates are not required
@@ -4938,13 +4572,8 @@ gf_defrag_status_get(dht_conf_t *conf, dict_t *dict)
     uint64_t lookup = 0;
     uint64_t failures = 0;
     uint64_t skipped = 0;
-    uint64_t promoted = 0;
-    uint64_t demoted = 0;
     char *status = "";
     double elapsed = 0;
-    struct timeval end = {
-        0,
-    };
     uint64_t time_to_complete = 0;
     uint64_t time_left = 0;
     gf_defrag_info_t *defrag = conf->defrag;
@@ -4961,17 +4590,12 @@ gf_defrag_status_get(dht_conf_t *conf, dict_t *dict)
     lookup = defrag->num_files_lookedup;
     failures = defrag->total_failures;
     skipped = defrag->skipped;
-    promoted = defrag->total_files_promoted;
-    demoted = defrag->total_files_demoted;
 
-    gettimeofday(&end, NULL);
-
-    elapsed = end.tv_sec - defrag->start_time.tv_sec;
+    elapsed = gf_time() - defrag->start_time;
 
     /* The rebalance is still in progress */
 
-    if ((defrag->cmd != GF_DEFRAG_CMD_START_TIER) &&
-        (defrag->defrag_status == GF_DEFRAG_STATUS_STARTED)) {
+    if (defrag->defrag_status == GF_DEFRAG_STATUS_STARTED) {
         time_to_complete = gf_defrag_get_estimates_based_on_size(conf);
 
         if (time_to_complete && (time_to_complete > elapsed))
@@ -4985,14 +4609,6 @@ gf_defrag_status_get(dht_conf_t *conf, dict_t *dict)
 
     if (!dict)
         goto log;
-
-    ret = dict_set_uint64(dict, "promoted", promoted);
-    if (ret)
-        gf_log(THIS->name, GF_LOG_WARNING, "failed to set promoted count");
-
-    ret = dict_set_uint64(dict, "demoted", demoted);
-    if (ret)
-        gf_log(THIS->name, GF_LOG_WARNING, "failed to set demoted count");
 
     ret = dict_set_uint64(dict, "files", files);
     if (ret)
@@ -5056,159 +4672,6 @@ log:
            "%" PRIu64,
            files, size, lookup, failures, skipped);
 out:
-    return 0;
-}
-
-void
-gf_defrag_set_pause_state(gf_tier_conf_t *tier_conf, tier_pause_state_t state)
-{
-    pthread_mutex_lock(&tier_conf->pause_mutex);
-    tier_conf->pause_state = state;
-    pthread_mutex_unlock(&tier_conf->pause_mutex);
-}
-
-tier_pause_state_t
-gf_defrag_get_pause_state(gf_tier_conf_t *tier_conf)
-{
-    int state;
-
-    pthread_mutex_lock(&tier_conf->pause_mutex);
-    state = tier_conf->pause_state;
-    pthread_mutex_unlock(&tier_conf->pause_mutex);
-
-    return state;
-}
-
-tier_pause_state_t
-gf_defrag_check_pause_tier(gf_tier_conf_t *tier_conf)
-{
-    int woke = 0;
-    int state = -1;
-
-    pthread_mutex_lock(&tier_conf->pause_mutex);
-
-    if (tier_conf->pause_state == TIER_RUNNING)
-        goto out;
-
-    if (tier_conf->pause_state == TIER_PAUSED)
-        goto out;
-
-    if (tier_conf->promote_in_progress || tier_conf->demote_in_progress)
-        goto out;
-
-    tier_conf->pause_state = TIER_PAUSED;
-
-    if (tier_conf->pause_synctask) {
-        synctask_wake(tier_conf->pause_synctask);
-        tier_conf->pause_synctask = 0;
-        woke = 1;
-    }
-
-    gf_msg("tier", GF_LOG_DEBUG, 0, DHT_MSG_TIER_PAUSED, "woken %d", woke);
-
-    gf_event(EVENT_TIER_PAUSE, "vol=%s", tier_conf->volname);
-out:
-    state = tier_conf->pause_state;
-
-    pthread_mutex_unlock(&tier_conf->pause_mutex);
-
-    return state;
-}
-
-void
-gf_defrag_pause_tier_timeout(void *data)
-{
-    xlator_t *this = NULL;
-    dht_conf_t *conf = NULL;
-    gf_defrag_info_t *defrag = NULL;
-
-    this = (xlator_t *)data;
-    GF_VALIDATE_OR_GOTO("tier", this, out);
-
-    conf = this->private;
-    GF_VALIDATE_OR_GOTO(this->name, conf, out);
-
-    defrag = conf->defrag;
-    GF_VALIDATE_OR_GOTO(this->name, defrag, out);
-
-    gf_msg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_TIER_PAUSED,
-           "Request pause timer timeout");
-
-    gf_defrag_check_pause_tier(&defrag->tier_conf);
-
-out:
-    return;
-}
-
-int
-gf_defrag_pause_tier(xlator_t *this, gf_defrag_info_t *defrag)
-{
-    int ret = 0;
-    struct timespec delta = {
-        0,
-    };
-    int delay = 2;
-
-    if (defrag->defrag_status != GF_DEFRAG_STATUS_STARTED)
-        goto out;
-
-    /*
-     * Set flag requesting to pause tiering. Wait 'delay' seconds for
-     * tiering to actually stop as indicated by the pause state
-     * before returning success or failure.
-     */
-    gf_defrag_set_pause_state(&defrag->tier_conf, TIER_REQUEST_PAUSE);
-
-    /*
-     * If migration is not underway, can pause immediately.
-     */
-    gf_defrag_check_pause_tier(&defrag->tier_conf);
-    if (gf_defrag_get_pause_state(&defrag->tier_conf) == TIER_PAUSED)
-        goto out;
-
-    gf_msg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_TIER_PAUSED,
-           "Request pause tier");
-
-    defrag->tier_conf.pause_synctask = synctask_get();
-    delta.tv_sec = delay;
-    delta.tv_nsec = 0;
-    defrag->tier_conf.pause_timer = gf_timer_call_after(
-        this->ctx, delta, gf_defrag_pause_tier_timeout, this);
-
-    synctask_yield(defrag->tier_conf.pause_synctask);
-
-    if (gf_defrag_get_pause_state(&defrag->tier_conf) == TIER_PAUSED)
-        goto out;
-
-    gf_defrag_set_pause_state(&defrag->tier_conf, TIER_RUNNING);
-
-    ret = -1;
-out:
-
-    gf_msg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_TIER_PAUSED,
-           "Pause tiering ret=%d", ret);
-
-    return ret;
-}
-
-int
-gf_defrag_resume_tier(xlator_t *this, gf_defrag_info_t *defrag)
-{
-    gf_msg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_TIER_RESUME,
-           "Pause end. Resume tiering");
-
-    gf_defrag_set_pause_state(&defrag->tier_conf, TIER_RUNNING);
-
-    gf_event(EVENT_TIER_RESUME, "vol=%s", defrag->tier_conf.volname);
-
-    return 0;
-}
-
-int
-gf_defrag_start_detach_tier(gf_defrag_info_t *defrag)
-{
-    defrag->cmd = GF_DEFRAG_CMD_START_DETACH_TIER;
-
     return 0;
 }
 

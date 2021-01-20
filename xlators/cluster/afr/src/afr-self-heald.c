@@ -94,7 +94,7 @@ __afr_shd_healer_wait(struct subvol_healer *healer)
     priv = healer->this->private;
 
 disabled_loop:
-    wait_till.tv_sec = time(NULL) + priv->shd.timeout;
+    wait_till.tv_sec = gf_time() + priv->shd.timeout;
 
     while (!healer->rerun) {
         ret = pthread_cond_timedwait(&healer->cond, &healer->mutex, &wait_till);
@@ -222,7 +222,7 @@ out:
 }
 
 int
-afr_shd_index_purge(xlator_t *subvol, inode_t *inode, char *name,
+afr_shd_entry_purge(xlator_t *subvol, inode_t *inode, char *name,
                     ia_type_t type)
 {
     int ret = 0;
@@ -371,7 +371,7 @@ afr_shd_sweep_prepare(struct subvol_healer *healer)
     event->split_brain_count = 0;
     event->heal_failed_count = 0;
 
-    time(&event->start_time);
+    event->start_time = gf_time();
     event->end_time = 0;
     _mask_cancellation();
 }
@@ -386,7 +386,7 @@ afr_shd_sweep_done(struct subvol_healer *healer)
     event = &healer->crawl_event;
     shd = &(((afr_private_t *)healer->this->private)->shd);
 
-    time(&event->end_time);
+    event->end_time = gf_time();
     history = gf_memdup(event, sizeof(*event));
     event->start_time = 0;
 
@@ -424,7 +424,7 @@ afr_shd_index_heal(xlator_t *subvol, gf_dirent_t *entry, loc_t *parent,
     ret = afr_shd_selfheal(healer, healer->subvol, gfid);
 
     if (ret == -ENOENT || ret == -ESTALE)
-        afr_shd_index_purge(subvol, parent->inode, entry->d_name, val);
+        afr_shd_entry_purge(subvol, parent->inode, entry->d_name, val);
 
     if (ret == 2)
         /* If bricks crashed in pre-op after creating indices/xattrop
@@ -843,6 +843,176 @@ out:
     return need_heal;
 }
 
+static int
+afr_shd_anon_inode_cleaner(xlator_t *subvol, gf_dirent_t *entry, loc_t *parent,
+                           void *data)
+{
+    struct subvol_healer *healer = data;
+    afr_private_t *priv = healer->this->private;
+    call_frame_t *frame = NULL;
+    afr_local_t *local = NULL;
+    int ret = 0;
+    loc_t loc = {0};
+    int count = 0;
+    int i = 0;
+    int op_errno = 0;
+    struct iatt *iatt = NULL;
+    gf_boolean_t multiple_links = _gf_false;
+    unsigned char *gfid_present = alloca0(priv->child_count);
+    unsigned char *entry_present = alloca0(priv->child_count);
+    char *type = "file";
+
+    frame = afr_frame_create(healer->this, &ret);
+    if (!frame) {
+        ret = -ret;
+        goto out;
+    }
+    local = frame->local;
+    if (AFR_COUNT(local->child_up, priv->child_count) != priv->child_count) {
+        gf_msg_debug(healer->this->name, 0,
+                     "Not all bricks are up. Skipping "
+                     "cleanup of %s on %s",
+                     entry->d_name, subvol->name);
+        ret = 0;
+        goto out;
+    }
+
+    loc.inode = inode_new(parent->inode->table);
+    if (!loc.inode) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    ret = gf_uuid_parse(entry->d_name, loc.gfid);
+    if (ret) {
+        ret = 0;
+        goto out;
+    }
+    AFR_ONLIST(local->child_up, frame, afr_selfheal_discover_cbk, lookup, &loc,
+               NULL);
+    for (i = 0; i < priv->child_count; i++) {
+        if (local->replies[i].op_ret == 0) {
+            count++;
+            gfid_present[i] = 1;
+            iatt = &local->replies[i].poststat;
+            if (iatt->ia_type == IA_IFDIR) {
+                type = "dir";
+            }
+
+            if (i == healer->subvol) {
+                if (local->replies[i].poststat.ia_nlink > 1) {
+                    multiple_links = _gf_true;
+                }
+            }
+        } else if (local->replies[i].op_errno != ENOENT &&
+                   local->replies[i].op_errno != ESTALE) {
+            /*We don't have complete view. Skip the entry*/
+            gf_msg_debug(healer->this->name, local->replies[i].op_errno,
+                         "Skipping cleanup of %s on %s", entry->d_name,
+                         subvol->name);
+            ret = 0;
+            goto out;
+        }
+    }
+
+    /*Inode is deleted from subvol*/
+    if (count == 1 || (iatt->ia_type != IA_IFDIR && multiple_links)) {
+        gf_msg(healer->this->name, GF_LOG_WARNING, 0,
+               AFR_MSG_EXPUNGING_FILE_OR_DIR, "expunging %s %s/%s on %s", type,
+               priv->anon_inode_name, entry->d_name, subvol->name);
+        ret = afr_shd_entry_purge(subvol, parent->inode, entry->d_name,
+                                  iatt->ia_type);
+        if (ret == -ENOENT || ret == -ESTALE)
+            ret = 0;
+    } else if (count > 1) {
+        loc_wipe(&loc);
+        loc.parent = inode_ref(parent->inode);
+        loc.name = entry->d_name;
+        loc.inode = inode_new(parent->inode->table);
+        if (!loc.inode) {
+            ret = -ENOMEM;
+            goto out;
+        }
+        AFR_ONLIST(local->child_up, frame, afr_selfheal_discover_cbk, lookup,
+                   &loc, NULL);
+        count = 0;
+        for (i = 0; i < priv->child_count; i++) {
+            if (local->replies[i].op_ret == 0) {
+                count++;
+                entry_present[i] = 1;
+                iatt = &local->replies[i].poststat;
+            } else if (local->replies[i].op_errno != ENOENT &&
+                       local->replies[i].op_errno != ESTALE) {
+                /*We don't have complete view. Skip the entry*/
+                gf_msg_debug(healer->this->name, local->replies[i].op_errno,
+                             "Skipping cleanup of %s on %s", entry->d_name,
+                             subvol->name);
+                ret = 0;
+                goto out;
+            }
+        }
+        for (i = 0; i < priv->child_count; i++) {
+            if (gfid_present[i] && !entry_present[i]) {
+                /*Entry is not anonymous on at least one subvol*/
+                gf_msg_debug(healer->this->name, 0,
+                             "Valid entry present on %s "
+                             "Skipping cleanup of %s on %s",
+                             priv->children[i]->name, entry->d_name,
+                             subvol->name);
+                ret = 0;
+                goto out;
+            }
+        }
+
+        gf_msg(healer->this->name, GF_LOG_WARNING, 0,
+               AFR_MSG_EXPUNGING_FILE_OR_DIR,
+               "expunging %s %s/%s on all subvols", type, priv->anon_inode_name,
+               entry->d_name);
+        ret = 0;
+        for (i = 0; i < priv->child_count; i++) {
+            op_errno = -afr_shd_entry_purge(priv->children[i], loc.parent,
+                                            entry->d_name, iatt->ia_type);
+            if (op_errno != ENOENT && op_errno != ESTALE) {
+                ret |= -op_errno;
+            }
+        }
+    }
+
+out:
+    if (frame)
+        AFR_STACK_DESTROY(frame);
+    loc_wipe(&loc);
+    return ret;
+}
+
+static void
+afr_cleanup_anon_inode_dir(struct subvol_healer *healer)
+{
+    int ret = 0;
+    call_frame_t *frame = NULL;
+    afr_private_t *priv = healer->this->private;
+    loc_t loc = {0};
+
+    ret = afr_anon_inode_create(healer->this, healer->subvol, &loc.inode);
+    if (ret)
+        goto out;
+
+    frame = afr_frame_create(healer->this, &ret);
+    if (!frame) {
+        ret = -ret;
+        goto out;
+    }
+
+    ret = syncop_mt_dir_scan(frame, priv->children[healer->subvol], &loc,
+                             GF_CLIENT_PID_SELF_HEALD, healer,
+                             afr_shd_anon_inode_cleaner, NULL,
+                             priv->shd.max_threads, priv->shd.wait_qlength);
+out:
+    if (frame)
+        AFR_STACK_DESTROY(frame);
+    loc_wipe(&loc);
+    return;
+}
+
 void *
 afr_shd_index_healer(void *data)
 {
@@ -899,6 +1069,10 @@ afr_shd_index_healer(void *data)
             */
             sleep(1);
         } while (ret > 0);
+
+        if (ret == 0) {
+            afr_cleanup_anon_inode_dir(healer);
+        }
 
         if (ret == 0 && pre_crawl_xdata &&
             !healer->crawl_event.heal_failed_count) {
@@ -1024,7 +1198,7 @@ afr_shd_dict_add_crawl_event(xlator_t *this, dict_t *output,
 {
     int ret = 0;
     uint64_t count = 0;
-    char key[256] = {0};
+    char key[128] = {0};
     int keylen = 0;
     char suffix[64] = {0};
     int xl_id = 0;
@@ -1149,9 +1323,9 @@ afr_shd_dict_add_path(xlator_t *this, dict_t *output, int child, char *path,
 {
     int ret = -1;
     uint64_t count = 0;
-    char key[256] = {0};
+    char key[64] = {0};
     int keylen = 0;
-    char xl_id_child_str[64] = {0};
+    char xl_id_child_str[32] = {0};
     int xl_id = 0;
 
     ret = dict_get_int32(output, this->name, &xl_id);
@@ -1374,19 +1548,40 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
     int op_ret = 0;
     uint64_t cnt = 0;
 
+#define AFR_SET_DICT_AND_LOG(name, output, key, keylen, dict_str,              \
+                             dict_str_len)                                     \
+    {                                                                          \
+        int ret;                                                               \
+                                                                               \
+        ret = dict_set_nstrn(output, key, keylen, dict_str, dict_str_len);     \
+        if (ret) {                                                             \
+            gf_smsg(name, GF_LOG_ERROR, -ret, AFR_MSG_DICT_SET_FAILED,         \
+                    "key=%s", key, "value=%s", dict_str, NULL);                \
+        }                                                                      \
+    }
+
     priv = this->private;
     shd = &priv->shd;
 
     ret = dict_get_int32_sizen(input, "xl-op", (int32_t *)&op);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_DICT_GET_FAILED,
+                "key=xl-op", NULL);
         goto out;
+    }
     this_name_len = strlen(this->name);
     ret = dict_get_int32n(input, this->name, this_name_len, &xl_id);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_DICT_GET_FAILED,
+                "key=%s", this->name, NULL);
         goto out;
+    }
     ret = dict_set_int32n(output, this->name, this_name_len, xl_id);
-    if (ret)
+    if (ret) {
+        gf_smsg(this->name, GF_LOG_ERROR, -ret, AFR_MSG_DICT_SET_FAILED,
+                "key=%s", this->name, NULL);
         goto out;
+    }
     switch (op) {
         case GF_SHD_OP_HEAL_INDEX:
             op_ret = 0;
@@ -1396,23 +1591,30 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
                 keylen = snprintf(key, sizeof(key), "%d-%d-status", xl_id, i);
 
                 if (!priv->child_up[i]) {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SBRICK_NOT_CONNECTED,
                                          SLEN(SBRICK_NOT_CONNECTED));
                     op_ret = -1;
                 } else if (AFR_COUNT(priv->child_up, priv->child_count) < 2) {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SLESS_THAN2_BRICKS_in_REP,
                                          SLEN(SLESS_THAN2_BRICKS_in_REP));
                     op_ret = -1;
                 } else if (!afr_shd_is_subvol_local(this, healer->subvol)) {
-                    ret = dict_set_nstrn(output, key, keylen, SBRICK_IS_REMOTE,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
+                                         SBRICK_IS_REMOTE,
                                          SLEN(SBRICK_IS_REMOTE));
                 } else {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SSTARTED_SELF_HEAL,
                                          SLEN(SSTARTED_SELF_HEAL));
-                    afr_shd_index_healer_spawn(this, i);
+
+                    ret = afr_shd_index_healer_spawn(this, i);
+
+                    if (ret) {
+                        gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                                AFR_MSG_HEALER_SPAWN_FAILED, NULL);
+                    }
                 }
             }
             break;
@@ -1424,21 +1626,28 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
                 keylen = snprintf(key, sizeof(key), "%d-%d-status", xl_id, i);
 
                 if (!priv->child_up[i]) {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SBRICK_NOT_CONNECTED,
                                          SLEN(SBRICK_NOT_CONNECTED));
                 } else if (AFR_COUNT(priv->child_up, priv->child_count) < 2) {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SLESS_THAN2_BRICKS_in_REP,
                                          SLEN(SLESS_THAN2_BRICKS_in_REP));
                 } else if (!afr_shd_is_subvol_local(this, healer->subvol)) {
-                    ret = dict_set_nstrn(output, key, keylen, SBRICK_IS_REMOTE,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
+                                         SBRICK_IS_REMOTE,
                                          SLEN(SBRICK_IS_REMOTE));
                 } else {
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SSTARTED_SELF_HEAL,
                                          SLEN(SSTARTED_SELF_HEAL));
-                    afr_shd_full_healer_spawn(this, i);
+
+                    ret = afr_shd_full_healer_spawn(this, i);
+
+                    if (ret) {
+                        gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                                AFR_MSG_HEALER_SPAWN_FAILED, NULL);
+                    }
                     op_ret = 0;
                 }
             }
@@ -1446,24 +1655,25 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
         case GF_SHD_OP_INDEX_SUMMARY:
             /* this case has been handled in glfs-heal.c */
             break;
-        case GF_SHD_OP_HEALED_FILES:
-        case GF_SHD_OP_HEAL_FAILED_FILES:
-            for (i = 0; i < priv->child_count; i++) {
-                keylen = snprintf(key, sizeof(key), "%d-%d-status", xl_id, i);
-                ret = dict_set_nstrn(output, key, keylen, SOP_NOT_SUPPORTED,
-                                     SLEN(SOP_NOT_SUPPORTED));
-            }
-            break;
         case GF_SHD_OP_SPLIT_BRAIN_FILES:
             eh_dump(shd->split_brain, output, afr_add_shd_event);
             break;
         case GF_SHD_OP_STATISTICS:
             for (i = 0; i < priv->child_count; i++) {
                 eh_dump(shd->statistics[i], output, afr_add_crawl_event);
-                afr_shd_dict_add_crawl_event(
+                ret = afr_shd_dict_add_crawl_event(
                     this, output, &shd->index_healers[i].crawl_event);
-                afr_shd_dict_add_crawl_event(this, output,
-                                             &shd->full_healers[i].crawl_event);
+                if (ret) {
+                    gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                            AFR_MSG_ADD_CRAWL_EVENT_FAILED, NULL);
+                }
+
+                ret = afr_shd_dict_add_crawl_event(
+                    this, output, &shd->full_healers[i].crawl_event);
+                if (ret) {
+                    gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                            AFR_MSG_ADD_CRAWL_EVENT_FAILED, NULL);
+                }
             }
             break;
         case GF_SHD_OP_STATISTICS_HEAL_COUNT:
@@ -1474,7 +1684,7 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
                 if (!priv->child_up[i]) {
                     keylen = snprintf(key, sizeof(key), "%d-%d-status", xl_id,
                                       i);
-                    ret = dict_set_nstrn(output, key, keylen,
+                    AFR_SET_DICT_AND_LOG(this->name, output, key, keylen,
                                          SBRICK_NOT_CONNECTED,
                                          SLEN(SBRICK_NOT_CONNECTED));
                 } else {
@@ -1484,9 +1694,8 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
                         ret = dict_set_uint64(output, key, cnt);
                     }
                     if (ret) {
-                        gf_msg(this->name, GF_LOG_ERROR, -ret,
-                               AFR_MSG_DICT_SET_FAILED,
-                               "Could not add cnt to output");
+                        gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                                AFR_MSG_DICT_SET_FAILED, NULL);
                     }
                     op_ret = 0;
                 }
@@ -1495,11 +1704,13 @@ afr_xl_op(xlator_t *this, dict_t *input, dict_t *output)
             break;
 
         default:
-            gf_msg(this->name, GF_LOG_ERROR, 0, AFR_MSG_INVALID_ARG,
-                   "Unknown set op %d", op);
+            gf_smsg(this->name, GF_LOG_ERROR, 0, AFR_MSG_INVALID_ARG, "op=%d",
+                    op, NULL);
             break;
     }
 out:
     dict_deln(output, this->name, this_name_len);
     return op_ret;
+
+#undef AFR_SET_DICT_AND_LOG
 }

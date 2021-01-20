@@ -184,9 +184,11 @@ xlator_volopt_dynload(char *xlator_type, void **dl_handle,
                       volume_opt_list_t *opt_list)
 {
     int ret = -1;
+    int flag = 0;
     char *name = NULL;
     void *handle = NULL;
     xlator_api_t *xlapi = NULL;
+    volume_option_t *opt = NULL;
 
     GF_VALIDATE_OR_GOTO("xlator", xlator_type, out);
 
@@ -194,8 +196,10 @@ xlator_volopt_dynload(char *xlator_type, void **dl_handle,
      * need this check */
     if (!strstr(xlator_type, "rpc-transport"))
         ret = gf_asprintf(&name, "%s/%s.so", XLATORDIR, xlator_type);
-    else
+    else {
+        flag = 1;
         ret = gf_asprintf(&name, "%s/%s.so", XLATORPARENTDIR, xlator_type);
+    }
     if (-1 == ret) {
         goto out;
     }
@@ -206,24 +210,34 @@ xlator_volopt_dynload(char *xlator_type, void **dl_handle,
 
     handle = dlopen(name, RTLD_NOW);
     if (!handle) {
-        gf_msg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLOPEN_FAILED, "%s",
-               dlerror());
+        gf_smsg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLOPEN_FAILED, "error=%s",
+                dlerror(), NULL);
         goto out;
     }
 
-    /* check new struct first, and then check this */
-    xlapi = dlsym(handle, "xlator_api");
-    if (!xlapi) {
-        gf_msg("xlator", GF_LOG_ERROR, 0, LG_MSG_DLSYM_ERROR,
-               "dlsym(xlator_api) missing: %s", dlerror());
-        goto out;
-    }
+    if (flag == 0) {
+        /* check new struct first, and then check this */
+        xlapi = dlsym(handle, "xlator_api");
+        if (!xlapi) {
+            gf_smsg("xlator", GF_LOG_ERROR, 0, LG_MSG_DLSYM_ERROR, "error=%s",
+                    dlerror(), NULL);
+            goto out;
+        }
 
-    opt_list->given_opt = xlapi->options;
-    if (!opt_list->given_opt) {
-        gf_msg("xlator", GF_LOG_ERROR, 0, LG_MSG_LOAD_FAILED,
-               "Failed to load xlator options table");
-        goto out;
+        opt_list->given_opt = xlapi->options;
+        if (!opt_list->given_opt) {
+            gf_smsg("xlator", GF_LOG_ERROR, 0, LG_MSG_LOAD_FAILED, NULL);
+            goto out;
+        }
+    } else {
+        opt = dlsym(handle, "options");
+        if (!opt) {
+            gf_smsg("xlator", GF_LOG_ERROR, 0, LG_MSG_DLSYM_ERROR, "error=%s",
+                    dlerror(), NULL);
+            goto out;
+        }
+
+        opt_list->given_opt = opt;
     }
 
     *dl_handle = handle;
@@ -246,21 +260,22 @@ xlator_dynload_apis(xlator_t *xl)
     void *handle = NULL;
     volume_opt_list_t *vol_opt = NULL;
     xlator_api_t *xlapi = NULL;
+    int i = 0;
 
     handle = xl->dlhandle;
 
     xlapi = dlsym(handle, "xlator_api");
     if (!xlapi) {
-        gf_msg("xlator", GF_LOG_ERROR, 0, LG_MSG_DLSYM_ERROR,
-               "dlsym(xlator_api) missing: %s", dlerror());
+        gf_smsg("xlator", GF_LOG_ERROR, 0, LG_MSG_DLSYM_ERROR, "dlsym=%s",
+                dlerror(), NULL);
         ret = -1;
         goto out;
     }
 
     xl->fops = xlapi->fops;
     if (!xl->fops) {
-        gf_msg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLSYM_ERROR,
-               "%s: struct missing (fops)", xl->name);
+        gf_smsg("xlator", GF_LOG_WARNING, 0, LG_MSG_STRUCT_MISS, "name=%s",
+                xl->name, NULL);
         goto out;
     }
 
@@ -271,8 +286,8 @@ xlator_dynload_apis(xlator_t *xl)
 
     xl->init = xlapi->init;
     if (!xl->init) {
-        gf_msg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLSYM_ERROR,
-               "%s: method missing (init)", xl->name);
+        gf_smsg("xlator", GF_LOG_WARNING, 0, LG_MSG_METHOD_MISS, "name=%s",
+                xl->name, NULL);
         goto out;
     }
 
@@ -343,6 +358,10 @@ xlator_dynload_apis(xlator_t *xl)
     memcpy(xl->op_version, xlapi->op_version,
            sizeof(uint32_t) * GF_MAX_RELEASES);
 
+    for (i = 0; i < GF_FOP_MAXVALUE; i++) {
+        gf_latency_reset(&xl->stats.interval.latencies[i]);
+    }
+
     ret = 0;
 out:
     return ret;
@@ -370,8 +389,8 @@ xlator_dynload(xlator_t *xl)
 
     handle = dlopen(name, RTLD_NOW);
     if (!handle) {
-        gf_msg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLOPEN_FAILED, "%s",
-               dlerror());
+        gf_smsg("xlator", GF_LOG_WARNING, 0, LG_MSG_DLOPEN_FAILED, "error=%s",
+                dlerror(), NULL);
         goto out;
     }
     xl->dlhandle = handle;
@@ -438,10 +457,8 @@ xlator_set_inode_lru_limit(xlator_t *this, void *data)
 
     if (this->itable) {
         if (!data) {
-            gf_msg(this->name, GF_LOG_WARNING, 0, LG_MSG_INVALID_ENTRY,
-                   "input data is NULL. "
-                   "Cannot update the lru limit of the inode"
-                   " table. Continuing with older value");
+            gf_smsg(this->name, GF_LOG_WARNING, 0, LG_MSG_INPUT_DATA_NULL,
+                    NULL);
             goto out;
         }
         inode_lru_limit = *(int *)data;
@@ -615,18 +632,15 @@ xlator_init(xlator_t *xl)
     xl->instance_name = NULL;
     GF_ATOMIC_INIT(xl->xprtrefcnt, 0);
     if (!xl->init) {
-        gf_msg(xl->name, GF_LOG_WARNING, 0, LG_MSG_INIT_FAILED,
-               "No init() found");
+        gf_smsg(xl->name, GF_LOG_WARNING, 0, LG_MSG_INIT_FAILED, NULL);
         goto out;
     }
 
     ret = __xlator_init(xl);
 
     if (ret) {
-        gf_msg(xl->name, GF_LOG_ERROR, 0, LG_MSG_VOLUME_ERROR,
-               "Initialization of volume '%s' failed,"
-               " review your volfile again",
-               xl->name);
+        gf_smsg(xl->name, GF_LOG_ERROR, 0, LG_MSG_VOLUME_ERROR, "name=%s",
+                xl->name, NULL);
         goto out;
     }
 
@@ -812,7 +826,7 @@ xlator_members_free(xlator_t *xl)
 
     GF_FREE(xl->name);
     GF_FREE(xl->type);
-    if (!(xl->ctx && xl->ctx->cmd_args.valgrind) && xl->dlhandle)
+    if (!(xl->ctx && xl->ctx->cmd_args.vgtool != _gf_none) && xl->dlhandle)
         dlclose(xl->dlhandle);
     if (xl->options)
         dict_unref(xl->options);
@@ -862,8 +876,7 @@ xlator_tree_free_members(xlator_t *tree)
     xlator_t *prev = tree;
 
     if (!tree) {
-        gf_msg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND,
-               "Translator tree not found");
+        gf_smsg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND, NULL);
         return -1;
     }
 
@@ -883,8 +896,7 @@ xlator_tree_free_memacct(xlator_t *tree)
     xlator_t *prev = tree;
 
     if (!tree) {
-        gf_msg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND,
-               "Translator tree not found");
+        gf_smsg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND, NULL);
         return -1;
     }
 
@@ -945,6 +957,8 @@ xlator_mem_cleanup(xlator_t *this)
     xlator_list_t **trav_p = NULL;
     xlator_t *top = NULL;
     xlator_t *victim = NULL;
+    glusterfs_graph_t *graph = NULL;
+    gf_boolean_t graph_cleanup = _gf_false;
 
     if (this->call_cleanup || !this->ctx)
         return;
@@ -952,18 +966,18 @@ xlator_mem_cleanup(xlator_t *this)
     this->call_cleanup = 1;
     ctx = this->ctx;
 
+    inode_table = this->itable;
+    if (inode_table) {
+        inode_table_destroy(inode_table);
+        this->itable = NULL;
+    }
+
     xlator_call_fini(trav);
 
     while (prev) {
         trav = prev->next;
         xlator_mem_free(prev);
         prev = trav;
-    }
-
-    inode_table = this->itable;
-    if (inode_table) {
-        inode_table_destroy(inode_table);
-        this->itable = NULL;
     }
 
     if (this->fini) {
@@ -975,16 +989,27 @@ xlator_mem_cleanup(xlator_t *this)
     if (ctx->active) {
         top = ctx->active->first;
         LOCK(&ctx->volfile_lock);
-        /* TODO here we have leak for xlator node in a graph */
-        /* Need to move only top xlator from a graph */
         for (trav_p = &top->children; *trav_p; trav_p = &(*trav_p)->next) {
             victim = (*trav_p)->xlator;
             if (victim->call_cleanup && !strcmp(victim->name, this->name)) {
+                graph_cleanup = _gf_true;
                 (*trav_p) = (*trav_p)->next;
                 break;
             }
         }
         UNLOCK(&ctx->volfile_lock);
+    }
+
+    if (graph_cleanup) {
+        prev = this;
+        graph = ctx->active;
+        pthread_mutex_lock(&graph->mutex);
+        while (prev) {
+            trav = prev->next;
+            GF_FREE(prev);
+            prev = trav;
+        }
+        pthread_mutex_unlock(&graph->mutex);
     }
 }
 
@@ -1344,9 +1369,9 @@ is_gf_log_command(xlator_t *this, const char *name, char *value, size_t size)
 
     /* Some crude way to change the log-level of process */
     if (!strcmp(name, "trusted.glusterfs.set-log-level")) {
-        gf_msg("glusterfs", gf_log_get_loglevel(), 0, LG_MSG_SET_LOG_LEVEL,
-               "setting log level to %d (old-value=%d)", log_level,
-               gf_log_get_loglevel());
+        gf_smsg("glusterfs", gf_log_get_loglevel(), 0, LG_MSG_SET_LOG_LEVEL,
+                "new-value=%d", log_level, "old-value=%d",
+                gf_log_get_loglevel(), NULL);
         gf_log_set_loglevel(this->ctx, log_level);
         ret = 0;
         goto out;
@@ -1354,9 +1379,9 @@ is_gf_log_command(xlator_t *this, const char *name, char *value, size_t size)
 
     if (!strcmp(name, "trusted.glusterfs.fuse.set-log-level")) {
         /* */
-        gf_msg(this->name, gf_log_get_xl_loglevel(this), 0,
-               LG_MSG_SET_LOG_LEVEL, "setting log level to %d (old-value=%d)",
-               log_level, gf_log_get_xl_loglevel(this));
+        gf_smsg(this->name, gf_log_get_xl_loglevel(this), 0,
+                LG_MSG_SET_LOG_LEVEL, "new-value=%d", log_level, "old-value=%d",
+                gf_log_get_xl_loglevel(this), NULL);
         gf_log_set_xl_loglevel(this, log_level);
         ret = 0;
         goto out;
@@ -1372,10 +1397,9 @@ is_gf_log_command(xlator_t *this, const char *name, char *value, size_t size)
     while (trav) {
         snprintf(key, 1024, "trusted.glusterfs.%s.set-log-level", trav->name);
         if (fnmatch(name, key, FNM_NOESCAPE) == 0) {
-            gf_msg(trav->name, gf_log_get_xl_loglevel(trav), 0,
-                   LG_MSG_SET_LOG_LEVEL,
-                   "setting log level to %d (old-value=%d)", log_level,
-                   gf_log_get_xl_loglevel(trav));
+            gf_smsg(trav->name, gf_log_get_xl_loglevel(trav), 0,
+                    LG_MSG_SET_LOG_LEVEL, "new-value%d", log_level,
+                    "old-value=%d", gf_log_get_xl_loglevel(trav), NULL);
             gf_log_set_xl_loglevel(trav, log_level);
             ret = 0;
         }
@@ -1407,9 +1431,7 @@ glusterd_check_log_level(const char *value)
     }
 
     if (log_level == -1)
-        gf_msg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INIT_FAILED,
-               "Invalid log-level. possible values are "
-               "DEBUG|WARNING|ERROR|CRITICAL|NONE|TRACE");
+        gf_smsg(THIS->name, GF_LOG_ERROR, 0, LG_MSG_INVALID_INIT, NULL);
 
     return log_level;
 }
@@ -1486,8 +1508,7 @@ gluster_graph_take_reference(xlator_t *tree)
     xlator_t *prev = tree;
 
     if (!tree) {
-        gf_msg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND,
-               "Translator tree not found");
+        gf_smsg("parser", GF_LOG_ERROR, 0, LG_MSG_TREE_NOT_FOUND, NULL);
         return;
     }
 
@@ -1524,15 +1545,15 @@ xlator_is_cleanup_starting(xlator_t *this)
     xlator_t *xl = NULL;
 
     if (!this) {
-        gf_msg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
-               "xlator object is null, returning false");
+        gf_smsg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_OBJECT_NULL, "xlator",
+                NULL);
         goto out;
     }
 
     graph = this->graph;
     if (!graph) {
-        gf_msg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
-               "Graph is not set for xlator %s", this->name);
+        gf_smsg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_GRAPH_NOT_SET,
+                "name=%s", this->name, NULL);
         goto out;
     }
 
@@ -1550,12 +1571,17 @@ graph_total_client_xlator(glusterfs_graph_t *graph)
     int count = 0;
 
     if (!graph) {
-        gf_msg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
-               "graph object is null");
+        gf_smsg("xlator", GF_LOG_WARNING, EINVAL, LG_MSG_OBJECT_NULL, "graph",
+                NULL);
         goto out;
     }
 
     xl = graph->first;
+    if (!strcmp(xl->type, "protocol/server")) {
+        gf_msg_debug(xl->name, 0, "Return because it is a server graph");
+        return 0;
+    }
+
     while (xl) {
         if (strcmp(xl->type, "protocol/client") == 0) {
             count++;

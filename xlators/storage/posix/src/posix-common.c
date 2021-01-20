@@ -26,7 +26,6 @@
 #include <signal.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <ftw.h>
 
 #ifndef GF_BSD_HOST_OS
 #include <alloca.h>
@@ -141,6 +140,7 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
     struct timespec sleep_till = {
         0,
     };
+    glusterfs_ctx_t *ctx = this->ctx;
 
     switch (event) {
         case GF_EVENT_PARENT_UP: {
@@ -151,8 +151,6 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
         case GF_EVENT_PARENT_DOWN: {
             if (!victim->cleanup_starting)
                 break;
-            gf_log(this->name, GF_LOG_INFO, "Sending CHILD_DOWN for brick %s",
-                   victim->name);
 
             if (priv->janitor) {
                 pthread_mutex_lock(&priv->janitor_mutex);
@@ -161,7 +159,7 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
                     ret = gf_tw_del_timer(this->ctx->tw->timer_wheel,
                                           priv->janitor);
                     if (!ret) {
-                        clock_gettime(CLOCK_REALTIME, &sleep_till);
+                        timespec_now_realtime(&sleep_till);
                         sleep_till.tv_sec += 1;
                         /* Wait to set janitor_task flag to _gf_false by
                          * janitor_task_done */
@@ -169,7 +167,7 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
                             (void)pthread_cond_timedwait(&priv->janitor_cond,
                                                          &priv->janitor_mutex,
                                                          &sleep_till);
-                            clock_gettime(CLOCK_REALTIME, &sleep_till);
+                            timespec_now_realtime(&sleep_till);
                             sleep_till.tv_sec += 1;
                         }
                     }
@@ -178,6 +176,16 @@ posix_notify(xlator_t *this, int32_t event, void *data, ...)
                 GF_FREE(priv->janitor);
             }
             priv->janitor = NULL;
+            pthread_mutex_lock(&ctx->fd_lock);
+            {
+                while (priv->rel_fdcount > 0) {
+                    pthread_cond_wait(&priv->fd_cond, &ctx->fd_lock);
+                }
+            }
+            pthread_mutex_unlock(&ctx->fd_lock);
+
+            gf_log(this->name, GF_LOG_INFO, "Sending CHILD_DOWN for brick %s",
+                   victim->name);
             default_notify(this->parents->xlator, GF_EVENT_CHILD_DOWN, data);
         } break;
         default:
@@ -544,6 +552,30 @@ posix_create_unlink_dir(xlator_t *this)
     return 0;
 }
 
+int
+posix_create_open_directory_based_fd(xlator_t *this, int pdirfd, char *dir_name)
+{
+    int ret = -1;
+
+    ret = sys_openat(pdirfd, dir_name, (O_DIRECTORY | O_RDONLY), 0);
+    if (ret < 0 && errno == ENOENT) {
+        ret = sys_mkdirat(pdirfd, dir_name, 0700);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_HANDLE_CREATE,
+                   "Creating directory %s failed", dir_name);
+            goto out;
+        }
+        ret = sys_openat(pdirfd, dir_name, (O_DIRECTORY | O_RDONLY), 0);
+        if (ret < 0 && errno != EEXIST) {
+            gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_HANDLE_CREATE,
+                   "error mkdir hash-1 %s ", dir_name);
+            goto out;
+        }
+    }
+out:
+    return ret;
+}
+
 /**
  * init -
  */
@@ -580,6 +612,15 @@ posix_init(xlator_t *this)
     int force_directory = -1;
     int create_mask = -1;
     int create_directory_mask = -1;
+    char dir_handle[PATH_MAX] = {
+        0,
+    };
+    int i;
+    char fhash[4] = {
+        0,
+    };
+    int hdirfd = -1;
+    char value;
 
     dir_data = dict_get(this->options, "directory");
 
@@ -622,6 +663,11 @@ posix_init(xlator_t *this)
     _private->base_path = gf_strdup(dir_data->data);
     _private->base_path_length = dir_data->len - 1;
 
+    _private->dirfd = -1;
+    _private->mount_lock = -1;
+    for (i = 0; i < 256; i++)
+        _private->arrdfd[i] = -1;
+
     ret = dict_get_str(this->options, "hostname", &_private->hostname);
     if (ret) {
         _private->hostname = GF_CALLOC(256, sizeof(char), gf_common_mt_char);
@@ -636,16 +682,11 @@ posix_init(xlator_t *this)
     }
 
     /* Check for Extended attribute support, if not present, log it */
-    op_ret = sys_lsetxattr(dir_data->data, "trusted.glusterfs.test", "working",
-                           8, 0);
-    if (op_ret != -1) {
-        ret = sys_lremovexattr(dir_data->data, "trusted.glusterfs.test");
-        if (ret) {
-            gf_msg(this->name, GF_LOG_DEBUG, errno, P_MSG_INVALID_OPTION,
-                   "failed to remove xattr: "
-                   "trusted.glusterfs.test");
-        }
-    } else {
+    size = sys_lgetxattr(dir_data->data, "user.x", &value, sizeof(value));
+
+    if ((size == -1) && (errno == EOPNOTSUPP)) {
+        gf_msg(this->name, GF_LOG_DEBUG, 0, P_MSG_XDATA_GETXATTR,
+               "getxattr returned %zd", size);
         tmp_data = dict_get(this->options, "mandate-attribute");
         if (tmp_data) {
             if (gf_string2boolean(tmp_data->data, &tmp_bool) == -1) {
@@ -894,8 +935,9 @@ posix_init(xlator_t *this)
     /* performing open dir on brick dir locks the brick dir
      * and prevents it from being unmounted
      */
-    _private->mount_lock = sys_opendir(dir_data->data);
-    if (!_private->mount_lock) {
+    _private->mount_lock = sys_open(dir_data->data, (O_DIRECTORY | O_RDONLY),
+                                    0);
+    if (_private->mount_lock < 0) {
         ret = -1;
         op_errno = errno;
         gf_msg(this->name, GF_LOG_ERROR, 0, P_MSG_DIR_OPERATION_FAILED,
@@ -939,6 +981,28 @@ posix_init(xlator_t *this)
     }
 
     this->private = (void *)_private;
+    snprintf(dir_handle, sizeof(dir_handle), "%s/%s", _private->base_path,
+             GF_HIDDEN_PATH);
+    hdirfd = posix_create_open_directory_based_fd(this, _private->mount_lock,
+                                                  dir_handle);
+    if (hdirfd < 0) {
+        gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_HANDLE_CREATE,
+               "error open directory failed for dir %s", dir_handle);
+        ret = -1;
+        goto out;
+    }
+    _private->dirfd = hdirfd;
+    for (i = 0; i < 256; i++) {
+        snprintf(fhash, sizeof(fhash), "%02x", i);
+        _private->arrdfd[i] = posix_create_open_directory_based_fd(this, hdirfd,
+                                                                   fhash);
+        if (_private->arrdfd[i] < 0) {
+            gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_HANDLE_CREATE,
+                   "error openat failed for file %s", fhash);
+            ret = -1;
+            goto out;
+        }
+    }
 
     op_ret = posix_handle_init(this);
     if (op_ret == -1) {
@@ -1029,7 +1093,9 @@ posix_init(xlator_t *this)
     pthread_cond_init(&_private->fsync_cond, NULL);
     pthread_mutex_init(&_private->janitor_mutex, NULL);
     pthread_cond_init(&_private->janitor_cond, NULL);
+    pthread_cond_init(&_private->fd_cond, NULL);
     INIT_LIST_HEAD(&_private->fsyncs);
+    _private->rel_fdcount = 0;
     ret = posix_spawn_ctx_janitor_thread(this);
     if (ret)
         goto out;
@@ -1106,9 +1172,27 @@ posix_init(xlator_t *this)
                    out);
 
     GF_OPTION_INIT("ctime", _private->ctime, bool, out);
+
 out:
     if (ret) {
         if (_private) {
+            if (_private->dirfd >= 0) {
+                sys_close(_private->dirfd);
+                _private->dirfd = -1;
+            }
+
+            for (i = 0; i < 256; i++) {
+                if (_private->arrdfd[i] >= 0) {
+                    sys_close(_private->arrdfd[i]);
+                    _private->arrdfd[i] = -1;
+                }
+            }
+            /*unlock brick dir*/
+            if (_private->mount_lock >= 0) {
+                (void)sys_close(_private->mount_lock);
+                _private->mount_lock = -1;
+            }
+
             GF_FREE(_private->base_path);
 
             GF_FREE(_private->hostname);
@@ -1128,7 +1212,10 @@ posix_fini(xlator_t *this)
 {
     struct posix_private *priv = this->private;
     gf_boolean_t health_check = _gf_false;
+    glusterfs_ctx_t *ctx = this->ctx;
+    uint32_t count;
     int ret = 0;
+    int i = 0;
 
     if (!priv)
         return;
@@ -1138,6 +1225,18 @@ posix_fini(xlator_t *this)
         priv->health_check_active = _gf_false;
     }
     UNLOCK(&priv->lock);
+
+    if (priv->dirfd >= 0) {
+        sys_close(priv->dirfd);
+        priv->dirfd = -1;
+    }
+
+    for (i = 0; i < 256; i++) {
+        if (priv->arrdfd[i] >= 0) {
+            sys_close(priv->arrdfd[i]);
+            priv->arrdfd[i] = -1;
+        }
+    }
 
     if (health_check) {
         (void)gf_thread_cleanup_xint(priv->health_check);
@@ -1161,13 +1260,28 @@ posix_fini(xlator_t *this)
         priv->janitor = NULL;
     }
 
+    pthread_mutex_lock(&ctx->fd_lock);
+    {
+        count = --ctx->pxl_count;
+        if (count == 0) {
+            pthread_cond_signal(&ctx->fd_cond);
+        }
+    }
+    pthread_mutex_unlock(&ctx->fd_lock);
+
+    if (count == 0) {
+        pthread_join(ctx->janitor, NULL);
+    }
+
     if (priv->fsyncer) {
         (void)gf_thread_cleanup_xint(priv->fsyncer);
         priv->fsyncer = 0;
     }
     /*unlock brick dir*/
-    if (priv->mount_lock)
-        (void)sys_closedir(priv->mount_lock);
+    if (priv->mount_lock >= 0) {
+        (void)sys_close(priv->mount_lock);
+        priv->mount_lock = -1;
+    }
 
     GF_FREE(priv->base_path);
     LOCK_DESTROY(&priv->lock);
@@ -1352,24 +1466,21 @@ struct volume_options posix_options[] = {
      .min = 0000,
      .max = 0777,
      .default_value = "0000",
-     .validate = GF_OPT_VALIDATE_MIN,
-     .validate = GF_OPT_VALIDATE_MAX,
+     .validate = GF_OPT_VALIDATE_BOTH,
      .description = "Mode bit permission that will always be set on a file."},
     {.key = {"force-directory-mode"},
      .type = GF_OPTION_TYPE_INT,
      .min = 0000,
      .max = 0777,
      .default_value = "0000",
-     .validate = GF_OPT_VALIDATE_MIN,
-     .validate = GF_OPT_VALIDATE_MAX,
+     .validate = GF_OPT_VALIDATE_BOTH,
      .description = "Mode bit permission that will be always set on directory"},
     {.key = {"create-mask"},
      .type = GF_OPTION_TYPE_INT,
      .min = 0000,
      .max = 0777,
      .default_value = "0777",
-     .validate = GF_OPT_VALIDATE_MIN,
-     .validate = GF_OPT_VALIDATE_MAX,
+     .validate = GF_OPT_VALIDATE_BOTH,
      .description = "Any bit not set here will be removed from the"
                     "modes set on a file when it is created"},
     {.key = {"create-directory-mask"},
@@ -1377,8 +1488,7 @@ struct volume_options posix_options[] = {
      .min = 0000,
      .max = 0777,
      .default_value = "0777",
-     .validate = GF_OPT_VALIDATE_MIN,
-     .validate = GF_OPT_VALIDATE_MAX,
+     .validate = GF_OPT_VALIDATE_BOTH,
      .description = "Any bit not set here will be removed from the"
                     "modes set on a directory when it is created"},
     {.key = {"max-hardlinks"},

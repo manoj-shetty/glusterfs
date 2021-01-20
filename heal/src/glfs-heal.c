@@ -1055,6 +1055,10 @@ glfsh_set_heal_options(glfs_t *fs, gf_xl_afr_op_t heal_op)
     if (ret)
         goto out;
 
+    ret = glfs_set_xlator_option(fs, "*-replicate-*", "halo-enabled", "off");
+    if (ret)
+        goto out;
+
     if ((heal_op != GF_SHD_OP_SBRAIN_HEAL_FROM_BIGGER_FILE) &&
         (heal_op != GF_SHD_OP_SBRAIN_HEAL_FROM_BRICK) &&
         (heal_op != GF_SHD_OP_SBRAIN_HEAL_FROM_LATEST_MTIME))
@@ -1725,14 +1729,19 @@ main(int argc, char **argv)
         goto out;
     }
 
+    char *var_str = (heal_op == GF_SHD_OP_INDEX_SUMMARY ||
+                     heal_op == GF_SHD_OP_HEAL_SUMMARY)
+                        ? "replicate/disperse"
+                        : "replicate";
+
     ret = glfsh_validate_volume(top_subvol, heal_op);
     if (ret < 0) {
         ret = -EINVAL;
-        gf_asprintf(&op_errstr, "Volume %s is not of type %s", volname,
-                    (heal_op == GF_SHD_OP_INDEX_SUMMARY ||
-                     heal_op == GF_SHD_OP_HEAL_SUMMARY)
-                        ? "replicate/disperse"
-                        : "replicate");
+        gf_asprintf(&op_errstr,
+                    "This command is supported "
+                    "for only volumes of %s type. Volume %s "
+                    "is not of type %s",
+                    var_str, volname, var_str);
         goto out;
     }
     rootloc.inode = inode_ref(top_subvol->itable->root);

@@ -37,7 +37,9 @@
 #include "glusterd-locks.h"
 #include "glusterd-svc-mgmt.h"
 #include "glusterd-shd-svc.h"
+#ifdef BUILD_GNFS
 #include "glusterd-nfs-svc.h"
+#endif
 #include "glusterd-bitd-svc.h"
 #include "glusterd-scrub-svc.h"
 #include "glusterd-quotad-svc.h"
@@ -65,7 +67,7 @@ extern struct rpcsvc_program gd_svc_cli_trusted_progs;
 extern struct rpc_clnt_program gd_brick_prog;
 extern struct rpcsvc_program glusterd_mgmt_hndsk_prog;
 
-extern char snap_mount_dir[PATH_MAX];
+extern char snap_mount_dir[VALID_GLUSTERD_PATHMAX];
 
 rpcsvc_cbk_program_t glusterd_cbk_prog = {
     .progname = "Gluster Callback",
@@ -200,8 +202,10 @@ glusterd_options_init(xlator_t *this)
     priv = this->private;
 
     priv->opts = dict_new();
-    if (!priv->opts)
+    if (!priv->opts) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL, NULL);
         goto out;
+    }
 
     ret = glusterd_store_retrieve_options(this);
     if (ret == 0) {
@@ -245,6 +249,7 @@ glusterd_client_statedump_submit_req(char *volname, char *target_ip, char *pid)
     GF_ASSERT(conf);
 
     if (target_ip == NULL || pid == NULL) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_INVALID_ARGUMENT, NULL);
         ret = -1;
         goto out;
     }
@@ -445,14 +450,19 @@ glusterd_rpcsvc_options_build(dict_t *options)
 {
     int ret = 0;
     uint32_t backlog = 0;
+    xlator_t *this = THIS;
+    GF_ASSERT(this);
 
     ret = dict_get_uint32(options, "transport.listen-backlog", &backlog);
 
     if (ret) {
         backlog = GLUSTERFS_SOCKET_LISTEN_BACKLOG;
         ret = dict_set_uint32(options, "transport.listen-backlog", backlog);
-        if (ret)
+        if (ret) {
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_SET_FAILED,
+                    "Key=transport.listen-backlog", NULL);
             goto out;
+        }
     }
 
     gf_msg_debug("glusterd", 0, "listen-backlog value: %d", backlog);
@@ -572,6 +582,7 @@ glusterd_crt_georep_folders(char *georepdir, glusterd_conf_t *conf)
 
     len = snprintf(georepdir, PATH_MAX, "%s/" GEOREP, conf->workdir);
     if ((len < 0) || (len >= PATH_MAX)) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         ret = -1;
         goto out;
     }
@@ -583,9 +594,11 @@ glusterd_crt_georep_folders(char *georepdir, glusterd_conf_t *conf)
     }
 
     ret = dict_get_str(THIS->options, GEOREP "-log-group", &greplg_s);
-    if (ret)
+    if (ret) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_DICT_GET_FAILED,
+                "Key=log-group", NULL);
         ret = 0;
-    else {
+    } else {
         gr = getgrnam(greplg_s);
         if (!gr) {
             gf_msg("glusterd", GF_LOG_CRITICAL, 0, GD_MSG_LOGGROUP_INVALID,
@@ -626,6 +639,7 @@ glusterd_crt_georep_folders(char *georepdir, glusterd_conf_t *conf)
     }
     len = snprintf(logdir, PATH_MAX, "%s/" GEOREP "-slaves", conf->logdir);
     if ((len < 0) || (len >= PATH_MAX)) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         ret = -1;
         goto out;
     }
@@ -652,6 +666,7 @@ glusterd_crt_georep_folders(char *georepdir, glusterd_conf_t *conf)
 
     len = snprintf(logdir, PATH_MAX, "%s/" GEOREP "-slaves/mbr", conf->logdir);
     if ((len < 0) || (len >= PATH_MAX)) {
+        gf_smsg("glusterd", GF_LOG_ERROR, errno, GD_MSG_COPY_FAIL, NULL);
         ret = -1;
         goto out;
     }
@@ -1043,6 +1058,8 @@ _install_mount_spec(dict_t *opts, char *key, data_t *value, void *data)
     int rv = 0;
     gf_mount_spec_t *mspec = NULL;
     char *user = NULL;
+    xlator_t *this = THIS;
+    GF_ASSERT(this);
 
     label = strtail(key, "mountbroker.");
 
@@ -1057,8 +1074,10 @@ _install_mount_spec(dict_t *opts, char *key, data_t *value, void *data)
         return 0;
 
     mspec = GF_CALLOC(1, sizeof(*mspec), gf_gld_mt_mount_spec);
-    if (!mspec)
+    if (!mspec) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_NO_MEMORY, NULL);
         goto err;
+    }
     mspec->label = label;
 
     if (georep) {
@@ -1114,8 +1133,10 @@ glusterd_init_uds_listener(xlator_t *this)
     GF_ASSERT(this);
 
     options = dict_new();
-    if (!options)
+    if (!options) {
+        gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_DICT_CREATE_FAIL, NULL);
         goto out;
+    }
 
     sock_data = dict_get(this->options, "glusterd-sockfile");
     (void)snprintf(sockfile, sizeof(sockfile), "%s",
@@ -1402,7 +1423,7 @@ init(xlator_t *this)
     char *mountbroker_root = NULL;
     int i = 0;
     int total_transport = 0;
-    gf_boolean_t valgrind = _gf_false;
+    gf_valgrind_tool vgtool;
     char *valgrind_str = NULL;
     char *transport_type = NULL;
     char var_run_dir[PATH_MAX] = {
@@ -1415,6 +1436,14 @@ init(xlator_t *this)
     int32_t len = 0;
     int op_version = 0;
 
+#if defined(RUN_WITH_MEMCHECK)
+    vgtool = _gf_memcheck;
+#elif defined(RUN_WITH_DRD)
+    vgtool = _gf_drd;
+#else
+    vgtool = _gf_none;
+#endif
+
 #ifndef GF_DARWIN_HOST_OS
     {
         struct rlimit lim;
@@ -1422,9 +1451,8 @@ init(xlator_t *this)
         lim.rlim_max = 65536;
 
         if (setrlimit(RLIMIT_NOFILE, &lim) == -1) {
-            gf_msg(this->name, GF_LOG_ERROR, errno, GD_MSG_SETXATTR_FAIL,
-                   "Failed to set 'ulimit -n "
-                   " 65536'");
+            gf_smsg(this->name, GF_LOG_ERROR, errno, GD_MSG_SET_XATTR_FAIL,
+                    "Failed to set 'ulimit -n 65536'", NULL);
         } else {
             gf_msg(this->name, GF_LOG_INFO, 0, GD_MSG_FILE_DESC_LIMIT_SET,
                    "Maximum allowed open file descriptors "
@@ -1562,6 +1590,7 @@ init(xlator_t *this)
         exit(1);
     }
 
+#ifdef BUILD_GNFS
     ret = glusterd_init_var_run_dirs(this, rundir, GLUSTERD_NFS_RUN_DIR);
     if (ret) {
         gf_msg(this->name, GF_LOG_CRITICAL, 0, GD_MSG_CREATE_DIR_FAILED,
@@ -1569,6 +1598,7 @@ init(xlator_t *this)
                "nfs running directory");
         exit(1);
     }
+#endif
 
     ret = glusterd_init_var_run_dirs(this, rundir, GLUSTERD_QUOTAD_RUN_DIR);
     if (ret) {
@@ -1662,6 +1692,7 @@ init(xlator_t *this)
         exit(1);
     }
 
+#ifdef BUILD_GNFS
     len = snprintf(storedir, sizeof(storedir), "%s/nfs", workdir);
     if ((len < 0) || (len >= sizeof(storedir))) {
         exit(1);
@@ -1674,7 +1705,7 @@ init(xlator_t *this)
                storedir, errno);
         exit(1);
     }
-
+#endif
     len = snprintf(storedir, sizeof(storedir), "%s/bitd", workdir);
     if ((len < 0) || (len >= sizeof(storedir))) {
         exit(1);
@@ -1867,6 +1898,9 @@ init(xlator_t *this)
     (void)strncpy(conf->logdir, logdir, sizeof(conf->logdir));
 
     synclock_init(&conf->big_lock, SYNC_LOCK_RECURSIVE);
+    synccond_init(&conf->cond_restart_bricks);
+    synccond_init(&conf->cond_restart_shd);
+    synccond_init(&conf->cond_blockers);
     pthread_mutex_init(&conf->xprt_lock, NULL);
     INIT_LIST_HEAD(&conf->xprt_list);
     pthread_mutex_init(&conf->import_volumes, NULL);
@@ -1899,18 +1933,24 @@ init(xlator_t *this)
     }
 
     /* Set option to run bricks on valgrind if enabled in glusterd.vol */
-    this->ctx->cmd_args.valgrind = valgrind;
+    this->ctx->cmd_args.vgtool = vgtool;
     ret = dict_get_str(this->options, "run-with-valgrind", &valgrind_str);
     if (ret < 0) {
         gf_msg_debug(this->name, 0, "cannot get run-with-valgrind value");
     }
     if (valgrind_str) {
-        if (gf_string2boolean(valgrind_str, &valgrind)) {
+        gf_boolean_t vg = _gf_false;
+
+        if (!strcmp(valgrind_str, "memcheck"))
+            this->ctx->cmd_args.vgtool = _gf_memcheck;
+        else if (!strcmp(valgrind_str, "drd"))
+            this->ctx->cmd_args.vgtool = _gf_drd;
+        else if (!gf_string2boolean(valgrind_str, &vg))
+            this->ctx->cmd_args.vgtool = (vg ? _gf_memcheck : _gf_none);
+        else
             gf_msg(this->name, GF_LOG_WARNING, EINVAL, GD_MSG_INVALID_ENTRY,
-                   "run-with-valgrind value not a boolean string");
-        } else {
-            this->ctx->cmd_args.valgrind = valgrind;
-        }
+                   "run-with-valgrind is neither boolean"
+                   " nor one of 'memcheck' or 'drd'");
     }
 
     /* Store ping-timeout in conf */
@@ -1921,7 +1961,9 @@ init(xlator_t *this)
     glusterd_mgmt_v3_lock_timer_init();
     glusterd_txn_opinfo_dict_init();
 
+#ifdef BUILD_GNFS
     glusterd_nfssvc_build(&conf->nfs_svc);
+#endif
     glusterd_quotadsvc_build(&conf->quotad_svc);
     glusterd_bitdsvc_build(&conf->bitd_svc);
     glusterd_scrubsvc_build(&conf->scrub_svc);

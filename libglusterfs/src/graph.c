@@ -41,7 +41,7 @@ _gf_dump_details (int argc, char **argv)
 {
         extern FILE *gf_log_logfile;
         int          i = 0;
-        char         timestr[64];
+        char         timestr[GF_TIMESTR_SIZE];
         time_t       utime = 0;
         pid_t        mypid = 0;
         struct utsname uname_buf = {{0, }, };
@@ -469,7 +469,7 @@ _xlator_check_unknown_options(xlator_t *xl, void *data)
     dict_foreach(xl->options, _log_if_unknown_option, xl);
 }
 
-int
+static int
 glusterfs_graph_unknown_options(glusterfs_graph_t *graph)
 {
     xlator_foreach(graph->first, _xlator_check_unknown_options, NULL);
@@ -482,7 +482,7 @@ fill_uuid(char *uuid, int size, struct timeval tv)
     char hostname[50] = {
         0,
     };
-    char now_str[64];
+    char now_str[GF_TIMESTR_SIZE];
 
     if (gethostname(hostname, sizeof(hostname) - 1) != 0) {
         gf_msg("graph", GF_LOG_ERROR, errno, LG_MSG_GETHOSTNAME_FAILED,
@@ -490,9 +490,8 @@ fill_uuid(char *uuid, int size, struct timeval tv)
         hostname[sizeof(hostname) - 1] = '\0';
     }
 
-    gf_time_fmt(now_str, sizeof now_str, tv.tv_sec, gf_timefmt_dirent);
-    snprintf(uuid, size, "%s-%d-%s:%" GF_PRI_SUSECONDS, hostname, getpid(),
-             now_str, tv.tv_usec);
+    gf_time_fmt_tv(now_str, sizeof now_str, &tv, gf_timefmt_dirent);
+    snprintf(uuid, size, "%s-%d-%s", hostname, getpid(), now_str);
 
     return;
 }
@@ -1378,7 +1377,7 @@ glusterfs_graph_cleanup(void *arg)
     ret = pthread_mutex_lock(&graph->mutex);
     if (ret != 0) {
         gf_msg("glusterfs", GF_LOG_ERROR, EAGAIN, LG_MSG_GRAPH_CLEANUP_FAILED,
-               "Failed to aquire a lock");
+               "Failed to acquire a lock");
         goto out;
     }
     /* check and wait for CHILD_DOWN for top xlator*/

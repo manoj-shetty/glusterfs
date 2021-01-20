@@ -67,7 +67,7 @@ except ImportError:
 SCRIPT_NAME = "snap_scheduler"
 scheduler_enabled = False
 log = logging.getLogger(SCRIPT_NAME)
-SHARED_STORAGE_DIR="/var/run/gluster/shared_storage"
+SHARED_STORAGE_DIR="/run/gluster/shared_storage"
 GCRON_DISABLED = SHARED_STORAGE_DIR+"/snaps/gcron_disabled"
 GCRON_ENABLED = SHARED_STORAGE_DIR+"/snaps/gcron_enabled"
 GCRON_TASKS = SHARED_STORAGE_DIR+"/snaps/glusterfs_snap_cron_tasks"
@@ -149,7 +149,7 @@ def initLogger():
     sh.setFormatter(formatter)
 
     process = subprocess.Popen(["gluster", "--print-logdir"],
-                               stdout=subprocess.PIPE)
+                               stdout=subprocess.PIPE, universal_newlines=True)
     logfile = os.path.join(process.stdout.read()[:-1], SCRIPT_NAME + ".log")
 
     fh = logging.FileHandler(logfile)

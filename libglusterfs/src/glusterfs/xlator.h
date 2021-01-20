@@ -32,6 +32,8 @@
 #define GF_SET_ATTR_ATIME 0x10
 #define GF_SET_ATTR_MTIME 0x20
 #define GF_SET_ATTR_CTIME 0x40
+#define GF_ATTR_ATIME_NOW 0x80
+#define GF_ATTR_MTIME_NOW 0x100
 
 #define gf_attr_mode_set(mode) ((mode)&GF_SET_ATTR_MODE)
 #define gf_attr_uid_set(mode) ((mode)&GF_SET_ATTR_UID)
@@ -700,6 +702,8 @@ typedef size_t (*cbk_inodectx_size_t)(xlator_t *this, inode_t *inode);
 
 typedef size_t (*cbk_fdctx_size_t)(xlator_t *this, fd_t *fd);
 
+typedef void (*cbk_fdclose_t)(xlator_t *this, fd_t *fd);
+
 struct xlator_cbks {
     cbk_forget_t forget;
     cbk_release_t release;
@@ -710,6 +714,8 @@ struct xlator_cbks {
     cbk_ictxmerge_t ictxmerge;
     cbk_inodectx_size_t ictxsize;
     cbk_fdctx_size_t fdctxsize;
+    cbk_fdclose_t fdclose;
+    cbk_fdclose_t fdclosedir;
 };
 
 typedef int32_t (*dumpop_priv_t)(xlator_t *this);
@@ -799,7 +805,7 @@ struct _xlator {
 
         struct {
             /* for latency measurement */
-            fop_latency_t latencies[GF_FOP_MAXVALUE];
+            gf_latency_t latencies[GF_FOP_MAXVALUE];
             /* for latency measurement */
             fop_metrics_t metrics[GF_FOP_MAXVALUE];
 

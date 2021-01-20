@@ -21,8 +21,8 @@ import subprocess
 import socket
 from subprocess import PIPE
 from threading import Lock, Thread as baseThread
-from errno import EACCES, EAGAIN, EPIPE, ENOTCONN, ECONNABORTED
-from errno import EINTR, ENOENT, ESTALE, EBUSY, errorcode
+from errno import (EACCES, EAGAIN, EPIPE, ENOTCONN, ENOMEM, ECONNABORTED,
+                   EINTR, ENOENT, ESTALE, EBUSY, ENODATA, errorcode, EIO)
 from signal import signal, SIGTERM
 import select as oselect
 from os import waitpid as owaitpid
@@ -54,6 +54,8 @@ import gsyncdconfig as gconf
 from rconf import rconf
 
 from hashlib import sha256 as sha256
+
+ENOTSUP = getattr(errno, 'ENOTSUP', 'EOPNOTSUPP')
 
 # auxiliary gfid based access prefix
 _CL_AUX_GFID_PFX = ".gfid/"
@@ -98,6 +100,19 @@ def unescape_space_newline(s):
             .replace(NEWLINE_ESCAPE_CHAR, "\n")\
             .replace(PERCENTAGE_ESCAPE_CHAR, "%")
 
+# gf_mount_ready() returns 1 if all subvols are up, else 0
+def gf_mount_ready():
+    ret = errno_wrap(Xattr.lgetxattr,
+                     ['.', 'dht.subvol.status', 16],
+                     [ENOENT, ENOTSUP, ENODATA], [ENOMEM])
+
+    if isinstance(ret, int):
+       logging.error("failed to get the xattr value")
+       return 1
+    ret = ret.rstrip('\x00')
+    if ret == "1":
+       return 1
+    return 0
 
 def norm(s):
     if s:
@@ -329,6 +344,17 @@ def log_raise_exception(excont):
                                                         ECONNABORTED):
             logging.error(lf('Gluster Mount process exited',
                              error=errorcode[exc.errno]))
+        elif isinstance(exc, OSError) and exc.errno == EIO:
+            logging.error("Getting \"Input/Output error\" "
+                          "is most likely due to "
+                          "a. Brick is down or "
+                          "b. Split brain issue.")
+            logging.error("This is expected as per design to "
+                          "keep the consistency of the file system. "
+                          "Once the above issue is resolved "
+                          "geo-replication would automatically "
+                          "proceed further.")
+            logtag = "FAIL"
         else:
             logtag = "FAIL"
         if not logtag and logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -562,7 +588,6 @@ def errno_wrap(call, arg=[], errnos=[], retry_errnos=[]):
 def lstat(e):
     return errno_wrap(os.lstat, [e], [ENOENT], [ESTALE, EBUSY])
 
-
 def get_gfid_from_mnt(gfidpath):
     return errno_wrap(Xattr.lgetxattr,
                       [gfidpath, 'glusterfs.gfid.string',
@@ -700,11 +725,13 @@ def get_slv_dir_path(slv_host, slv_volume, gfid):
                 if not isinstance(realpath, int):
                     basename = os.path.basename(realpath).rstrip('\x00')
                     dirpath = os.path.dirname(realpath)
-                    if dirpath is "/":
+                    if dirpath == "/":
                         pargfid = ROOT_GFID
                     else:
                         dirpath = dirpath.strip("/")
                         pargfid = get_gfid_from_mnt(dirpath)
+                        if isinstance(pargfid, int):
+                            return None
                     dir_entry = os.path.join(pfx, pargfid, basename)
                     return dir_entry
 
@@ -867,6 +894,19 @@ class Popen(subprocess.Popen):
             self.errfail()
 
 
+def host_brick_split(value):
+    """
+    IPv6 compatible way to split and get the host
+    and brick information. Example inputs:
+    node1.example.com:/exports/bricks/brick1/brick
+    fe80::af0f:df82:844f:ef66%utun0:/exports/bricks/brick1/brick
+    """
+    parts = value.split(":")
+    brick = parts[-1]
+    hostparts = parts[0:-1]
+    return (":".join(hostparts), brick)
+
+
 class Volinfo(object):
 
     def __init__(self, vol, host='localhost', prelude=[], master=True):
@@ -909,7 +949,7 @@ class Volinfo(object):
     @memoize
     def bricks(self):
         def bparse(b):
-            host, dirp = b.find("name").text.split(':', 2)
+            host, dirp = host_brick_split(b.find("name").text)
             return {'host': host, 'dir': dirp, 'uuid': b.find("hostUuid").text}
         return [bparse(b) for b in self.get('brick')]
 
@@ -985,6 +1025,16 @@ class VolinfoFromGconf(object):
     def is_hot(self, brickpath):
         return False
 
+    def is_uuid(self, value):
+        try:
+            uuid.UUID(value)
+            return True
+        except ValueError:
+            return False
+
+    def possible_path(self, value):
+        return "/" in value
+
     @property
     @memoize
     def bricks(self):
@@ -998,8 +1048,22 @@ class VolinfoFromGconf(object):
         out = []
         for b in bricks_data:
             parts = b.split(":")
-            bpath = parts[2] if len(parts) == 3 else ""
-            out.append({"host": parts[1], "dir": bpath, "uuid": parts[0]})
+            b_uuid = None
+            if self.is_uuid(parts[0]):
+                b_uuid = parts[0]
+                # Set all parts except first
+                parts = parts[1:]
+
+            if self.possible_path(parts[-1]):
+                bpath = parts[-1]
+                # Set all parts except last
+                parts = parts[0:-1]
+
+            out.append({
+                "host": ":".join(parts),   # if remaining parts are IPv6 name
+                "dir": bpath,
+                "uuid": b_uuid
+            })
 
         return out
 

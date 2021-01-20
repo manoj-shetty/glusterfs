@@ -209,6 +209,9 @@ typedef struct {
     gf_boolean_t restart_done;
     dict_t *opts;
     synclock_t big_lock;
+    synccond_t cond_restart_bricks;
+    synccond_t cond_restart_shd;
+    synccond_t cond_blockers;
     rpcsvc_t *uds_rpc; /* RPCSVC for the unix domain socket */
     uint32_t base_port;
     uint32_t max_port;
@@ -510,6 +513,10 @@ struct glusterd_volinfo_ {
      * volfile generation code, we are
      * temporarily appending either "-hot"
      * or "-cold" */
+    gf_atomic_t volpeerupdate;
+    /* Flag to check about volume has received updates
+       from peer
+    */
 };
 
 typedef enum gd_snap_status_ {
@@ -1190,6 +1197,8 @@ glusterd_op_set_ganesha(dict_t *dict, char **errstr);
 int
 ganesha_manage_export(dict_t *dict, char *value,
                       gf_boolean_t update_cache_invalidation, char **op_errstr);
+int
+gd_ganesha_send_dbus(char *volname, char *value);
 gf_boolean_t
 glusterd_is_ganesha_cluster();
 gf_boolean_t
@@ -1209,6 +1218,9 @@ int
 glusterd_op_stage_add_brick(dict_t *dict, char **op_errstr, dict_t *rsp_dict);
 int
 glusterd_op_stage_remove_brick(dict_t *dict, char **op_errstr);
+
+int
+glusterd_set_rebalance_id_for_remove_brick(dict_t *req_dict, dict_t *rsp_dict);
 
 int
 glusterd_set_rebalance_id_in_rsp_dict(dict_t *req_dict, dict_t *rsp_dict);
@@ -1353,5 +1365,11 @@ glusterd_options_init(xlator_t *this);
 
 int32_t
 glusterd_recreate_volfiles(glusterd_conf_t *conf);
+
+void
+glusterd_add_peers_to_auth_list(char *volname);
+
+int
+glusterd_replace_old_auth_allow_list(char *volname);
 
 #endif

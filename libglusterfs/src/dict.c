@@ -97,6 +97,8 @@ get_new_dict_full(int size_hint)
         }
     }
 
+    dict->free_pair.key = NULL;
+    dict->totkvlen = 0;
     LOCK_INIT(&dict->lock);
 
     return dict;
@@ -335,7 +337,7 @@ err_out:
  * checked by callers.
  */
 static data_pair_t *
-dict_lookup_common(dict_t *this, char *key, uint32_t hash)
+dict_lookup_common(const dict_t *this, const char *key, const uint32_t hash)
 {
     int hashval = 0;
     data_pair_t *pair;
@@ -409,6 +411,7 @@ dict_set_lk(dict_t *this, char *key, const int key_len, data_t *value,
         if (pair) {
             data_t *unref_data = pair->value;
             pair->value = data_ref(value);
+            this->totkvlen += (value->len - unref_data->len);
             data_unref(unref_data);
             if (key_free)
                 GF_FREE(key);
@@ -417,16 +420,15 @@ dict_set_lk(dict_t *this, char *key, const int key_len, data_t *value,
         }
     }
 
-    if (this->free_pair_in_use) {
+    if (this->free_pair.key) { /* the free_pair is used */
         pair = mem_get(THIS->ctx->dict_pair_pool);
         if (!pair) {
             if (key_free)
                 GF_FREE(key);
             return -1;
         }
-    } else {
+    } else { /* assign the pair to the free pair */
         pair = &this->free_pair;
-        this->free_pair_in_use = _gf_true;
     }
 
     if (key_free) {
@@ -436,9 +438,7 @@ dict_set_lk(dict_t *this, char *key, const int key_len, data_t *value,
     } else {
         pair->key = (char *)GF_MALLOC(keylen + 1, gf_common_mt_char);
         if (!pair->key) {
-            if (pair == &this->free_pair) {
-                this->free_pair_in_use = _gf_false;
-            } else {
+            if (pair != &this->free_pair) {
                 mem_put(pair);
             }
             return -1;
@@ -447,6 +447,7 @@ dict_set_lk(dict_t *this, char *key, const int key_len, data_t *value,
     }
     pair->key_hash = key_hash;
     pair->value = data_ref(value);
+    this->totkvlen += (keylen + 1 + value->len);
 
     /* If the divisor is 1, the modulo is always 0,
      * in such case avoid hash calculation.
@@ -644,6 +645,7 @@ dict_deln(dict_t *this, char *key, const int keylen)
             else
                 this->members[hashval] = pair->hash_next;
 
+            this->totkvlen -= pair->value->len;
             data_unref(pair->value);
 
             if (pair->prev)
@@ -654,9 +656,10 @@ dict_deln(dict_t *this, char *key, const int keylen)
             if (pair->next)
                 pair->next->prev = pair->prev;
 
+            this->totkvlen -= (strlen(pair->key) + 1);
             GF_FREE(pair->key);
             if (pair == &this->free_pair) {
-                this->free_pair_in_use = _gf_false;
+                this->free_pair.key = NULL;
             } else {
                 mem_put(pair);
             }
@@ -696,16 +699,18 @@ dict_destroy(dict_t *this)
         GF_FREE(prev->key);
         if (prev != &this->free_pair) {
             mem_put(prev);
+        } else {
+            this->free_pair.key = NULL;
         }
         total_pairs++;
         prev = pair;
     }
 
+    this->totkvlen = 0;
     if (this->members != &this->members_internal) {
         mem_put(this->members);
     }
 
-    GF_FREE(this->extra_free);
     free(this->extra_stdfree);
 
     /* update 'ctx->stats.dict.details' using max_count */
@@ -1106,59 +1111,73 @@ data_to_int64(data_t *data)
 {
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, "null", -1);
 
-    return (int64_t)strtoull(data->data, NULL, 0);
+    char *endptr = NULL;
+    int64_t value = 0;
+
+    errno = 0;
+    value = strtoll(data->data, &endptr, 0);
+
+    if (endptr && *endptr != '\0')
+        /* Unrecognized characters at the end of string. */
+        errno = EINVAL;
+    if (errno) {
+        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
+                         LG_MSG_DATA_CONVERSION_ERROR,
+                         "Error in data conversion: '%s' can't "
+                         "be represented as int64_t",
+                         data->data);
+        return -1;
+    }
+    return value;
 }
+
+/* Like above but implies signed range check. */
+
+#define DATA_TO_RANGED_SIGNED(endptr, value, data, type, min, max)             \
+    do {                                                                       \
+        errno = 0;                                                             \
+        value = strtoll(data->data, &endptr, 0);                               \
+        if (endptr && *endptr != '\0')                                         \
+            errno = EINVAL;                                                    \
+        if (errno || value > max || value < min) {                             \
+            gf_msg_callingfn("dict", GF_LOG_WARNING, errno,                    \
+                             LG_MSG_DATA_CONVERSION_ERROR,                     \
+                             "Error in data conversion: '%s' can't "           \
+                             "be represented as " #type,                       \
+                             data->data);                                      \
+            return -1;                                                         \
+        }                                                                      \
+        return (type)value;                                                    \
+    } while (0)
 
 int32_t
 data_to_int32(data_t *data)
 {
-    VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, "null", -1);
+    char *endptr = NULL;
+    int64_t value = 0;
 
-    return strtoul(data->data, NULL, 0);
+    VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, "null", -1);
+    DATA_TO_RANGED_SIGNED(endptr, value, data, int32_t, INT_MIN, INT_MAX);
 }
 
 int16_t
 data_to_int16(data_t *data)
 {
+    char *endptr = NULL;
+    int64_t value = 0;
+
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, "null", -1);
-
-    int16_t value = 0;
-
-    errno = 0;
-    value = strtol(data->data, NULL, 0);
-
-    if ((value > SHRT_MAX) || (value < SHRT_MIN)) {
-        errno = ERANGE;
-        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
-                         LG_MSG_DATA_CONVERSION_ERROR,
-                         "Error in data"
-                         " conversion: detected overflow");
-        return -1;
-    }
-
-    return (int16_t)value;
+    DATA_TO_RANGED_SIGNED(endptr, value, data, int16_t, SHRT_MIN, SHRT_MAX);
 }
 
 int8_t
 data_to_int8(data_t *data)
 {
+    char *endptr = NULL;
+    int64_t value = 0;
+
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_INT, "null", -1);
-
-    int8_t value = 0;
-
-    errno = 0;
-    value = strtol(data->data, NULL, 0);
-
-    if ((value > SCHAR_MAX) || (value < SCHAR_MIN)) {
-        errno = ERANGE;
-        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
-                         LG_MSG_DATA_CONVERSION_ERROR,
-                         "Error in data"
-                         " conversion: detected overflow");
-        return -1;
-    }
-
-    return (int8_t)value;
+    DATA_TO_RANGED_SIGNED(endptr, value, data, int8_t, CHAR_MIN, CHAR_MAX);
 }
 
 uint64_t
@@ -1166,57 +1185,72 @@ data_to_uint64(data_t *data)
 {
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_UINT, "null", -1);
 
-    return strtoll(data->data, NULL, 0);
+    char *endptr = NULL;
+    uint64_t value = 0;
+
+    errno = 0;
+    value = strtoull(data->data, &endptr, 0);
+
+    if (endptr && *endptr != '\0')
+        errno = EINVAL;
+    if (errno) {
+        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
+                         LG_MSG_DATA_CONVERSION_ERROR,
+                         "Error in data conversion: '%s' can't "
+                         "be represented as uint64_t",
+                         data->data);
+        return -1;
+    }
+    return value;
 }
+
+/* Like above but implies unsigned range check. */
+
+#define DATA_TO_RANGED_UNSIGNED(endptr, value, data, type, max)                \
+    do {                                                                       \
+        errno = 0;                                                             \
+        value = strtoull(data->data, &endptr, 0);                              \
+        if (endptr && *endptr != '\0')                                         \
+            errno = EINVAL;                                                    \
+        if (errno || value > max) {                                            \
+            gf_msg_callingfn("dict", GF_LOG_WARNING, errno,                    \
+                             LG_MSG_DATA_CONVERSION_ERROR,                     \
+                             "Error in data conversion: '%s' can't "           \
+                             "be represented as " #type,                       \
+                             data->data);                                      \
+            return -1;                                                         \
+        }                                                                      \
+        return (type)value;                                                    \
+    } while (0)
 
 uint32_t
 data_to_uint32(data_t *data)
 {
-    VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_UINT, "null", -1);
+    char *endptr = NULL;
+    uint64_t value = 0;
 
-    return strtol(data->data, NULL, 0);
+    VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_UINT, "null", -1);
+    DATA_TO_RANGED_UNSIGNED(endptr, value, data, uint32_t, UINT_MAX);
 }
 
 uint16_t
 data_to_uint16(data_t *data)
 {
+    char *endptr = NULL;
+    uint64_t value = 0;
+
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_UINT, "null", -1);
-
-    uint16_t value = 0;
-
-    errno = 0;
-    value = strtol(data->data, NULL, 0);
-
-    if ((USHRT_MAX - value) < 0) {
-        errno = ERANGE;
-        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
-                         LG_MSG_DATA_CONVERSION_ERROR,
-                         "Error in data conversion: "
-                         "overflow detected");
-        return -1;
-    }
-
-    return (uint16_t)value;
+    DATA_TO_RANGED_UNSIGNED(endptr, value, data, uint16_t, USHRT_MAX);
 }
 
 uint8_t
 data_to_uint8(data_t *data)
 {
+    char *endptr = NULL;
+    uint64_t value = 0;
+
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_UINT, "null", -1);
-
-    errno = 0;
-    uint32_t value = strtol(data->data, NULL, 0);
-
-    if ((UCHAR_MAX - (uint8_t)value) < 0) {
-        errno = ERANGE;
-        gf_msg_callingfn("dict", GF_LOG_WARNING, errno,
-                         LG_MSG_DATA_CONVERSION_ERROR,
-                         "data "
-                         "conversion overflow detected");
-        return -1;
-    }
-
-    return (uint8_t)value;
+    DATA_TO_RANGED_UNSIGNED(endptr, value, data, uint8_t, UCHAR_MAX);
 }
 
 char *
@@ -1250,8 +1284,8 @@ data_to_iatt(data_t *data, char *key)
      * pass more data but are backward compatible (if the initial contents
      * of the struct are maintained, of course). */
     if (data->len < sizeof(struct iatt)) {
-        gf_msg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
-               "data value for '%s' is smaller than expected", key);
+        gf_smsg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
+                "key=%s", key, NULL);
         return NULL;
     }
 
@@ -1268,8 +1302,8 @@ int
 dict_remove_foreach_fn(dict_t *d, char *k, data_t *v, void *_tmp)
 {
     if (!d || !k) {
-        gf_msg("glusterfs", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ENTRY,
-               "%s is NULL", d ? "key" : "dictionary");
+        gf_smsg("glusterfs", GF_LOG_WARNING, EINVAL, LG_MSG_KEY_OR_VALUE_NULL,
+                "d=%s", d ? "key" : "dictionary", NULL);
         return -1;
     }
 
@@ -1461,31 +1495,12 @@ fail:
  *               -val error, val = errno
  */
 
-int
-dict_get_with_ref(dict_t *this, char *key, data_t **data)
-{
-    if (!this || !key || !data) {
-        gf_msg_callingfn("dict", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
-                         "dict OR key (%s) is NULL", key);
-        return -EINVAL;
-    }
-
-    return dict_get_with_refn(this, key, strlen(key), data);
-}
-
-int
+static int
 dict_get_with_refn(dict_t *this, char *key, const int keylen, data_t **data)
 {
     data_pair_t *pair = NULL;
     int ret = -ENOENT;
     uint32_t hash;
-
-    if (!this || !key || !data) {
-        gf_msg_callingfn("dict", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
-                         "dict OR key (%s) is NULL", key);
-        ret = -EINVAL;
-        goto err;
-    }
 
     hash = (uint32_t)XXH64(key, keylen, 0);
 
@@ -1499,8 +1514,20 @@ dict_get_with_refn(dict_t *this, char *key, const int keylen, data_t **data)
         }
     }
     UNLOCK(&this->lock);
-err:
+
     return ret;
+}
+
+int
+dict_get_with_ref(dict_t *this, char *key, data_t **data)
+{
+    if (!this || !key || !data) {
+        gf_msg_callingfn("dict", GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
+                         "dict OR key (%s) is NULL", key);
+        return -EINVAL;
+    }
+
+    return dict_get_with_refn(this, key, strlen(key), data);
 }
 
 static int
@@ -1676,7 +1703,7 @@ dict_get_int8(dict_t *this, char *key, int8_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1722,7 +1749,7 @@ dict_get_int16(dict_t *this, char *key, int16_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1794,7 +1821,7 @@ dict_get_int32(dict_t *this, char *key, int32_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1859,7 +1886,7 @@ dict_get_int64(dict_t *this, char *key, int64_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1904,7 +1931,7 @@ dict_get_uint16(dict_t *this, char *key, uint16_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1949,7 +1976,7 @@ dict_get_uint32(dict_t *this, char *key, uint32_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -1994,7 +2021,7 @@ dict_get_uint64(dict_t *this, char *key, uint64_t *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -2104,8 +2131,8 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
         } else {
             ptr = GF_CALLOC(1, DICT_MAX_FLAGS / 8, gf_common_mt_char);
             if (!ptr) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate flag bit array");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                        "flag bit array", NULL);
                 ret = -ENOMEM;
                 goto err;
             }
@@ -2113,8 +2140,8 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
             data = data_from_dynptr(ptr, DICT_MAX_FLAGS / 8);
 
             if (!data) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate data");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY, "data",
+                        NULL);
                 GF_FREE(ptr);
                 ret = -ENOMEM;
                 goto err;
@@ -2125,30 +2152,29 @@ _dict_modify_flag(dict_t *this, char *key, int flag, int op)
             else
                 BIT_CLEAR((unsigned char *)(data->data), flag);
 
-            if (this->free_pair_in_use) {
+            if (this->free_pair.key) { /* the free pair is in use */
                 pair = mem_get0(THIS->ctx->dict_pair_pool);
                 if (!pair) {
-                    gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                           "unable to allocate dict pair");
+                    gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                            "dict pair", NULL);
                     ret = -ENOMEM;
                     goto err;
                 }
-            } else {
+            } else { /* use the free pair */
                 pair = &this->free_pair;
-                this->free_pair_in_use = _gf_true;
             }
 
             pair->key = (char *)GF_MALLOC(strlen(key) + 1, gf_common_mt_char);
             if (!pair->key) {
-                gf_msg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
-                       "unable to allocate dict pair");
+                gf_smsg("dict", GF_LOG_ERROR, ENOMEM, LG_MSG_NO_MEMORY,
+                        "dict pair", NULL);
                 ret = -ENOMEM;
                 goto err;
             }
             strcpy(pair->key, key);
             pair->key_hash = hash;
             pair->value = data_ref(data);
-
+            this->totkvlen += (strlen(key) + 1 + data->len);
             hashval = hash % this->hash_size;
             pair->hash_next = this->members[hashval];
             this->members[hashval] = pair;
@@ -2173,12 +2199,11 @@ err:
         UNLOCK(&this->lock);
 
     if (pair) {
-        if (pair->key)
-            free(pair->key);
-
-        if (pair == &this->free_pair) {
-            this->free_pair_in_use = _gf_false;
-        } else {
+        if (pair->key) {
+            GF_FREE(pair->key);
+            pair->key = NULL;
+        }
+        if (pair != &this->free_pair) {
             mem_put(pair);
         }
     }
@@ -2186,8 +2211,8 @@ err:
     if (data)
         data_destroy(data);
 
-    gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_DICT_SET_FAILED,
-           "unable to set key (%s) in dict ", key);
+    gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_DICT_SET_FAILED, "key=%s", key,
+            NULL);
 
     return ret;
 }
@@ -2219,7 +2244,7 @@ dict_get_double(dict_t *this, char *key, double *val)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !val) {
+    if (!val) {
         ret = -EINVAL;
         goto err;
     }
@@ -2302,7 +2327,7 @@ dict_get_ptr(dict_t *this, char *key, void **ptr)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !ptr) {
+    if (!ptr) {
         ret = -EINVAL;
         goto err;
     }
@@ -2332,7 +2357,7 @@ dict_get_ptr_and_len(dict_t *this, char *key, void **ptr, int *len)
     data_t *data = NULL;
     int ret = 0;
 
-    if (!this || !key || !ptr) {
+    if (!ptr) {
         ret = -EINVAL;
         goto err;
     }
@@ -2390,7 +2415,7 @@ dict_get_str(dict_t *this, char *key, char **str)
     data_t *data = NULL;
     int ret = -EINVAL;
 
-    if (!this || !key || !str) {
+    if (!str) {
         goto err;
     }
     ret = dict_get_with_ref(this, key, &data);
@@ -2564,7 +2589,7 @@ dict_get_bin(dict_t *this, char *key, void **bin)
     data_t *data = NULL;
     int ret = -EINVAL;
 
-    if (!this || !key || !bin) {
+    if (!bin) {
         goto err;
     }
 
@@ -2667,7 +2692,7 @@ dict_get_gfuuid(dict_t *this, char *key, uuid_t *gfid)
     data_t *data = NULL;
     int ret = -EINVAL;
 
-    if (!this || !key || !gfid) {
+    if (!gfid) {
         goto err;
     }
     ret = dict_get_with_ref(this, key, &data);
@@ -2700,7 +2725,7 @@ dict_get_mdata(dict_t *this, char *key, struct mdata_iatt *mdata)
     data_t *data = NULL;
     int ret = -EINVAL;
 
-    if (!this || !key || !mdata) {
+    if (!mdata) {
         goto err;
     }
     ret = dict_get_with_ref(this, key, &data);
@@ -2710,8 +2735,8 @@ dict_get_mdata(dict_t *this, char *key, struct mdata_iatt *mdata)
 
     VALIDATE_DATA_AND_LOG(data, GF_DATA_TYPE_MDATA, key, -EINVAL);
     if (data->len < sizeof(struct mdata_iatt)) {
-        gf_msg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
-               "data value for '%s' is smaller than expected", key);
+        gf_smsg("glusterfs", GF_LOG_ERROR, ENOBUFS, LG_MSG_UNDERSIZED_BUF,
+                "key=%s", key, NULL);
         ret = -ENOBUFS;
         goto err;
     }
@@ -2738,7 +2763,7 @@ dict_get_iatt(dict_t *this, char *key, struct iatt *iatt)
     data_t *data = NULL;
     int ret = -EINVAL;
 
-    if (!this || !key || !iatt) {
+    if (!iatt) {
         goto err;
     }
     ret = dict_get_with_ref(this, key, &data);
@@ -2875,53 +2900,15 @@ dict_serialized_length_lk(dict_t *this)
 {
     int ret = -EINVAL;
     int count = this->count;
-    int len = DICT_HDR_LEN;
-    data_pair_t *pair = this->members_list;
+    const int keyhdrlen = DICT_DATA_HDR_KEY_LEN + DICT_DATA_HDR_VAL_LEN;
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) < 0!", count);
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
-    while (count) {
-        if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL,
-                   LG_MSG_COUNT_LESS_THAN_DATA_PAIRS,
-                   "less than count data pairs found!");
-            goto out;
-        }
-
-        len += DICT_DATA_HDR_KEY_LEN + DICT_DATA_HDR_VAL_LEN;
-
-        if (!pair->key) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR,
-                   "pair->key is null!");
-            goto out;
-        }
-
-        len += strlen(pair->key) + 1 /* for '\0' */;
-
-        if (!pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_NULL_PTR,
-                   "pair->value is null!");
-            goto out;
-        }
-
-        if (pair->value->len < 0) {
-            gf_msg("dict", GF_LOG_ERROR, EINVAL,
-                   LG_MSG_VALUE_LENGTH_LESS_THAN_ZERO, "value->len (%d) < 0",
-                   pair->value->len);
-            goto out;
-        }
-
-        len += pair->value->len;
-
-        pair = pair->next;
-        count--;
-    }
-
-    ret = len;
+    ret = DICT_HDR_LEN + this->totkvlen + (count * keyhdrlen);
 out:
     return ret;
 }
@@ -2948,14 +2935,13 @@ dict_serialize_lk(dict_t *this, char *buf)
     int32_t netword = 0;
 
     if (!buf) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG,
-               "buf is null!");
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, NULL);
         goto out;
     }
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) < 0!", count);
+        gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
@@ -2965,14 +2951,13 @@ dict_serialize_lk(dict_t *this, char *buf)
 
     while (count) {
         if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
-                   "less than count data pairs found!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
+                    NULL);
             goto out;
         }
 
         if (!pair->key) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR,
-                   "pair->key is null!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
@@ -2982,8 +2967,7 @@ dict_serialize_lk(dict_t *this, char *buf)
         buf += DICT_DATA_HDR_KEY_LEN;
 
         if (!pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR,
-                   "pair->value is null!");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_PTR, NULL);
             goto out;
         }
 
@@ -3131,8 +3115,8 @@ dict_unserialize(char *orig_buf, int32_t size, dict_t **fill)
     buf += DICT_HDR_LEN;
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
-               "count (%d) <= 0", count);
+        gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_COUNT_LESS_THAN_ZERO,
+                "count=%d", count, NULL);
         goto out;
     }
 
@@ -3288,32 +3272,30 @@ dict_serialize_value_with_delim_lk(dict_t *this, char *buf, int32_t *serz_len,
     data_pair_t *pair = this->members_list;
 
     if (!buf) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, "buf is null");
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, NULL);
         goto out;
     }
 
     if (count < 0) {
-        gf_msg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG,
-               "count (%d) < 0", count);
+        gf_smsg("dict", GF_LOG_ERROR, EINVAL, LG_MSG_INVALID_ARG, "count=%d",
+                count, NULL);
         goto out;
     }
 
     while (count) {
         if (!pair) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
-                   "less than count data pairs found");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_PAIRS_LESS_THAN_COUNT,
+                    NULL);
             goto out;
         }
 
         if (!pair->key || !pair->value) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_KEY_OR_VALUE_NULL,
-                   "key or value is null");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_KEY_OR_VALUE_NULL, NULL);
             goto out;
         }
 
         if (!pair->value->data) {
-            gf_msg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_VALUE_IN_DICT,
-                   "null value found in dict");
+            gf_smsg("dict", GF_LOG_ERROR, 0, LG_MSG_NULL_VALUE_IN_DICT, NULL);
             goto out;
         }
 
@@ -3405,12 +3387,11 @@ dict_dump_to_log(dict_t *dict)
 
     ret = dict_dump_to_str(dict, dump, dump_size, format);
     if (ret) {
-        gf_msg("dict", GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT,
-               "Failed to log dictionary");
+        gf_smsg("dict", GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT, NULL);
         goto out;
     }
-    gf_msg("dict", GF_LOG_INFO, 0, LG_MSG_DICT_ERROR, "dict=%p (%s)", dict,
-           dump);
+    gf_smsg("dict", GF_LOG_INFO, 0, LG_MSG_DICT_ERROR, "dict=%p", dict,
+            "dump=%s", dump, NULL);
 out:
     GF_FREE(dump);
 
@@ -3443,8 +3424,8 @@ dict_dump_to_statedump(dict_t *dict, char *dict_name, char *domain)
 
     ret = dict_dump_to_str(dict, dump, dump_size, format);
     if (ret) {
-        gf_msg(domain, GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT,
-               "Failed to log dictionary %s", dict_name);
+        gf_smsg(domain, GF_LOG_WARNING, 0, LG_MSG_FAILED_TO_LOG_DICT, "name=%s",
+                dict_name, NULL);
         goto out;
     }
     gf_proc_dump_build_key(key, domain, "%s", dict_name);

@@ -8,6 +8,7 @@ later), or the GNU General Public License, version 2 (GPLv2), in all
 cases as published by the Free Software Foundation.
 */
 
+#include <glusterfs/syscall.h>
 #include "glusterd-volgen.h"
 #include "glusterd-utils.h"
 
@@ -786,6 +787,32 @@ out:
 
     return ret;
 }
+static int
+is_directory(const char *path)
+{
+    struct stat statbuf;
+    if (sys_stat(path, &statbuf) != 0)
+        return 0;
+    return S_ISDIR(statbuf.st_mode);
+}
+static int
+validate_statedump_path(glusterd_volinfo_t *volinfo, dict_t *dict, char *key,
+                        char *value, char **op_errstr)
+{
+    xlator_t *this = NULL;
+    this = THIS;
+    GF_ASSERT(this);
+
+    int ret = 0;
+    if (!is_directory(value)) {
+        gf_asprintf(op_errstr, "Failed: %s is not a directory", value);
+        ret = -1;
+        gf_msg(this->name, GF_LOG_ERROR, 0, GD_MSG_INVALID_ENTRY, "%s",
+               *op_errstr);
+    }
+
+    return ret;
+}
 
 /* dispatch table for VOLUME SET
  * -----------------------------
@@ -1108,6 +1135,11 @@ struct volopt_map_entry glusterd_volopt_map[] = {
      .type = NO_DOC,
      .op_version = GD_OP_VERSION_3_13_2,
      .flags = VOLOPT_FLAG_CLIENT_OPT},
+    {.key = "cluster.optimistic-change-log",
+     .voltype = "cluster/replicate",
+     .type = NO_DOC,
+     .op_version = GD_OP_VERSION_7_2,
+     .flags = VOLOPT_FLAG_CLIENT_OPT},
 
     /* IO-stats xlator options */
     {.key = VKEY_DIAG_LAT_MEASUREMENT,
@@ -1234,10 +1266,21 @@ struct volopt_map_entry glusterd_volopt_map[] = {
      .option = "priority",
      .op_version = 1,
      .flags = VOLOPT_FLAG_CLIENT_OPT},
-    {.key = "performance.cache-size",
+    {.key = "performance.io-cache-size",
      .voltype = "performance/io-cache",
-     .op_version = 1,
+     .option = "cache-size",
+     .op_version = GD_OP_VERSION_8_0,
      .flags = VOLOPT_FLAG_CLIENT_OPT},
+    {
+        .key = "performance.cache-size",
+        .voltype = "performance/io-cache",
+        .op_version = 1,
+        .flags = VOLOPT_FLAG_CLIENT_OPT,
+        .description = "Deprecated option. Use performance.io-cache-size "
+                       "to adjust the cache size of the io-cache translator, "
+                       "and use performance.quick-read-cache-size to adjust "
+                       "the cache size of the quick-read translator.",
+    },
 
     /* IO-threads xlator options */
     {.key = "performance.io-thread-count",
@@ -1277,16 +1320,29 @@ struct volopt_map_entry glusterd_volopt_map[] = {
      .voltype = "performance/io-cache",
      .option = "pass-through",
      .op_version = GD_OP_VERSION_4_1_0},
+    {.key = "performance.quick-read-cache-size",
+     .voltype = "performance/quick-read",
+     .option = "cache-size",
+     .op_version = GD_OP_VERSION_8_0,
+     .flags = VOLOPT_FLAG_CLIENT_OPT},
     {.key = "performance.cache-size",
      .voltype = "performance/quick-read",
      .type = NO_DOC,
      .op_version = 1,
      .flags = VOLOPT_FLAG_CLIENT_OPT},
+    {.key = "performance.quick-read-cache-timeout",
+     .voltype = "performance/quick-read",
+     .option = "cache-timeout",
+     .op_version = GD_OP_VERSION_8_0,
+     .flags = VOLOPT_FLAG_CLIENT_OPT},
     {.key = "performance.qr-cache-timeout",
      .voltype = "performance/quick-read",
      .option = "cache-timeout",
      .op_version = 1,
-     .flags = VOLOPT_FLAG_CLIENT_OPT},
+     .flags = VOLOPT_FLAG_CLIENT_OPT,
+     .description =
+         "Deprecated option. Use performance.quick-read-cache-timeout "
+         "instead."},
     {.key = "performance.quick-read-cache-invalidation",
      .voltype = "performance/quick-read",
      .option = "quick-read-cache-invalidation",
@@ -1583,7 +1639,8 @@ struct volopt_map_entry glusterd_volopt_map[] = {
     {.key = "server.statedump-path",
      .voltype = "protocol/server",
      .option = "statedump-path",
-     .op_version = 1},
+     .op_version = 1,
+     .validate_fn = validate_statedump_path},
     {.key = "server.outstanding-rpc-limit",
      .voltype = "protocol/server",
      .option = "rpc.outstanding-rpc-limit",
@@ -1756,7 +1813,7 @@ struct volopt_map_entry glusterd_volopt_map[] = {
     {.key = "performance.readdir-ahead",
      .voltype = "performance/readdir-ahead",
      .option = "!perf",
-     .value = "on",
+     .value = "off",
      .op_version = 3,
      .description = "enable/disable readdir-ahead translator in the volume.",
      .flags = VOLOPT_FLAG_CLIENT_OPT | VOLOPT_FLAG_XLATOR_OPT},
@@ -2429,7 +2486,6 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         .voltype = "storage/posix",
         .op_version = GD_OP_VERSION_4_1_0,
     },
-    {.key = "storage.bd-aio", .voltype = "storage/bd", .op_version = 3},
     {.key = "config.memory-accounting",
      .voltype = "mgmt/glusterd",
      .option = "!config",
@@ -2646,6 +2702,15 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         .op_version = GD_OP_VERSION_3_7_0,
         .type = NO_DOC,
     },
+    {
+        .key = "features.signer-threads",
+        .voltype = "features/bit-rot",
+        .value = BR_WORKERS,
+        .option = "signer-threads",
+        .op_version = GD_OP_VERSION_8_0,
+        .type = NO_DOC,
+    },
+    /* Upcall translator options */
     /* Upcall translator options */
     {
         .key = "features.cache-invalidation",
@@ -3061,5 +3126,21 @@ struct volopt_map_entry glusterd_volopt_map[] = {
     {.key = "features.cloudsync-product-id",
      .voltype = "features/cloudsync",
      .op_version = GD_OP_VERSION_7_0,
+     .flags = VOLOPT_FLAG_CLIENT_OPT},
+    {
+        .key = "features.acl",
+        .voltype = "features/access-control",
+        .value = "enable",
+        .option = "!features",
+        .op_version = GD_OP_VERSION_8_0,
+        .description = "(WARNING: for debug purpose only) enable/disable "
+                       "access-control xlator in volume",
+        .type = NO_DOC,
+    },
+
+    {.key = "cluster.use-anonymous-inode",
+     .voltype = "cluster/replicate",
+     .op_version = GD_OP_VERSION_9_0,
+     .value = "yes",
      .flags = VOLOPT_FLAG_CLIENT_OPT},
     {.key = NULL}};

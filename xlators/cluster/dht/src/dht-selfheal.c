@@ -8,9 +8,7 @@
   cases as published by the Free Software Foundation.
 */
 
-#include "dht-common.h"
 #include "dht-lock.h"
-#include <glusterfs/glusterfs-acl.h>
 
 #define DHT_SET_LAYOUT_RANGE(layout, i, srt, chunk, path)                      \
     do {                                                                       \
@@ -35,7 +33,7 @@
         }                                                                      \
     } while (0)
 
-int
+static int
 dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
                          gf_boolean_t newdir, dht_selfheal_layout_t healer,
                          dht_need_heal_t should_heal);
@@ -146,8 +144,8 @@ dht_refresh_layout_done(call_frame_t *frame)
 
     ret = dht_layout_sort(refreshed);
     if (ret == -1) {
-        gf_msg(frame->this->name, GF_LOG_WARNING, 0, DHT_MSG_LAYOUT_SORT_FAILED,
-               "sorting the layout failed");
+        gf_smsg(frame->this->name, GF_LOG_WARNING, 0,
+                DHT_MSG_LAYOUT_SORT_FAILED, NULL);
         goto err;
     }
 
@@ -203,10 +201,9 @@ dht_refresh_layout_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         if (op_ret == -1) {
             gf_uuid_unparse(local->loc.gfid, gfid);
             local->op_errno = op_errno;
-            gf_msg(this->name, GF_LOG_ERROR, op_errno,
-                   DHT_MSG_FILE_LOOKUP_FAILED,
-                   "lookup of %s on %s returned error, gfid: %s",
-                   local->loc.path, prev->name, gfid);
+            gf_smsg(this->name, GF_LOG_ERROR, op_errno,
+                    DHT_MSG_FILE_LOOKUP_FAILED, "path=%s", local->loc.path,
+                    "name=%s", prev->name, "gfid=%s", gfid, NULL);
 
             goto unlock;
         }
@@ -267,9 +264,8 @@ dht_refresh_layout(call_frame_t *frame)
                                                       conf->subvolume_cnt);
     if (!local->selfheal.refreshed_layout) {
         gf_uuid_unparse(local->loc.gfid, gfid);
-        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-               "mem allocation for layout failed, path:%s gfid:%s",
-               local->loc.path, gfid);
+        gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_MEM_ALLOC_FAILED,
+                "path=%s", local->loc.path, "gfid=%s", gfid, NULL);
         goto out;
     }
 
@@ -281,9 +277,8 @@ dht_refresh_layout(call_frame_t *frame)
         gf_uuid_unparse(local->loc.gfid, gfid);
         local->xattr_req = dict_new();
         if (local->xattr_req == NULL) {
-            gf_msg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-                   "dict mem allocation failed, path:%s gfid:%s",
-                   local->loc.path, gfid);
+            gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
+                    "path=%s", local->loc.path, "gfid=%s", gfid, NULL);
             goto out;
         }
     }
@@ -291,9 +286,9 @@ dht_refresh_layout(call_frame_t *frame)
     if (dict_get(local->xattr_req, conf->xattr_name) == 0) {
         ret = dict_set_uint32(local->xattr_req, conf->xattr_name, 4 * 4);
         if (ret)
-            gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-                   "%s: Failed to set dictionary value:key = %s",
-                   local->loc.path, conf->xattr_name);
+            gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
+                    "path=%s", local->loc.path, "key=%s", conf->xattr_name,
+                    NULL);
     }
 
     for (i = 0; i < call_cnt; i++) {
@@ -526,7 +521,7 @@ out:
     return fixit;
 }
 
-int
+static int
 dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
                          gf_boolean_t newdir, dht_selfheal_layout_t healer,
                          dht_need_heal_t should_heal)
@@ -558,10 +553,8 @@ dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
         lk_array = GF_CALLOC(count, sizeof(*lk_array), gf_common_mt_char);
         if (lk_array == NULL) {
             gf_uuid_unparse(local->stbuf.ia_gfid, gfid);
-            gf_msg("dht", GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-                   "mem allocation failed for "
-                   "lk_array, gfid:%s path: %s",
-                   gfid, local->loc.path);
+            gf_smsg("dht", GF_LOG_ERROR, ENOMEM, DHT_MSG_MEM_ALLOC_FAILED,
+                    "lk_array-gfid=%s", gfid, "path=%s", local->loc.path, NULL);
             goto err;
         }
 
@@ -571,10 +564,9 @@ dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
                 DHT_LAYOUT_HEAL_DOMAIN, NULL, FAIL_ON_ANY_ERROR);
             if (lk_array[i] == NULL) {
                 gf_uuid_unparse(local->stbuf.ia_gfid, gfid);
-                gf_msg(THIS->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-                       "mem allocation "
-                       "failed for lk_array, gfid:%s path:%s",
-                       gfid, local->loc.path);
+                gf_smsg(THIS->name, GF_LOG_ERROR, ENOMEM,
+                        DHT_MSG_MEM_ALLOC_FAILED, "lk_array-gfid=%s", gfid,
+                        "path=%s", local->loc.path, NULL);
                 goto err;
             }
         }
@@ -583,10 +575,8 @@ dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
         lk_array = GF_CALLOC(count, sizeof(*lk_array), gf_common_mt_char);
         if (lk_array == NULL) {
             gf_uuid_unparse(local->stbuf.ia_gfid, gfid);
-            gf_msg(THIS->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-                   "mem allocation failed for "
-                   "lk_array, gfid:%s path:%s",
-                   gfid, local->loc.path);
+            gf_smsg(THIS->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_MEM_ALLOC_FAILED,
+                    "lk_array-gfid=%s", gfid, "path=%s", local->loc.path, NULL);
             goto err;
         }
 
@@ -595,10 +585,8 @@ dht_selfheal_layout_lock(call_frame_t *frame, dht_layout_t *layout,
                                    NULL, FAIL_ON_ANY_ERROR);
         if (lk_array[0] == NULL) {
             gf_uuid_unparse(local->stbuf.ia_gfid, gfid);
-            gf_msg(THIS->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-                   "mem allocation failed for "
-                   "lk_array, gfid:%s path:%s",
-                   gfid, local->loc.path);
+            gf_smsg(THIS->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_MEM_ALLOC_FAILED,
+                    "lk_array-gfid=%s", gfid, "path=%s", local->loc.path, NULL);
             goto err;
         }
     }
@@ -624,7 +612,7 @@ err:
     return -1;
 }
 
-int
+static int
 dht_selfheal_dir_xattr_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                            int op_ret, int op_errno, dict_t *xdata)
 {
@@ -646,10 +634,9 @@ dht_selfheal_dir_xattr_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         err = 0;
     } else {
         gf_uuid_unparse(local->loc.gfid, gfid);
-        gf_msg(this->name, GF_LOG_ERROR, op_errno,
-               DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-               "layout setxattr failed on %s, path:%s gfid:%s", subvol->name,
-               local->loc.path, gfid);
+        gf_smsg(this->name, GF_LOG_ERROR, op_errno,
+                DHT_MSG_DIR_SELFHEAL_XATTR_FAILED, "name=%s", subvol->name,
+                "path=%s", local->loc.path, "gfid=%s", gfid, NULL);
         err = op_errno;
     }
 
@@ -696,7 +683,7 @@ dht_set_user_xattr(dict_t *dict, char *k, data_t *v, void *data)
     return ret;
 }
 
-int
+static int
 dht_selfheal_dir_xattr_persubvol(call_frame_t *frame, loc_t *loc,
                                  dht_layout_t *layout, int i,
                                  xlator_t *req_subvol)
@@ -738,19 +725,17 @@ dht_selfheal_dir_xattr_persubvol(call_frame_t *frame, loc_t *loc,
 
     ret = dict_set_str(xdata, GLUSTERFS_INTERNAL_FOP_KEY, "yes");
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "%s: Failed to set dictionary value: key = %s,"
-               " gfid = %s",
-               loc->path, GLUSTERFS_INTERNAL_FOP_KEY, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
+                "path=%s", loc->path, "key=%s", GLUSTERFS_INTERNAL_FOP_KEY,
+                "gfid=%s", gfid, NULL);
         goto err;
     }
 
     ret = dict_set_int8(xdata, DHT_IATT_IN_XDATA_KEY, 1);
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "%s: Failed to set dictionary value: key = %s,"
-               " gfid = %s",
-               loc->path, DHT_IATT_IN_XDATA_KEY, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
+                "path=%s", loc->path, "key=%s", DHT_IATT_IN_XDATA_KEY,
+                "gfid=%s", gfid, NULL);
         goto err;
     }
 
@@ -758,21 +743,21 @@ dht_selfheal_dir_xattr_persubvol(call_frame_t *frame, loc_t *loc,
 
     ret = dht_disk_layout_extract(this, layout, i, &disk_layout);
     if (ret == -1) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-               "Directory self heal xattr failed:"
-               " %s: (subvol %s) Failed to extract disk layout,"
-               " gfid = %s",
-               loc->path, subvol->name, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0,
+                DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
+                "extract-disk-layout-failed, path=%s", loc->path, "subvol=%s",
+                subvol->name, "gfid=%s", gfid, NULL);
         goto err;
     }
 
     ret = dict_set_bin(xattr, conf->xattr_name, disk_layout, 4 * 4);
     if (ret == -1) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-               "Directory self heal xattr failed:"
-               "%s: (subvol %s) Failed to set xattr dictionary,"
-               " gfid = %s",
-               loc->path, subvol->name, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0,
+                DHT_MSG_DIR_SELFHEAL_XATTR_FAILED, "path=%s", loc->path,
+                "subvol=%s", subvol->name,
+                "set-xattr-dictionary-failed"
+                "gfid=%s",
+                gfid, NULL);
         goto err;
     }
     disk_layout = NULL;
@@ -788,20 +773,17 @@ dht_selfheal_dir_xattr_persubvol(call_frame_t *frame, loc_t *loc,
         if (data) {
             ret = dict_add(xattr, QUOTA_LIMIT_KEY, data);
             if (ret) {
-                gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-                       "%s: Failed to set dictionary value:"
-                       " key = %s",
-                       loc->path, QUOTA_LIMIT_KEY);
+                gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
+                        "path=%s", loc->path, "key=%s", QUOTA_LIMIT_KEY, NULL);
             }
         }
         data = dict_get(local->xattr, QUOTA_LIMIT_OBJECTS_KEY);
         if (data) {
             ret = dict_add(xattr, QUOTA_LIMIT_OBJECTS_KEY, data);
             if (ret) {
-                gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-                       "%s: Failed to set dictionary value:"
-                       " key = %s",
-                       loc->path, QUOTA_LIMIT_OBJECTS_KEY);
+                gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
+                        "path=%s", loc->path, "key=%s", QUOTA_LIMIT_OBJECTS_KEY,
+                        NULL);
             }
         }
     }
@@ -830,7 +812,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_fix_dir_xattr(call_frame_t *frame, loc_t *loc, dht_layout_t *layout)
 {
     dht_local_t *local = NULL;
@@ -879,7 +861,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_selfheal_dir_xattr(call_frame_t *frame, loc_t *loc, dht_layout_t *layout)
 {
     dht_local_t *local = NULL;
@@ -939,9 +921,8 @@ dht_selfheal_dir_xattr(call_frame_t *frame, loc_t *loc, dht_layout_t *layout)
     dummy = dht_layout_new(this, 1);
     if (!dummy) {
         gf_uuid_unparse(loc->gfid, gfid);
-        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-               "failed to allocate dummy layout, path:%s gfid:%s", loc->path,
-               gfid);
+        gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_DUMMY_ALLOC_FAILED,
+                "path=%s", loc->path, "gfid=%s", gfid, NULL);
         goto out;
     }
     for (i = 0; i < conf->subvolume_cnt && missing_xattr; i++) {
@@ -955,38 +936,6 @@ dht_selfheal_dir_xattr(call_frame_t *frame, loc_t *loc, dht_layout_t *layout)
     dht_layout_unref(this, dummy);
 out:
     return 0;
-}
-
-gf_boolean_t
-dht_is_subvol_part_of_layout(dht_layout_t *layout, xlator_t *xlator)
-{
-    int i = 0;
-    gf_boolean_t ret = _gf_false;
-
-    for (i = 0; i < layout->cnt; i++) {
-        if (!strcmp(layout->list[i].xlator->name, xlator->name)) {
-            ret = _gf_true;
-            break;
-        }
-    }
-
-    return ret;
-}
-
-int
-dht_layout_index_from_conf(dht_layout_t *layout, xlator_t *xlator)
-{
-    int i = -1;
-    int j = 0;
-
-    for (j = 0; j < layout->cnt; j++) {
-        if (!strcmp(layout->list[j].xlator->name, xlator->name)) {
-            i = j;
-            break;
-        }
-    }
-
-    return i;
 }
 
 int
@@ -1079,7 +1028,7 @@ dht_selfheal_dir_setattr(call_frame_t *frame, loc_t *loc, struct iatt *stbuf,
     return 0;
 }
 
-int
+static int
 dht_selfheal_dir_mkdir_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                            int op_ret, int op_errno, inode_t *inode,
                            struct iatt *stbuf, struct iatt *preparent,
@@ -1109,11 +1058,10 @@ dht_selfheal_dir_mkdir_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 
     if (op_ret) {
         gf_uuid_unparse(local->loc.gfid, gfid);
-        gf_msg(this->name,
-               ((op_errno == EEXIST) ? GF_LOG_DEBUG : GF_LOG_WARNING), op_errno,
-               DHT_MSG_DIR_SELFHEAL_FAILED,
-               "Directory selfheal failed: path = %s, gfid = %s",
-               local->loc.path, gfid);
+        gf_smsg(this->name,
+                ((op_errno == EEXIST) ? GF_LOG_DEBUG : GF_LOG_WARNING),
+                op_errno, DHT_MSG_DIR_SELFHEAL_FAILED, "path=%s",
+                local->loc.path, "gfid=%s", gfid, NULL);
         goto out;
     }
     dht_iatt_merge(this, &local->preparent, preparent);
@@ -1132,89 +1080,7 @@ out:
     return 0;
 }
 
-void
-dht_selfheal_dir_mkdir_setacl(dict_t *xattr, dict_t *dict)
-{
-    data_t *acl_default = NULL;
-    data_t *acl_access = NULL;
-    xlator_t *this = NULL;
-    int ret = -1;
-
-    GF_ASSERT(xattr);
-    GF_ASSERT(dict);
-
-    this = THIS;
-    GF_ASSERT(this);
-
-    acl_default = dict_get(xattr, POSIX_ACL_DEFAULT_XATTR);
-
-    if (!acl_default) {
-        gf_msg_debug(this->name, 0, "ACL_DEFAULT xattr not present");
-        goto cont;
-    }
-    ret = dict_set(dict, POSIX_ACL_DEFAULT_XATTR, acl_default);
-    if (ret)
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary value.key = %s",
-               POSIX_ACL_DEFAULT_XATTR);
-cont:
-    acl_access = dict_get(xattr, POSIX_ACL_ACCESS_XATTR);
-    if (!acl_access) {
-        gf_msg_debug(this->name, 0, "ACL_ACCESS xattr not present");
-        goto out;
-    }
-    ret = dict_set(dict, POSIX_ACL_ACCESS_XATTR, acl_access);
-    if (ret)
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary value.key = %s",
-               POSIX_ACL_ACCESS_XATTR);
-
-out:
-    return;
-}
-
-void
-dht_selfheal_dir_mkdir_setquota(dict_t *src, dict_t *dst)
-{
-    data_t *quota_limit_key = NULL;
-    data_t *quota_limit_obj_key = NULL;
-    xlator_t *this = NULL;
-    int ret = -1;
-
-    GF_ASSERT(src);
-    GF_ASSERT(dst);
-
-    this = THIS;
-    GF_ASSERT(this);
-
-    quota_limit_key = dict_get(src, QUOTA_LIMIT_KEY);
-    if (!quota_limit_key) {
-        gf_msg_debug(this->name, 0, "QUOTA_LIMIT_KEY xattr not present");
-        goto cont;
-    }
-    ret = dict_set(dst, QUOTA_LIMIT_KEY, quota_limit_key);
-    if (ret)
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary value.key = %s", QUOTA_LIMIT_KEY);
-
-cont:
-    quota_limit_obj_key = dict_get(src, QUOTA_LIMIT_OBJECTS_KEY);
-    if (!quota_limit_obj_key) {
-        gf_msg_debug(this->name, 0,
-                     "QUOTA_LIMIT_OBJECTS_KEY xattr not present");
-        goto out;
-    }
-    ret = dict_set(dst, QUOTA_LIMIT_OBJECTS_KEY, quota_limit_obj_key);
-    if (ret)
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary value.key = %s",
-               QUOTA_LIMIT_OBJECTS_KEY);
-
-out:
-    return;
-}
-
-int
+static int
 dht_selfheal_dir_mkdir_lookup_done(call_frame_t *frame, xlator_t *this)
 {
     dht_local_t *local = NULL;
@@ -1238,10 +1104,8 @@ dht_selfheal_dir_mkdir_lookup_done(call_frame_t *frame, xlator_t *this)
 
         ret = dict_set_gfuuid(dict, "gfid-req", local->gfid, true);
         if (ret)
-            gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-                   "%s: Failed to set dictionary value:"
-                   " key = gfid-req",
-                   loc->path);
+            gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
+                    "path=%s", loc->path, "key=gfid-req", NULL);
     } else if (local->params) {
         /* Send the dictionary from higher layers directly */
 
@@ -1253,18 +1117,15 @@ dht_selfheal_dir_mkdir_lookup_done(call_frame_t *frame, xlator_t *this)
     dht_dir_set_heal_xattr(this, local, dict, local->xattr, NULL, NULL);
 
     if (!dict) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
-               "dict is NULL, need to make sure gfids are same");
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_IS_NULL, NULL);
         dict = dict_new();
         if (!dict)
             return -1;
     }
     ret = dict_set_flag(dict, GF_INTERNAL_CTX_KEY, GF_DHT_HEAL_DIR);
     if (ret) {
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary value for"
-               " key = %s at path: %s",
-               GF_INTERNAL_CTX_KEY, loc->path);
+        gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED, "key=%s",
+                GF_INTERNAL_CTX_KEY, "path=%s", loc->path, NULL);
         /* We can still continue. As heal can still happen
          * unless quota limits have reached for the dir.
          */
@@ -1296,7 +1157,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_selfheal_dir_mkdir_lookup_cbk(call_frame_t *frame, void *cookie,
                                   xlator_t *this, int op_ret, int op_errno,
                                   inode_t *inode, struct iatt *stbuf,
@@ -1390,7 +1251,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_selfheal_dir_mkdir_lock_cbk(call_frame_t *frame, void *cookie,
                                 xlator_t *this, int32_t op_ret,
                                 int32_t op_errno, dict_t *xdata)
@@ -1410,19 +1271,14 @@ dht_selfheal_dir_mkdir_lock_cbk(call_frame_t *frame, void *cookie,
     local->call_cnt = conf->subvolume_cnt;
 
     if (op_ret < 0) {
-        /* We get this error when the directory entry was not created
-         * on a newky attached tier subvol. Hence proceed and do mkdir
-         * on the tier subvol.
-         */
         if (op_errno == EINVAL) {
             local->call_cnt = 1;
             dht_selfheal_dir_mkdir_lookup_done(frame, this);
             return 0;
         }
 
-        gf_msg(this->name, GF_LOG_WARNING, op_errno, DHT_MSG_ENTRYLK_ERROR,
-               "acquiring entrylk after inodelk failed for %s",
-               local->loc.path);
+        gf_smsg(this->name, GF_LOG_WARNING, op_errno, DHT_MSG_ENTRYLK_ERROR,
+                "path=%s", local->loc.path, NULL);
 
         local->op_errno = op_errno;
         goto err;
@@ -1436,10 +1292,8 @@ dht_selfheal_dir_mkdir_lock_cbk(call_frame_t *frame, void *cookie,
 
     ret = dict_set_int32(local->xattr_req, "list-xattr", 1);
     if (ret)
-        gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-               "Failed to set dictionary key list-xattr value "
-               " for path %s ",
-               local->loc.path);
+        gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED, "path=%s",
+                local->loc.path, NULL);
 
     for (i = 0; i < conf->subvolume_cnt; i++) {
         if (mds_subvol && conf->subvolumes[i] == mds_subvol) {
@@ -1462,18 +1316,21 @@ err:
     return 0;
 }
 
-int
+static int
 dht_selfheal_dir_mkdir(call_frame_t *frame, loc_t *loc, dht_layout_t *layout,
                        int force)
 {
     int missing_dirs = 0;
     int i = 0;
+    int op_errno = 0;
     int ret = -1;
     dht_local_t *local = NULL;
     xlator_t *this = NULL;
+    dht_conf_t *conf = NULL;
 
     local = frame->local;
     this = frame->this;
+    conf = this->private;
 
     local->selfheal.force_mkdir = force;
     local->selfheal.hole_cnt = 0;
@@ -1490,13 +1347,12 @@ dht_selfheal_dir_mkdir(call_frame_t *frame, loc_t *loc, dht_layout_t *layout,
         if (!__is_root_gfid(local->stbuf.ia_gfid)) {
             if (local->need_xattr_heal) {
                 local->need_xattr_heal = 0;
-                ret = dht_dir_xattr_heal(this, local);
-                if (ret)
-                    gf_msg(this->name, GF_LOG_ERROR, ret,
-                           DHT_MSG_DIR_XATTR_HEAL_FAILED,
-                           "%s:xattr heal failed for "
-                           "directory (gfid = %s)",
-                           local->loc.path, local->gfid);
+                ret = dht_dir_xattr_heal(this, local, &op_errno);
+                if (ret) {
+                    gf_smsg(this->name, GF_LOG_ERROR, op_errno,
+                            DHT_MSG_DIR_XATTR_HEAL_FAILED, "path=%s",
+                            local->loc.path, "gfid=%s", local->gfid, NULL);
+                }
             } else {
                 if (!gf_uuid_is_null(local->gfid))
                     gf_uuid_copy(loc->gfid, local->gfid);
@@ -1505,28 +1361,53 @@ dht_selfheal_dir_mkdir(call_frame_t *frame, loc_t *loc, dht_layout_t *layout,
                 if (!ret)
                     return 0;
 
-                gf_msg(this->name, GF_LOG_INFO, 0,
-                       DHT_MSG_DIR_XATTR_HEAL_FAILED,
-                       "%s: Failed to set mds xattr "
-                       "for directory (gfid = %s)",
-                       local->loc.path, local->gfid);
+                gf_smsg(this->name, GF_LOG_INFO, 0, DHT_MSG_SET_XATTR_FAILED,
+                        "path=%s", local->loc.path, "gfid=%s", local->gfid,
+                        NULL);
             }
         }
         dht_selfheal_dir_setattr(frame, loc, &local->stbuf, 0xffffffff, layout);
         return 0;
     }
 
-    if (local->hashed_subvol == NULL)
-        local->hashed_subvol = dht_subvol_get_hashed(this, loc);
+    /* MDS xattr is populated only while DHT is having more than one
+     subvol.In case of graph switch while adding more dht subvols need to
+     consider hash subvol as a MDS to avoid MDS check failure at the time
+     of running fop on directory
+    */
+    if (!dict_get(local->xattr, conf->mds_xattr_key) &&
+        (conf->subvolume_cnt > 1)) {
+        if (local->hashed_subvol == NULL) {
+            local->hashed_subvol = dht_subvol_get_hashed(this, loc);
+            if (local->hashed_subvol == NULL) {
+                local->op_errno = EINVAL;
+                gf_smsg(this->name, GF_LOG_WARNING, local->op_errno,
+                        DHT_MSG_HASHED_SUBVOL_GET_FAILED, "gfid=%s",
+                        loc->pargfid, "name=%s", loc->name, "path=%s",
+                        loc->path, NULL);
+                goto err;
+            }
+        }
+        ret = dht_inode_ctx_mdsvol_set(local->inode, this,
+                                       local->hashed_subvol);
+        if (ret) {
+            gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_SET_INODE_CTX_FAILED,
+                   "Failed to set hashed subvol for %s on inode vol is %s",
+                   local->loc.path,
+                   local->hashed_subvol ? local->hashed_subvol->name : "NULL");
+            goto err;
+        }
+    }
 
     if (local->hashed_subvol == NULL) {
-        local->op_errno = EINVAL;
-        gf_msg(this->name, GF_LOG_WARNING, local->op_errno,
-               DHT_MSG_HASHED_SUBVOL_GET_FAILED,
-               "(%s/%s) (path: %s): "
-               "hashed subvolume not found",
-               loc->pargfid, loc->name, loc->path);
-        goto err;
+        local->hashed_subvol = dht_subvol_get_hashed(this, loc);
+        if (local->hashed_subvol == NULL) {
+            local->op_errno = EINVAL;
+            gf_smsg(this->name, GF_LOG_WARNING, local->op_errno,
+                    DHT_MSG_HASHED_SUBVOL_GET_FAILED, "gfid=%s", loc->pargfid,
+                    "name=%s", loc->name, "path=%s", loc->path, NULL);
+            goto err;
+        }
     }
 
     local->current = &local->lock[0];
@@ -1542,7 +1423,7 @@ err:
     return -1;
 }
 
-int
+static int
 dht_selfheal_layout_alloc_start(xlator_t *this, loc_t *loc,
                                 dht_layout_t *layout)
 {
@@ -1651,8 +1532,6 @@ dht_selfheal_layout_new_directory(call_frame_t *frame, loc_t *loc,
                                   dht_layout_t *new_layout);
 
 void
-dht_layout_entry_swap(dht_layout_t *layout, int i, int j);
-void
 dht_layout_range_swap(dht_layout_t *layout, int i, int j);
 
 /*
@@ -1661,7 +1540,7 @@ dht_layout_range_swap(dht_layout_t *layout, int i, int j);
  */
 #define OV_ENTRY(x, y) table[x * new->cnt + y]
 
-void
+static void
 dht_selfheal_layout_maximize_overlap(call_frame_t *frame, loc_t *loc,
                                      dht_layout_t *new, dht_layout_t *old)
 {
@@ -1738,7 +1617,7 @@ dht_selfheal_layout_maximize_overlap(call_frame_t *frame, loc_t *loc,
     }
 }
 
-dht_layout_t *
+static dht_layout_t *
 dht_fix_layout_of_directory(call_frame_t *frame, loc_t *loc,
                             dht_layout_t *layout)
 {
@@ -1763,9 +1642,8 @@ dht_fix_layout_of_directory(call_frame_t *frame, loc_t *loc,
     new_layout = dht_layout_new(this, priv->subvolume_cnt);
     if (!new_layout) {
         gf_uuid_unparse(loc->gfid, gfid);
-        gf_msg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_NO_MEMORY,
-               "mem allocation failed for new_layout, path:%s gfid:%s",
-               loc->path, gfid);
+        gf_smsg(this->name, GF_LOG_ERROR, ENOMEM, DHT_MSG_MEM_ALLOC_FAILED,
+                "new_layout, path=%s", loc->path, "gfid=%s", gfid, NULL);
         goto done;
     }
 
@@ -1775,10 +1653,9 @@ dht_fix_layout_of_directory(call_frame_t *frame, loc_t *loc,
 
     if (subvol_down) {
         gf_uuid_unparse(loc->gfid, gfid);
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_LAYOUT_FIX_FAILED,
-               "Layout fix failed: %u subvolume(s) are down"
-               ". Skipping fix layout. path:%s gfid:%s",
-               subvol_down, loc->path, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_LAYOUT_FIX_FAILED,
+                "subvol-down=%u", subvol_down, "Skipping-fix-layout", "path=%s",
+                loc->path, "gfid=%s", gfid, NULL);
         GF_FREE(new_layout);
         return NULL;
     }
@@ -1796,10 +1673,10 @@ dht_fix_layout_of_directory(call_frame_t *frame, loc_t *loc,
 
     if (priv->du_stats) {
         for (i = 0; i < priv->subvolume_cnt; ++i) {
-            gf_msg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_SUBVOL_INFO,
-                   "subvolume %d (%s): %u chunks, path:%s", i,
-                   priv->subvolumes[i]->name, priv->du_stats[i].chunks,
-                   loc->path);
+            gf_smsg(this->name, GF_LOG_DEBUG, 0, DHT_MSG_SUBVOL_INFO,
+                    "index=%d", i, "name=%s", priv->subvolumes[i]->name,
+                    "chunks=%u", priv->du_stats[i].chunks, "path=%s", loc->path,
+                    NULL);
 
             /* Maximize overlap if the bricks are all the same
              *  size.
@@ -1811,8 +1688,8 @@ dht_fix_layout_of_directory(call_frame_t *frame, loc_t *loc,
             }
         }
     } else {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_NO_DISK_USAGE_STATUS,
-               "no du stats ?!?");
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_NO_DISK_USAGE_STATUS,
+                NULL);
     }
 
     /* First give it a layout as though it is a new directory. This
@@ -1843,7 +1720,7 @@ done:
  * Having to call this 2x for each entry in the layout is pretty horrible, but
  * that's what all of this layout-sorting nonsense gets us.
  */
-uint32_t
+static uint32_t
 dht_get_chunks_from_xl(xlator_t *parent, xlator_t *child)
 {
     dht_conf_t *priv = parent->private;
@@ -1961,7 +1838,7 @@ done:
     return;
 }
 
-int
+static int
 dht_selfheal_dir_getafix(call_frame_t *frame, loc_t *loc, dht_layout_t *layout)
 {
     dht_local_t *local = NULL;
@@ -2020,9 +1897,8 @@ dht_selfheal_new_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t dir_cbk,
     linked_inode = inode_link(loc->inode, loc->parent, loc->name,
                               &local->stbuf);
     if (!linked_inode) {
-        gf_msg(frame->this->name, GF_LOG_WARNING, 0,
-               DHT_MSG_DIR_SELFHEAL_FAILED,
-               "linking inode failed (%s/%s) => %s", pgfid, loc->name, gfid);
+        gf_smsg(frame->this->name, GF_LOG_WARNING, 0, DHT_MSG_LINK_INODE_FAILED,
+                "pgfid=%s", pgfid, "name=%s", loc->name, "gfid=%s", gfid, NULL);
         ret = -1;
         goto out;
     }
@@ -2094,9 +1970,18 @@ dht_selfheal_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t dir_cbk,
     local->selfheal.dir_cbk = dir_cbk;
     local->selfheal.layout = dht_layout_ref(this, layout);
 
-    if (local->need_attrheal && !IA_ISINVAL(local->mds_stbuf.ia_type)) {
-        /*Use the one in the mds_stbuf*/
-        local->stbuf = local->mds_stbuf;
+    if (local->need_attrheal) {
+        if (__is_root_gfid(local->stbuf.ia_gfid)) {
+            local->stbuf.ia_gid = local->prebuf.ia_gid;
+            local->stbuf.ia_uid = local->prebuf.ia_uid;
+
+            local->stbuf.ia_ctime = local->prebuf.ia_ctime;
+            local->stbuf.ia_ctime_nsec = local->prebuf.ia_ctime_nsec;
+            local->stbuf.ia_prot = local->prebuf.ia_prot;
+
+        } else if (!IA_ISINVAL(local->mds_stbuf.ia_type)) {
+            local->stbuf = local->mds_stbuf;
+        }
     }
 
     if (!__is_root_gfid(local->stbuf.ia_gfid)) {
@@ -2106,9 +1991,9 @@ dht_selfheal_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t dir_cbk,
         linked_inode = inode_link(loc->inode, loc->parent, loc->name,
                                   &local->stbuf);
         if (!linked_inode) {
-            gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_SELFHEAL_FAILED,
-                   "linking inode failed (%s/%s) => %s", pgfid, loc->name,
-                   gfid);
+            gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_LINK_INODE_FAILED,
+                    "pgfid=%s", pgfid, "name=%s", loc->name, "gfid=%s", gfid,
+                    NULL);
             ret = 0;
             goto sorry_no_fix;
         }
@@ -2134,19 +2019,17 @@ dht_selfheal_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t dir_cbk,
     misc = local->selfheal.misc;
 
     if (down) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_SELFHEAL_FAILED,
-               "%s: Directory selfheal failed: %d subvolumes down."
-               "Not fixing. gfid = %s",
-               loc->path, down, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_SELFHEAL_FAILED,
+                "path=%s", loc->path, "subvol-down=%d", down, "Not-fixing",
+                "gfid=%s", gfid, NULL);
         ret = 0;
         goto sorry_no_fix;
     }
 
     if (misc) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_SELFHEAL_FAILED,
-               "%s: Directory selfheal failed : %d subvolumes "
-               "have unrecoverable errors. gfid = %s",
-               loc->path, misc, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_SELFHEAL_FAILED,
+                "path=%s", loc->path, "misc=%d", misc, "unrecoverable-errors",
+                "gfid=%s", gfid, NULL);
 
         ret = 0;
         goto sorry_no_fix;
@@ -2232,29 +2115,28 @@ dht_dir_heal_xattrs(void *data)
     gf_uuid_unparse(local->loc.gfid, gfid);
 
     if (!mds_subvol) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_XATTR_HEAL_FAILED,
-               "No mds subvol for %s gfid = %s", local->loc.path, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_NO_MDS_SUBVOL, "path=%s",
+                local->loc.path, "gfid=%s", gfid, NULL);
         goto out;
     }
 
     if ((local->loc.inode && gf_uuid_is_null(local->loc.inode->gfid)) ||
         gf_uuid_is_null(local->loc.gfid)) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_XATTR_HEAL_FAILED,
-               "No gfid present so skip heal for path %s gfid = %s",
-               local->loc.path, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_GFID_NOT_PRESENT,
+                "skip-heal path=%s", local->loc.path, "gfid=%s", gfid, NULL);
         goto out;
     }
 
     internal_xattr = dict_new();
     if (!internal_xattr) {
-        gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_NO_MEMORY, 0,
-               "dictionary creation failed");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_CREATE_FAILED,
+                "dictionary", NULL);
         goto out;
     }
     xdata = dict_new();
     if (!xdata) {
-        gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_NO_MEMORY, 0,
-               "dictionary creation failed");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_CREATE_FAILED,
+                "dictionary", NULL);
         goto out;
     }
 
@@ -2262,18 +2144,17 @@ dht_dir_heal_xattrs(void *data)
 
     user_xattr = dict_new();
     if (!user_xattr) {
-        gf_msg(this->name, GF_LOG_ERROR, DHT_MSG_NO_MEMORY, 0,
-               "dictionary creation failed");
+        gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_CREATE_FAILED,
+                "dictionary", NULL);
         goto out;
     }
 
     ret = syncop_listxattr(local->mds_subvol, &local->loc, &mds_xattr, NULL,
                            NULL);
     if (ret < 0) {
-        gf_msg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_DIR_XATTR_HEAL_FAILED,
-               "failed to list xattrs for "
-               "%s: on %s ",
-               local->loc.path, local->mds_subvol->name);
+        gf_smsg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_LIST_XATTRS_FAILED,
+                "path=%s", local->loc.path, "name=%s", local->mds_subvol->name,
+                NULL);
     }
 
     if (!mds_xattr)
@@ -2288,10 +2169,9 @@ dht_dir_heal_xattrs(void *data)
         dict_get(user_xattr, QUOTA_LIMIT_OBJECTS_KEY)) {
         ret = dict_set_int32(xdata, GLUSTERFS_INTERNAL_FOP_KEY, 1);
         if (ret) {
-            gf_msg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
-                   "Failed to set dictionary value: key = %s,"
-                   " path = %s",
-                   GLUSTERFS_INTERNAL_FOP_KEY, local->loc.path);
+            gf_smsg(this->name, GF_LOG_ERROR, 0, DHT_MSG_DICT_SET_FAILED,
+                    "key=%s", GLUSTERFS_INTERNAL_FOP_KEY, "path=%s",
+                    local->loc.path, NULL);
             goto out;
         }
     }
@@ -2303,16 +2183,25 @@ dht_dir_heal_xattrs(void *data)
         if (subvol == mds_subvol)
             continue;
         if (uret || uflag) {
+            /* Custom xattr heal is required - let posix handle it */
+            ret = dict_set_int8(xdata, "sync_backend_xattrs", _gf_true);
+            if (ret) {
+                gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DICT_SET_FAILED,
+                        "path=%s", local->loc.path, "key=%s",
+                        "sync_backend_xattrs", NULL);
+                goto out;
+            }
+
             ret = syncop_setxattr(subvol, &local->loc, user_xattr, 0, xdata,
                                   NULL);
             if (ret) {
                 xattr_hashed = 1;
-                gf_msg(this->name, GF_LOG_ERROR, -ret,
-                       DHT_MSG_DIR_XATTR_HEAL_FAILED,
-                       "Directory xattr heal failed. Failed to set"
-                       "user xattr on path %s on "
-                       "subvol %s, gfid = %s ",
-                       local->loc.path, subvol->name, gfid);
+                gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                        DHT_MSG_DIR_XATTR_HEAL_FAILED,
+                        "set-user-xattr-failed path=%s", local->loc.path,
+                        "subvol=%s", subvol->name, "gfid=%s", gfid, NULL);
+            } else {
+                dict_del(xdata, "sync_backend_xattrs");
             }
         }
     }
@@ -2321,21 +2210,17 @@ dht_dir_heal_xattrs(void *data)
         ret = dht_dict_set_array(internal_xattr, conf->mds_xattr_key, allzero,
                                  1);
         if (ret) {
-            gf_msg(this->name, GF_LOG_WARNING, ENOMEM, DHT_MSG_DICT_SET_FAILED,
-                   "Failed to set dictionary value:key = %s for "
-                   "path %s",
-                   conf->mds_xattr_key, local->loc.path);
+            gf_smsg(this->name, GF_LOG_WARNING, ENOMEM, DHT_MSG_DICT_SET_FAILED,
+                    "key=%s", conf->mds_xattr_key, "path=%s", local->loc.path,
+                    NULL);
             goto out;
         }
         ret = syncop_setxattr(mds_subvol, &local->loc, internal_xattr, 0, NULL,
                               NULL);
         if (ret) {
-            gf_msg(this->name, GF_LOG_ERROR, -ret,
-                   DHT_MSG_DIR_XATTR_HEAL_FAILED,
-                   "Failed to reset internal xattr "
-                   "on path %s on subvol %s"
-                   "gfid = %s ",
-                   local->loc.path, mds_subvol->name, gfid);
+            gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                    DHT_MSG_DIR_XATTR_HEAL_FAILED, "path=%s", local->loc.path,
+                    "subvol=%s", mds_subvol->name, "gfid=%s", gfid, NULL);
         }
     }
 
@@ -2386,8 +2271,8 @@ dht_dir_attr_heal(void *data)
     call_cnt = conf->subvolume_cnt;
 
     if (!__is_root_gfid(local->stbuf.ia_gfid) && (!mds_subvol)) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, DHT_MSG_DIR_ATTR_HEAL_FAILED,
-               "No mds subvol for %s gfid = %s", local->loc.path, gfid);
+        gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_NO_MDS_SUBVOL, "path=%s",
+                local->loc.path, "gfid=%s", gfid, NULL);
         goto out;
     }
 
@@ -2395,11 +2280,9 @@ dht_dir_attr_heal(void *data)
         for (i = 0; i < conf->subvolume_cnt; i++) {
             if (conf->subvolumes[i] == mds_subvol) {
                 if (!conf->subvolume_status[i]) {
-                    gf_msg(this->name, GF_LOG_ERROR, 0,
-                           DHT_MSG_HASHED_SUBVOL_DOWN,
-                           "mds subvol is down for path "
-                           " %s gfid is %s Unable to set xattr ",
-                           local->loc.path, gfid);
+                    gf_smsg(this->name, GF_LOG_ERROR, 0,
+                            DHT_MSG_MDS_DOWN_UNABLE_TO_SET, "path=%s",
+                            local->loc.path, "gfid=%s", gfid, NULL);
                     goto out;
                 }
             }
@@ -2425,10 +2308,9 @@ dht_dir_attr_heal(void *data)
         if (ret) {
             gf_uuid_unparse(local->loc.gfid, gfid);
 
-            gf_msg(this->name, GF_LOG_ERROR, -ret, DHT_MSG_DIR_ATTR_HEAL_FAILED,
-                   "Directory attr heal failed. Failed to set"
-                   " uid/gid on path %s on subvol %s, gfid = %s ",
-                   local->loc.path, subvol->name, gfid);
+            gf_smsg(this->name, GF_LOG_ERROR, -ret,
+                    DHT_MSG_DIR_ATTR_HEAL_FAILED, "path=%s", local->loc.path,
+                    "subvol=%s", subvol->name, "gfid=%s", gfid, NULL);
         }
     }
 out:
@@ -2443,7 +2325,7 @@ dht_dir_attr_heal_done(int ret, call_frame_t *sync_frame, void *data)
 }
 
 /* EXIT: dht_update_commit_hash_for_layout */
-int
+static int
 dht_update_commit_hash_for_layout_done(call_frame_t *frame, void *cookie,
                                        xlator_t *this, int32_t op_ret,
                                        int32_t op_errno, dict_t *xdata)
@@ -2463,7 +2345,7 @@ dht_update_commit_hash_for_layout_done(call_frame_t *frame, void *cookie,
     return 0;
 }
 
-int
+static int
 dht_update_commit_hash_for_layout_unlock(call_frame_t *frame, xlator_t *this)
 {
     dht_local_t *local = NULL;
@@ -2481,11 +2363,8 @@ dht_update_commit_hash_for_layout_unlock(call_frame_t *frame, xlator_t *this)
             local->op_ret = -1;
         }
 
-        gf_msg(this->name, GF_LOG_WARNING, errno,
-               DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-               "Winding unlock failed: stale locks left on brick"
-               " %s",
-               local->loc.path);
+        gf_smsg(this->name, GF_LOG_WARNING, errno, DHT_MSG_WIND_UNLOCK_FAILED,
+                "path=%s", local->loc.path, NULL);
 
         dht_update_commit_hash_for_layout_done(frame, NULL, this, 0, 0, NULL);
     }
@@ -2493,7 +2372,7 @@ dht_update_commit_hash_for_layout_unlock(call_frame_t *frame, xlator_t *this)
     return 0;
 }
 
-int
+static int
 dht_update_commit_hash_for_layout_cbk(call_frame_t *frame, void *cookie,
                                       xlator_t *this, int op_ret, int op_errno,
                                       dict_t *xdata)
@@ -2520,7 +2399,7 @@ dht_update_commit_hash_for_layout_cbk(call_frame_t *frame, void *cookie,
     return 0;
 }
 
-int
+static int
 dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
                                          xlator_t *this, int32_t op_ret,
                                          int32_t op_errno, dict_t *xdata)
@@ -2548,11 +2427,8 @@ dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
     if (!xattr) {
         local->op_errno = errno;
 
-        gf_msg(this->name, GF_LOG_WARNING, errno,
-               DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-               "Directory commit hash update failed:"
-               " %s: Allocation failed",
-               local->loc.path);
+        gf_smsg(this->name, GF_LOG_WARNING, errno, DHT_MSG_COMMIT_HASH_FAILED,
+                "allocation-failed path=%s", local->loc.path, NULL);
 
         goto err;
     }
@@ -2563,11 +2439,10 @@ dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
         if (ret < 0) {
             local->op_errno = ENOENT;
 
-            gf_msg(this->name, GF_LOG_WARNING, 0,
-                   DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-                   "Directory commit hash update failed:"
-                   " %s: (subvol %s) Failed to find disk layout",
-                   local->loc.path, conf->local_subvols[i]->name);
+            gf_smsg(this->name, GF_LOG_WARNING, 0, DHT_MSG_COMMIT_HASH_FAILED,
+                    "path=%s", local->loc.path, "subvol=%s",
+                    conf->local_subvols[i]->name, "find-disk-layout-failed",
+                    NULL);
 
             goto err;
         }
@@ -2581,12 +2456,10 @@ dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
         if (ret == -1) {
             local->op_errno = errno;
 
-            gf_msg(this->name, GF_LOG_WARNING, errno,
-                   DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-                   "Directory commit hash update failed:"
-                   " %s: (subvol %s) Failed to extract disk"
-                   " layout",
-                   local->loc.path, conf->local_subvols[i]->name);
+            gf_smsg(this->name, GF_LOG_WARNING, errno,
+                    DHT_MSG_COMMIT_HASH_FAILED, "path=%s", local->loc.path,
+                    "subvol=%s", conf->local_subvols[i]->name,
+                    "extract-disk-layout-failed", NULL);
 
             goto err;
         }
@@ -2595,11 +2468,9 @@ dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
         if (!xattr[i]) {
             local->op_errno = errno;
 
-            gf_msg(this->name, GF_LOG_WARNING, errno,
-                   DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-                   "Directory commit hash update failed:"
-                   " %s: Allocation failed",
-                   local->loc.path);
+            gf_smsg(this->name, GF_LOG_WARNING, errno,
+                    DHT_MSG_COMMIT_HASH_FAILED, "path=%s Allocation-failed",
+                    local->loc.path, NULL);
 
             goto err;
         }
@@ -2608,12 +2479,10 @@ dht_update_commit_hash_for_layout_resume(call_frame_t *frame, void *cookie,
         if (ret != 0) {
             local->op_errno = ENOMEM;
 
-            gf_msg(this->name, GF_LOG_WARNING, 0,
-                   DHT_MSG_DIR_SELFHEAL_XATTR_FAILED,
-                   "Directory self heal xattr failed:"
-                   "%s: (subvol %s) Failed to set xattr"
-                   " dictionary,",
-                   local->loc.path, conf->local_subvols[i]->name);
+            gf_smsg(this->name, GF_LOG_WARNING, 0,
+                    DHT_MSG_DIR_SELFHEAL_XATTR_FAILED, "path=%s",
+                    local->loc.path, "subvol=%s", conf->local_subvols[i]->name,
+                    "set-xattr-failed", NULL);
 
             goto err;
         }

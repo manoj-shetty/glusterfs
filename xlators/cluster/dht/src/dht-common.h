@@ -24,7 +24,6 @@
 #define _DHT_H
 
 #define GF_XATTR_FIX_LAYOUT_KEY "distribute.fix.layout"
-#define GF_XATTR_TIER_LAYOUT_FIXED_KEY "trusted.tier.fix.layout.complete"
 #define GF_XATTR_FILE_MIGRATE_KEY "trusted.distribute.migrate-data"
 #define DHT_MDS_STR "mds"
 #define GF_DHT_LOOKUP_UNHASHED_OFF 0
@@ -36,21 +35,20 @@
 #define DHT_LAYOUT_HEAL_DOMAIN "dht.layout.heal"
 /* Namespace synchronization */
 #define DHT_ENTRY_SYNC_DOMAIN "dht.entry.sync"
-#define TIERING_MIGRATION_KEY "tiering.migration"
 #define DHT_LAYOUT_HASH_INVALID 1
 #define MAX_REBAL_THREADS sysconf(_SC_NPROCESSORS_ONLN)
 
 #define DHT_DIR_STAT_BLOCKS 8
 #define DHT_DIR_STAT_SIZE 4096
 
+/* Virtual xattr for subvols status */
+
+#define DHT_SUBVOL_STATUS_KEY "dht.subvol.status"
+
 /* Virtual xattrs for debugging */
 
 #define DHT_DBG_HASHED_SUBVOL_PATTERN "dht.file.hashed-subvol.*"
 #define DHT_DBG_HASHED_SUBVOL_KEY "dht.file.hashed-subvol."
-
-/* Array to hold custom xattr keys
- */
-extern char *xattrs_to_heal[];
 
 /* Rebalance nodeuuid flags */
 #define REBAL_NODEUUID_MINE 0x01
@@ -242,19 +240,6 @@ typedef gf_boolean_t (*dht_need_heal_t)(call_frame_t *frame,
                                         dht_layout_t **inmem,
                                         dht_layout_t **ondisk);
 
-typedef struct {
-    uint64_t blocks_used;
-    uint64_t pblocks_used;
-    uint64_t files_used;
-    uint64_t pfiles_used;
-    uint64_t unhashed_blocks_used;
-    uint64_t unhashed_pblocks_used;
-    uint64_t unhashed_files_used;
-    uint64_t unhashed_pfiles_used;
-    uint64_t unhashed_fsid;
-    uint64_t hashed_fsid;
-} tier_statvfs_t;
-
 struct dht_local {
     loc_t loc;
     loc_t loc2;
@@ -272,7 +257,6 @@ struct dht_local {
     struct iatt preparent;
     struct iatt postparent;
     struct statvfs statvfs;
-    tier_statvfs_t tier_statvfs;
     fd_t *fd;
     inode_t *inode;
     dict_t *params;
@@ -405,14 +389,7 @@ enum gf_defrag_type {
     GF_DEFRAG_CMD_STATUS = 1 + 2,
     GF_DEFRAG_CMD_START_LAYOUT_FIX = 1 + 3,
     GF_DEFRAG_CMD_START_FORCE = 1 + 4,
-    GF_DEFRAG_CMD_START_TIER = 1 + 5,
-    GF_DEFRAG_CMD_STATUS_TIER = 1 + 6,
-    GF_DEFRAG_CMD_START_DETACH_TIER = 1 + 7,
-    GF_DEFRAG_CMD_STOP_DETACH_TIER = 1 + 8,
-    GF_DEFRAG_CMD_PAUSE_TIER = 1 + 9,
-    GF_DEFRAG_CMD_RESUME_TIER = 1 + 10,
     GF_DEFRAG_CMD_DETACH_STATUS = 1 + 11,
-    GF_DEFRAG_CMD_STOP_TIER = 1 + 12,
     GF_DEFRAG_CMD_DETACH_START = 1 + 13,
     GF_DEFRAG_CMD_DETACH_COMMIT = 1 + 14,
     GF_DEFRAG_CMD_DETACH_COMMIT_FORCE = 1 + 15,
@@ -463,75 +440,6 @@ struct dht_container {
     int local_subvol_index;
 };
 
-typedef enum tier_mode_ {
-    TIER_MODE_NONE = 0,
-    TIER_MODE_TEST,
-    TIER_MODE_WM
-} tier_mode_t;
-
-typedef enum tier_pause_state_ {
-    TIER_RUNNING = 0,
-    TIER_REQUEST_PAUSE,
-    TIER_PAUSED
-} tier_pause_state_t;
-
-/* This Structure is only used in tiering fixlayout */
-typedef struct gf_tier_fix_layout_arg {
-    xlator_t *this;
-    dict_t *fix_layout;
-    pthread_t thread_id;
-} gf_tier_fix_layout_arg_t;
-
-typedef struct gf_tier_conf {
-    int is_tier;
-    int watermark_hi;
-    int watermark_low;
-    int watermark_last;
-    unsigned long block_size;
-    fsblkcnt_t blocks_total;
-    fsblkcnt_t blocks_used;
-    uint64_t max_migrate_bytes;
-    int max_migrate_files;
-    int query_limit;
-    tier_mode_t mode;
-    int percent_full;
-    /* These flags are only used for tier-compact */
-    gf_boolean_t compact_active;
-    /* These 3 flags are set to true when the client changes the */
-    /* compaction mode on the command line. */
-    /* When they are set, the daemon will trigger compaction as */
-    /* soon as possible to activate or deactivate compaction. */
-    /* If in the middle of a compaction, then the switches take */
-    /* effect on the next compaction, not the current one. */
-    /* If the user switches it off, we want to avoid needless */
-    /* compactions. */
-    /* If the user switches it on, they want to compact as soon */
-    /* as possible. */
-    gf_boolean_t compact_mode_switched;
-    gf_boolean_t compact_mode_switched_hot;
-    gf_boolean_t compact_mode_switched_cold;
-    int tier_max_promote_size;
-    int tier_promote_frequency;
-    int tier_demote_frequency;
-    int tier_compact_hot_frequency;
-    int tier_compact_cold_frequency;
-    uint64_t st_last_promoted_size;
-    uint64_t st_last_demoted_size;
-    struct synctask *pause_synctask;
-    gf_timer_t *pause_timer;
-    pthread_mutex_t pause_mutex;
-    int promote_in_progress;
-    int demote_in_progress;
-    /* This Structure is only used in tiering fixlayout */
-    gf_tier_fix_layout_arg_t tier_fix_layout_arg;
-    /* Indicates the index of the first queryfile picked
-     * in the last cycle of promote or demote */
-    int32_t last_promote_qfile_index;
-    int32_t last_demote_qfile_index;
-    tier_pause_state_t pause_state;
-    char volname[GD_VOLUME_NAME_MAX + 1];
-} gf_tier_conf_t;
-
 typedef struct nodeuuid_info {
     char info;   /* Set to 1 is this is my node's uuid*/
     uuid_t uuid; /* Store the nodeuuid as well for debugging*/
@@ -559,17 +467,10 @@ struct gf_defrag_info_ {
     int cmd;
     inode_t *root_inode;
     uuid_t node_uuid;
-    struct timeval start_time;
+    time_t start_time;
     uint32_t new_commit_hash;
     gf_defrag_status_t defrag_status;
     gf_defrag_pattern_list_t *defrag_pattern;
-    gf_tier_conf_t tier_conf;
-
-    /*Data Tiering params for scanner*/
-    uint64_t total_files_promoted;
-    uint64_t total_files_demoted;
-    int write_freq_threshold;
-    int read_freq_threshold;
 
     pthread_cond_t parallel_migration_cond;
     pthread_mutex_t dfq_mutex;
@@ -605,7 +506,6 @@ typedef struct gf_defrag_info_ gf_defrag_info_t;
 struct dht_methods_s {
     int32_t (*migration_get_dst_subvol)(xlator_t *this, dht_local_t *local);
     int32_t (*migration_other)(xlator_t *this, gf_defrag_info_t *defrag);
-    int32_t (*migration_needed)(xlator_t *this);
     xlator_t *(*layout_search)(xlator_t *this, dht_layout_t *layout,
                                const char *name);
 };
@@ -626,7 +526,7 @@ struct dht_conf {
     int subvolume_cnt;
     int32_t refresh_interval;
     gf_lock_t subvolume_lock;
-    struct timeval last_stat_fetch;
+    time_t last_stat_fetch;
     gf_lock_t layout_lock;
     dict_t *leaf_to_subvol;
     void *private; /* Can be used by wrapper xlators over
@@ -748,6 +648,8 @@ struct dir_dfmeta {
     struct list_head **head;
     struct list_head **iterator;
     int *fetch_entries;
+    /* fds corresponding to local subvols only */
+    fd_t **lfd;
 };
 
 typedef struct dht_migrate_info {
@@ -823,22 +725,18 @@ typedef struct dht_fd_ctx {
         dht_local_wipe(__xl, __local);                                         \
     } while (0)
 
-#define DHT_UPDATE_TIME(ctx_sec, ctx_nsec, new_sec, new_nsec, inode, post)     \
+#define DHT_UPDATE_TIME(ctx_sec, ctx_nsec, new_sec, new_nsec, post)            \
     do {                                                                       \
-        LOCK(&inode->lock);                                                    \
-        {                                                                      \
-            if (ctx_sec == new_sec)                                            \
-                new_nsec = max(new_nsec, ctx_nsec);                            \
-            else if (ctx_sec > new_sec) {                                      \
-                new_sec = ctx_sec;                                             \
-                new_nsec = ctx_nsec;                                           \
-            }                                                                  \
-            if (post) {                                                        \
-                ctx_sec = new_sec;                                             \
-                ctx_nsec = new_nsec;                                           \
-            }                                                                  \
+        if (ctx_sec == new_sec)                                                \
+            new_nsec = max(new_nsec, ctx_nsec);                                \
+        else if (ctx_sec > new_sec) {                                          \
+            new_sec = ctx_sec;                                                 \
+            new_nsec = ctx_nsec;                                               \
         }                                                                      \
-        UNLOCK(&inode->lock);                                                  \
+        if (post) {                                                            \
+            ctx_sec = new_sec;                                                 \
+            ctx_nsec = new_nsec;                                               \
+        }                                                                      \
     } while (0)
 
 #define is_greater_time(a, an, b, bn)                                          \
@@ -883,7 +781,6 @@ dht_layout_anomalies(xlator_t *this, loc_t *loc, dht_layout_t *layout,
 int
 dht_layout_dir_mismatch(xlator_t *this, dht_layout_t *layout, xlator_t *subvol,
                         loc_t *loc, dict_t *xattr);
-
 xlator_t *
 dht_linkfile_subvol(xlator_t *this, inode_t *inode, struct iatt *buf,
                     dict_t *xattr);
@@ -900,9 +797,6 @@ dht_layout_merge(xlator_t *this, dht_layout_t *layout, xlator_t *subvol,
 int
 dht_disk_layout_extract(xlator_t *this, dht_layout_t *layout, int pos,
                         int32_t **disk_layout_p);
-int
-dht_disk_layout_merge(xlator_t *this, dht_layout_t *layout, int pos,
-                      void *disk_layout_raw, int disk_layout_len);
 int
 dht_disk_layout_extract_for_subvol(xlator_t *this, dht_layout_t *layout,
                                    xlator_t *subvol, int32_t **disk_layout_p);
@@ -939,25 +833,17 @@ dht_linkfile_create(call_frame_t *frame, fop_mknod_cbk_t linkfile_cbk,
                     xlator_t *this, xlator_t *tovol, xlator_t *fromvol,
                     loc_t *loc);
 int
-dht_lookup_directory(call_frame_t *frame, xlator_t *this, loc_t *loc);
-int
 dht_lookup_everywhere(call_frame_t *frame, xlator_t *this, loc_t *loc);
 int
 dht_selfheal_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t cbk,
                        loc_t *loc, dht_layout_t *layout);
-
-int
-dht_selfheal_directory_for_nameless_lookup(call_frame_t *frame,
-                                           dht_selfheal_dir_cbk_t cbk,
-                                           loc_t *loc, dht_layout_t *layout);
-
 int
 dht_selfheal_new_directory(call_frame_t *frame, dht_selfheal_dir_cbk_t cbk,
                            dht_layout_t *layout);
 int
 dht_selfheal_restore(call_frame_t *frame, dht_selfheal_dir_cbk_t cbk,
                      loc_t *loc, dht_layout_t *layout);
-int
+void
 dht_layout_sort_volname(dht_layout_t *layout);
 
 int
@@ -974,14 +860,14 @@ dht_get_du_info_for_subvol(xlator_t *this, int subvol_idx);
 int
 dht_layout_preset(xlator_t *this, xlator_t *subvol, inode_t *inode);
 int
-dht_layout_index_for_subvol(dht_layout_t *layout, xlator_t *subvol);
-int
 dht_layout_set(xlator_t *this, inode_t *inode, dht_layout_t *layout);
 ;
 void
 dht_layout_unref(xlator_t *this, dht_layout_t *layout);
 dht_layout_t *
 dht_layout_ref(xlator_t *this, dht_layout_t *layout);
+int
+dht_layout_index_for_subvol(dht_layout_t *layout, xlator_t *subvol);
 xlator_t *
 dht_first_up_subvol(xlator_t *this);
 xlator_t *
@@ -1248,29 +1134,7 @@ dht_common_xattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                        int32_t op_ret, int32_t op_errno, dict_t *dict,
                        dict_t *xdata);
 int
-dht_fxattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
-                 int32_t op_ret, int32_t op_errno, dict_t *dict, dict_t *xdata);
-
-int
 gf_defrag_status_get(dht_conf_t *conf, dict_t *dict);
-
-void
-gf_defrag_set_pause_state(gf_tier_conf_t *tier_conf, tier_pause_state_t state);
-
-tier_pause_state_t
-gf_defrag_get_pause_state(gf_tier_conf_t *tier_conf);
-
-int
-gf_defrag_pause_tier(xlator_t *this, gf_defrag_info_t *defrag);
-
-tier_pause_state_t
-gf_defrag_check_pause_tier(gf_tier_conf_t *defrag);
-
-int
-gf_defrag_resume_tier(xlator_t *this, gf_defrag_info_t *defrag);
-
-int
-gf_defrag_start_detach_tier(gf_defrag_info_t *defrag);
 
 int
 gf_defrag_stop(dht_conf_t *conf, gf_defrag_status_t status, dict_t *output);
@@ -1303,10 +1167,6 @@ int
 dht_dir_attr_heal(void *data);
 int
 dht_dir_attr_heal_done(int ret, call_frame_t *sync_frame, void *data);
-int
-dht_dir_has_layout(dict_t *xattr, char *name);
-gf_boolean_t
-dht_is_subvol_in_layout(dht_layout_t *layout, xlator_t *xlator);
 xlator_t *
 dht_subvol_with_free_space_inodes(xlator_t *this, xlator_t *subvol,
                                   xlator_t *ignore, dht_layout_t *layout,
@@ -1315,14 +1175,17 @@ xlator_t *
 dht_subvol_maxspace_nonzeroinode(xlator_t *this, xlator_t *subvol,
                                  dht_layout_t *layout);
 int
+dht_dir_has_layout(dict_t *xattr, char *name);
+int
 dht_linkfile_attr_heal(call_frame_t *frame, xlator_t *this);
 
-void
-dht_layout_dump(dht_layout_t *layout, const char *prefix);
 int32_t
 dht_priv_dump(xlator_t *this);
 int32_t
 dht_inodectx_dump(xlator_t *this, inode_t *inode);
+
+gf_boolean_t
+dht_is_subvol_in_layout(dht_layout_t *layout, xlator_t *xlator);
 
 int
 dht_inode_ctx_get_mig_info(xlator_t *this, inode_t *inode,
@@ -1337,11 +1200,6 @@ dht_subvol_status(dht_conf_t *conf, xlator_t *subvol);
 void
 dht_log_new_layout_for_dir_selfheal(xlator_t *this, loc_t *loc,
                                     dht_layout_t *layout);
-int
-dht_lookup_everywhere_done(call_frame_t *frame, xlator_t *this);
-
-int
-dht_fill_dict_to_avoid_unlink_of_migrating_file(dict_t *dict);
 
 int
 dht_layout_sort(dht_layout_t *layout);
@@ -1357,9 +1215,6 @@ dht_layout_missing_dirs(dht_layout_t *layout);
 
 int
 dht_refresh_layout(call_frame_t *frame);
-
-gf_boolean_t
-dht_is_tier_xlator(xlator_t *this);
 
 int
 dht_build_parent_loc(xlator_t *this, loc_t *parent, loc_t *child,
@@ -1390,22 +1245,6 @@ dht_get_lock_subvolume(xlator_t *this, struct gf_flock *lock,
 
 int
 dht_lk_inode_unref(call_frame_t *frame, int32_t op_ret);
-
-void
-dht_normalize_stats(struct statvfs *buf, unsigned long bsize,
-                    unsigned long frsize);
-
-int
-add_opt(char **optsp, const char *opt);
-
-int
-dht_aggregate_split_brain_xattr(dict_t *dst, char *key, data_t *value);
-
-int
-dht_remove_stale_linkto(void *data);
-
-int
-dht_remove_stale_linkto_cbk(int ret, call_frame_t *sync_frame, void *data);
 
 int
 dht_fd_ctx_set(xlator_t *this, fd_t *fd, xlator_t *subvol);
@@ -1478,9 +1317,6 @@ dht_dir_heal_xattrs(void *data);
 int
 dht_dir_heal_xattrs_done(int ret, call_frame_t *sync_frame, void *data);
 
-void
-dht_aggregate_xattr(dict_t *dst, dict_t *src);
-
 int32_t
 dht_dict_set_array(dict_t *dict, char *key, int32_t value[], int32_t size);
 
@@ -1492,24 +1328,11 @@ dht_dir_set_heal_xattr(xlator_t *this, dht_local_t *local, dict_t *dst,
                        dict_t *src, int *uret, int *uflag);
 
 int
-dht_dir_xattr_heal(xlator_t *this, dht_local_t *local);
-
-int32_t
-dht_dict_get_array(dict_t *dict, char *key, int32_t value[], int32_t size,
-                   int *errst);
-
-xlator_t *
-dht_inode_get_hashed_subvol(inode_t *inode, xlator_t *this, loc_t *loc);
+dht_dir_xattr_heal(xlator_t *this, dht_local_t *local, int *op_errno);
 
 int
 dht_common_mark_mdsxattr(call_frame_t *frame, int *errst, int flag);
 
-int
-dht_common_mark_mdsxattr_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
-                             int op_ret, int op_errno, dict_t *xdata);
-
-int
-dht_inode_ctx_mdsvol_set(inode_t *inode, xlator_t *this, xlator_t *mds_subvol);
 int
 dht_inode_ctx_mdsvol_get(inode_t *inode, xlator_t *this, xlator_t **mdsvol);
 
@@ -1519,14 +1342,6 @@ dht_selfheal_dir_setattr(call_frame_t *frame, loc_t *loc, struct iatt *stbuf,
 
 /* Abstract out the DHT-IATT-IN-DICT */
 
-int
-dht_request_iatt_in_xdata(xlator_t *this, dict_t *xattr_req);
-
-int
-dht_read_iatt_from_xdata(xlator_t *this, dict_t *xdata, struct iatt *stbuf);
-
-int
-is_permission_different(ia_prot_t *prot1, ia_prot_t *prot2);
 void
 dht_selfheal_layout_new_directory(call_frame_t *frame, loc_t *loc,
                                   dht_layout_t *new_layout);
@@ -1550,4 +1365,20 @@ dht_pt_rename(call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
 int32_t
 dht_check_remote_fd_failed_error(dht_local_t *local, int op_ret, int op_errno);
 
+int
+dht_common_xattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
+                       int32_t op_ret, int32_t op_errno, dict_t *dict,
+                       dict_t *xdata);
+
+int32_t
+dht_create_lock(call_frame_t *frame, xlator_t *subvol);
+
+int
+dht_set_parent_layout_in_dict(loc_t *loc, xlator_t *this, dht_local_t *local);
+
+int
+dht_dir_layout_error_check(xlator_t *this, inode_t *inode);
+
+int
+dht_inode_ctx_mdsvol_set(inode_t *inode, xlator_t *this, xlator_t *mds_subvol);
 #endif /* _DHT_H */

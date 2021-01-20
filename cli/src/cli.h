@@ -40,8 +40,8 @@ enum argp_option_keys {
     ARGP_PORT_KEY = 'p',
 };
 
-int cli_default_conn_timeout;
-int cli_ten_minutes_timeout;
+extern int cli_default_conn_timeout;
+extern int cli_ten_minutes_timeout;
 
 typedef enum {
     COLD_BRICK_COUNT,
@@ -189,6 +189,12 @@ typedef ssize_t (*cli_serialize_t)(struct iovec outmsg, void *args);
 
 extern struct cli_state *global_state; /* use only in readline callback */
 
+extern struct rpc_clnt *global_quotad_rpc;
+
+extern struct rpc_clnt *global_rpc;
+
+extern rpc_clnt_prog_t *cli_rpc_prog;
+
 typedef const char *(*cli_selector_t)(void *wcon);
 
 char *
@@ -267,8 +273,8 @@ int32_t
 cli_cmd_volume_reset_parse(const char **words, int wordcount, dict_t **opt);
 
 int32_t
-cli_cmd_gsync_set_parse(const char **words, int wordcount, dict_t **opt,
-                        char **errstr);
+cli_cmd_gsync_set_parse(struct cli_state *state, const char **words,
+                        int wordcount, dict_t **opt, char **errstr);
 
 int32_t
 cli_cmd_quota_parse(const char **words, int wordcount, dict_t **opt);
@@ -329,11 +335,14 @@ cli_local_get();
 void
 cli_local_wipe(cli_local_t *local);
 
-int32_t
-cli_cmd_await_connected();
+gf_boolean_t
+cli_cmd_connected();
 
 int32_t
-cli_cmd_broadcast_connected();
+cli_cmd_await_connected(unsigned timeout);
+
+int32_t
+cli_cmd_broadcast_connected(gf_boolean_t status);
 
 int
 cli_rpc_notify(struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
@@ -488,9 +497,6 @@ cli_xml_output_snapshot(int cmd_type, dict_t *dict, int op_ret, int op_errno,
 int
 cli_xml_snapshot_status_single_snap(cli_local_t *local, dict_t *dict,
                                     char *key);
-char *
-is_server_debug_xlator(void *myframe);
-
 int32_t
 cli_cmd_snapshot_parse(const char **words, int wordcount, dict_t **options,
                        struct cli_state *state);

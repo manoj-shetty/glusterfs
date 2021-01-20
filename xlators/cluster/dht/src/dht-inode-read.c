@@ -10,25 +10,25 @@
 
 #include "dht-common.h"
 
-int
+static int
 dht_access2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_readv2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_attr2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_open2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_flush2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_lk2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_fsync2(xlator_t *this, xlator_t *dst_node, call_frame_t *frame, int ret);
-int
+static int
 dht_common_xattrop2(xlator_t *this, xlator_t *subvol, call_frame_t *frame,
                     int ret);
 
-int
+static int
 dht_open_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
              int op_errno, fd_t *fd, dict_t *xdata)
 {
@@ -67,7 +67,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_open2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -216,7 +216,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_attr2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -258,7 +258,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_attr_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
              int op_errno, struct iatt *stbuf, dict_t *xdata)
 {
@@ -473,7 +473,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_readv2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -558,7 +558,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_access_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
                int op_errno, dict_t *xdata)
 {
@@ -606,7 +606,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_access2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -735,7 +735,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_flush2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -881,7 +881,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_fsync2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -959,7 +959,7 @@ err:
 /* TODO: for 'lk()' call, we need some other special error, may be ESTALE to
    indicate that lock migration happened on the fd, so we can consider it as
    phase 2 of migration */
-int
+static int
 dht_lk_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
            int op_errno, struct gf_flock *flock, dict_t *xdata)
 {
@@ -1006,7 +1006,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_lk2(xlator_t *this, xlator_t *subvol, call_frame_t *frame, int ret)
 {
     dht_local_t *local = NULL;
@@ -1087,7 +1087,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_lease_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
               int op_errno, struct gf_lease *lease, dict_t *xdata)
 {
@@ -1129,7 +1129,7 @@ err:
 }
 
 /* Symlinks are currently not migrated, so no need for any check here */
-int
+static int
 dht_readlink_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
                  int op_errno, const char *path, struct iatt *stbuf,
                  dict_t *xdata)
@@ -1192,6 +1192,29 @@ err:
     return 0;
 }
 
+/* Get both DHT_IATT_IN_XDATA_KEY and DHT_MODE_IN_XDATA_KEY
+ * Use DHT_MODE_IN_XDATA_KEY if available, else fall back to
+ * DHT_IATT_IN_XDATA_KEY
+ * This will return a dummy iatt with only the mode and type set
+ */
+static int
+dht_read_iatt_from_xdata(dict_t *xdata, struct iatt *stbuf)
+{
+    int ret = -1;
+    int32_t mode = 0;
+
+    ret = dict_get_int32(xdata, DHT_MODE_IN_XDATA_KEY, &mode);
+
+    if (ret) {
+        ret = dict_get_bin(xdata, DHT_IATT_IN_XDATA_KEY, (void **)&stbuf);
+    } else {
+        stbuf->ia_prot = ia_prot_from_st_mode(mode);
+        stbuf->ia_type = ia_type_from_st_mode(mode);
+    }
+
+    return ret;
+}
+
 int
 dht_common_xattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                        int32_t op_ret, int32_t op_errno, dict_t *dict,
@@ -1230,7 +1253,7 @@ dht_common_xattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
         return 0;
     }
 
-    ret = dht_read_iatt_from_xdata(this, xdata, &stbuf);
+    ret = dht_read_iatt_from_xdata(xdata, &stbuf);
 
     if ((!op_ret) && (ret)) {
         /* This is a potential problem and can cause corruption
@@ -1282,7 +1305,7 @@ out:
     return 0;
 }
 
-int
+static int
 dht_common_xattrop2(xlator_t *this, xlator_t *subvol, call_frame_t *frame,
                     int ret)
 {
@@ -1341,12 +1364,28 @@ out:
     return 0;
 }
 
-int
+static int
 dht_xattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                 int32_t op_ret, int32_t op_errno, dict_t *dict, dict_t *xdata)
 {
     DHT_STACK_UNWIND(xattrop, frame, op_ret, op_errno, dict, xdata);
     return 0;
+}
+
+/* Set both DHT_IATT_IN_XDATA_KEY and DHT_MODE_IN_XDATA_KEY
+ * Use DHT_MODE_IN_XDATA_KEY if available. Else fall back to
+ * DHT_IATT_IN_XDATA_KEY
+ */
+static int
+dht_request_iatt_in_xdata(dict_t *xattr_req)
+{
+    int ret = -1;
+
+    ret = dict_set_int8(xattr_req, DHT_MODE_IN_XDATA_KEY, 1);
+    ret = dict_set_int8(xattr_req, DHT_IATT_IN_XDATA_KEY, 1);
+
+    /* At least one call succeeded */
+    return ret;
 }
 
 int
@@ -1391,7 +1430,7 @@ dht_xattrop(call_frame_t *frame, xlator_t *this, loc_t *loc,
         local->rebalance.xattr = dict_ref(dict);
         local->rebalance.flags = flags;
 
-        ret = dht_request_iatt_in_xdata(this, local->xattr_req);
+        ret = dht_request_iatt_in_xdata(local->xattr_req);
 
         if (ret) {
             gf_msg_debug(this->name, 0,
@@ -1413,7 +1452,7 @@ err:
     return 0;
 }
 
-int
+static int
 dht_fxattrop_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                  int32_t op_ret, int32_t op_errno, dict_t *dict, dict_t *xdata)
 {
@@ -1461,7 +1500,7 @@ dht_fxattrop(call_frame_t *frame, xlator_t *this, fd_t *fd,
         local->rebalance.xattr = dict_ref(dict);
         local->rebalance.flags = flags;
 
-        ret = dht_request_iatt_in_xdata(this, local->xattr_req);
+        ret = dht_request_iatt_in_xdata(local->xattr_req);
 
         if (ret) {
             gf_msg_debug(this->name, 0, "Failed to set dictionary key %s fd=%p",
@@ -1486,7 +1525,7 @@ err:
  * below fops, hence not implementing 'migration' related checks
  */
 
-int
+static int
 dht_inodelk_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
                 int32_t op_ret, int32_t op_errno, dict_t *xdata)
 

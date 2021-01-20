@@ -18,6 +18,7 @@
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <openssl/md5.h>
 #ifndef GF_BSD_HOST_OS
 #include <alloca.h>
@@ -25,6 +26,11 @@
 #include <limits.h>
 #include <fnmatch.h>
 #include <uuid/uuid.h>
+
+/* FreeBSD, etc. */
+#ifndef __BITS_PER_LONG
+#define __BITS_PER_LONG (CHAR_BIT * (sizeof(long)))
+#endif
 
 #ifndef ffsll
 #define ffsll(x) __builtin_ffsll(x)
@@ -123,6 +129,7 @@ trap(void);
 
 /* Default value of signing waiting time to sign a file for bitrot */
 #define SIGNING_TIMEOUT "120"
+#define BR_WORKERS "4"
 
 /* xxhash */
 #define GF_XXH64_DIGEST_LENGTH 8
@@ -147,6 +154,9 @@ trap(void);
 #define GF_THREAD_NAME_LIMIT 16
 #define GF_THREAD_NAME_PREFIX "glfs_"
 
+/* Advisory buffer size for formatted timestamps (see gf_time_fmt) */
+#define GF_TIMESTR_SIZE 256
+
 /*
  * we could have initialized these as +ve values and treated
  * them as negative while comparing etc.. (which would have
@@ -166,7 +176,8 @@ enum _gf_special_pid {
     GF_CLIENT_PID_SCRUB = -9,
     GF_CLIENT_PID_TIER_DEFRAG = -10,
     GF_SERVER_PID_TRASH = -11,
-    GF_CLIENT_PID_ADD_REPLICA_MOUNT = -12
+    GF_CLIENT_PID_ADD_REPLICA_MOUNT = -12,
+    GF_CLIENT_PID_SET_UTIME = -13,
 };
 
 enum _gf_xlator_ipc_targets {
@@ -177,6 +188,12 @@ enum _gf_xlator_ipc_targets {
 
 typedef enum _gf_special_pid gf_special_pid_t;
 typedef enum _gf_xlator_ipc_targets _gf_xlator_ipc_targets_t;
+
+/* Array to hold custom xattr keys */
+extern char *xattrs_to_heal[];
+
+char **
+get_xattrs_to_heal();
 
 /* The DHT file rename operation is not a straightforward rename.
  * It involves creating linkto and linkfiles, and can unlink or rename the
@@ -238,6 +255,8 @@ list_node_del(struct list_node *node);
 
 struct dnscache *
 gf_dnscache_init(time_t ttl);
+void
+gf_dnscache_deinit(struct dnscache *cache);
 struct dnscache_entry *
 gf_dnscache_entry_init(void);
 void
@@ -436,6 +455,15 @@ BIT_VALUE(unsigned char *array, unsigned int index)
     } while (0)
 #endif
 
+/* Compile-time assert, borrowed from Linux kernel. */
+#ifdef HAVE_STATIC_ASSERT
+#define GF_STATIC_ASSERT(expr, ...)                                            \
+    __gf_static_assert(expr, ##__VA_ARGS__, #expr)
+#define __gf_static_assert(expr, msg, ...) _Static_assert(expr, msg)
+#else
+#define GF_STATIC_ASSERT(expr, ...)
+#endif
+
 #define GF_ABORT(msg...)                                                       \
     do {                                                                       \
         gf_msg_callingfn("", GF_LOG_CRITICAL, 0, LG_MSG_ASSERTION_FAILED,      \
@@ -466,18 +494,15 @@ union gf_sock_union {
 
 #define IOV_MIN(n) min(IOV_MAX, n)
 
-#define GF_SKIP_IRRELEVANT_ENTRIES(entry, dir, scr)                            \
-    do {                                                                       \
-        entry = NULL;                                                          \
-        if (dir) {                                                             \
-            entry = sys_readdir(dir, scr);                                     \
-            while (entry && (!strcmp(entry->d_name, ".") ||                    \
-                             !fnmatch("*.tmp", entry->d_name, 0) ||            \
-                             !strcmp(entry->d_name, ".."))) {                  \
-                entry = sys_readdir(dir, scr);                                 \
-            }                                                                  \
-        }                                                                      \
-    } while (0)
+static inline gf_boolean_t
+gf_irrelevant_entry(struct dirent *entry)
+{
+    GF_ASSERT(entry);
+
+    return (!strcmp(entry->d_name, ".") ||
+            !fnmatch("*.tmp", entry->d_name, 0) ||
+            !strcmp(entry->d_name, ".."));
+}
 
 static inline void
 iov_free(struct iovec *vector, int count)
@@ -788,7 +813,7 @@ typedef enum {
 } gf_timefmts;
 
 static inline char *
-gf_time_fmt(char *dst, size_t sz_dst, time_t utime, unsigned int fmt)
+gf_time_fmt_tv(char *dst, size_t sz_dst, struct timeval *tv, unsigned int fmt)
 {
     extern void _gf_timestuff(const char ***, const char ***);
     static gf_timefmts timefmt_last = (gf_timefmts)-1;
@@ -796,6 +821,8 @@ gf_time_fmt(char *dst, size_t sz_dst, time_t utime, unsigned int fmt)
     static const char **zeros;
     struct tm tm, *res;
     int localtime = 0;
+    int len = 0;
+    int pos = 0;
 
     if (timefmt_last == ((gf_timefmts)-1)) {
         _gf_timestuff(&fmts, &zeros);
@@ -805,13 +832,33 @@ gf_time_fmt(char *dst, size_t sz_dst, time_t utime, unsigned int fmt)
         fmt = gf_timefmt_default;
     }
     localtime = gf_log_get_localtime();
-    res = localtime ? localtime_r(&utime, &tm) : gmtime_r(&utime, &tm);
-    if (utime && (res != NULL)) {
-        strftime(dst, sz_dst, fmts[fmt], &tm);
+    res = localtime ? localtime_r(&tv->tv_sec, &tm)
+                    : gmtime_r(&tv->tv_sec, &tm);
+    if (tv->tv_sec && (res != NULL)) {
+        len = strftime(dst, sz_dst, fmts[fmt], &tm);
+        if (len == 0)
+            return dst;
+        pos += len;
+        if (tv->tv_usec >= 0) {
+            len = snprintf(dst + pos, sz_dst - pos, ".%" GF_PRI_SUSECONDS,
+                           tv->tv_usec);
+            if (len >= sz_dst - pos)
+                return dst;
+            pos += len;
+        }
+        strftime(dst + pos, sz_dst - pos, " %z", &tm);
     } else {
         strncpy(dst, "N/A", sz_dst);
     }
     return dst;
+}
+
+static inline char *
+gf_time_fmt(char *dst, size_t sz_dst, time_t utime, unsigned int fmt)
+{
+    struct timeval tv = {utime, -1};
+
+    return gf_time_fmt_tv(dst, sz_dst, &tv, fmt);
 }
 
 /* This function helps us use gfid (unique identity) to generate inode's unique
@@ -1163,6 +1210,47 @@ int
 gf_d_type_from_ia_type(ia_type_t type);
 
 int
+gf_syncfs(int fd);
+
+int
 gf_nanosleep(uint64_t nsec);
+
+static inline time_t
+gf_time(void)
+{
+    return time(NULL);
+}
+
+/* Return delta value in microseconds. */
+
+static inline double
+gf_tvdiff(struct timeval *start, struct timeval *end)
+{
+    struct timeval t;
+
+    if (start->tv_usec > end->tv_usec)
+        t.tv_sec = end->tv_sec - 1, t.tv_usec = end->tv_usec + 1000000;
+    else
+        t.tv_sec = end->tv_sec, t.tv_usec = end->tv_usec;
+
+    return (double)(t.tv_sec - start->tv_sec) * 1e6 +
+           (double)(t.tv_usec - start->tv_usec);
+}
+
+/* Return delta value in nanoseconds. */
+
+static inline double
+gf_tsdiff(struct timespec *start, struct timespec *end)
+{
+    struct timespec t;
+
+    if (start->tv_nsec > end->tv_nsec)
+        t.tv_sec = end->tv_sec - 1, t.tv_nsec = end->tv_nsec + 1000000000;
+    else
+        t.tv_sec = end->tv_sec, t.tv_nsec = end->tv_nsec;
+
+    return (double)(t.tv_sec - start->tv_sec) * 1e9 +
+           (double)(t.tv_nsec - start->tv_nsec);
+}
 
 #endif /* _COMMON_UTILS_H */

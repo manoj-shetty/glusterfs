@@ -63,10 +63,8 @@ typedef enum {
             goto label;                                                        \
         }                                                                      \
         if (remote_fd == -1) {                                                 \
-            gf_msg(xl->name, GF_LOG_WARNING, EBADFD, PC_MSG_BAD_FD,            \
-                   " (%s) "                                                    \
-                   "remote_fd is -1. EBADFD",                                  \
-                   uuid_utoa(fd->inode->gfid));                                \
+            gf_smsg(xl->name, GF_LOG_WARNING, EBADFD, PC_MSG_BAD_FD,           \
+                    "gfid=%s", uuid_utoa(fd->inode->gfid), NULL);              \
             op_errno = EBADFD;                                                 \
             goto label;                                                        \
         }                                                                      \
@@ -159,6 +157,8 @@ typedef struct clnt_conf {
                                   locks when a client disconnects.
                                */
 
+    gf_boolean_t connection_to_brick; /*True from attempt to connect to brick
+                                        till disconnection to brick*/
 } clnt_conf_t;
 
 typedef struct _client_fd_ctx {

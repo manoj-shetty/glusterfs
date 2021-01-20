@@ -117,15 +117,13 @@ struct ioc_page {
 struct ioc_cache {
     rbthash_table_t *page_table;
     struct list_head page_lru;
-    time_t mtime;      /*
-                        * seconds component of file mtime
-                        */
-    time_t mtime_nsec; /*
-                        * nanosecond component of file mtime
-                        */
-    struct timeval tv; /*
-                        * time-stamp at last re-validate
-                        */
+    time_t mtime;           /*
+                             * seconds component of file mtime
+                             */
+    time_t mtime_nsec;      /*
+                             * nanosecond component of file mtime
+                             */
+    time_t last_revalidate; /* timestamp at last re-validate */
 };
 
 struct ioc_inode {
@@ -269,17 +267,6 @@ ioc_frame_fill(ioc_page_t *page, call_frame_t *frame, off_t offset, size_t size,
                      page);                                                    \
         pthread_mutex_unlock(&page->page_lock);                                \
     } while (0)
-
-static inline uint64_t
-time_elapsed(struct timeval *now, struct timeval *then)
-{
-    uint64_t sec = now->tv_sec - then->tv_sec;
-
-    if (sec)
-        return sec;
-
-    return 0;
-}
 
 ioc_inode_t *
 ioc_inode_search(ioc_table_t *table, inode_t *inode);

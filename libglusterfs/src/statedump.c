@@ -199,6 +199,40 @@ gf_proc_dump_write(char *key, char *value, ...)
     return ret;
 }
 
+void
+gf_latency_statedump_and_reset(char *key, gf_latency_t *lat)
+{
+    /* Doesn't make sense to continue if there are no fops
+       came in the given interval */
+    if (!lat || !lat->count)
+        return;
+    gf_proc_dump_write(key,
+                       "AVG:%lf CNT:%" PRIu64 " TOTAL:%" PRIu64 " MIN:%" PRIu64
+                       " MAX:%" PRIu64,
+                       (((double)lat->total) / lat->count), lat->count,
+                       lat->total, lat->min, lat->max);
+    gf_latency_reset(lat);
+}
+
+void
+gf_proc_dump_xl_latency_info(xlator_t *xl)
+{
+    char key_prefix[GF_DUMP_MAX_BUF_LEN];
+    char key[GF_DUMP_MAX_BUF_LEN];
+    int i;
+
+    snprintf(key_prefix, GF_DUMP_MAX_BUF_LEN, "%s.latency", xl->name);
+    gf_proc_dump_add_section("%s", key_prefix);
+
+    for (i = 0; i < GF_FOP_MAXVALUE; i++) {
+        gf_proc_dump_build_key(key, key_prefix, "%s", (char *)gf_fop_list[i]);
+
+        gf_latency_t *lat = &xl->stats.interval.latencies[i];
+
+        gf_latency_statedump_and_reset(key, lat);
+    }
+}
+
 static void
 gf_proc_dump_xlator_mem_info(xlator_t *xl)
 {
@@ -270,7 +304,7 @@ gf_proc_dump_xlator_mem_info_only_in_use(xlator_t *xl)
 void
 gf_proc_dump_mem_info()
 {
-#ifdef HAVE_MALLOC_STATS
+#ifdef HAVE_MALLINFO
     struct mallinfo info;
 
     memset(&info, 0, sizeof(struct mallinfo));
@@ -296,7 +330,7 @@ gf_proc_dump_mem_info_to_dict(dict_t *dict)
 {
     if (!dict)
         return;
-#ifdef HAVE_MALLOC_STATS
+#ifdef HAVE_MALLINFO
     struct mallinfo info;
     int ret = -1;
 
@@ -349,26 +383,13 @@ gf_proc_dump_mem_info_to_dict(dict_t *dict)
 void
 gf_proc_dump_mempool_info(glusterfs_ctx_t *ctx)
 {
+#ifdef GF_DISABLE_MEMPOOL
+    gf_proc_dump_write("built with --disable-mempool", " so no memory pools");
+#else
     struct mem_pool *pool = NULL;
 
     gf_proc_dump_add_section("mempool");
 
-#if defined(OLD_MEM_POOLS)
-    list_for_each_entry(pool, &ctx->mempool_list, global_list)
-    {
-        gf_proc_dump_write("-----", "-----");
-        gf_proc_dump_write("pool-name", "%s", pool->name);
-        gf_proc_dump_write("hot-count", "%d", pool->hot_count);
-        gf_proc_dump_write("cold-count", "%d", pool->cold_count);
-        gf_proc_dump_write("padded_sizeof", "%lu", pool->padded_sizeof_type);
-        gf_proc_dump_write("alloc-count", "%" PRIu64, pool->alloc_count);
-        gf_proc_dump_write("max-alloc", "%d", pool->max_alloc);
-
-        gf_proc_dump_write("pool-misses", "%" PRIu64, pool->pool_misses);
-        gf_proc_dump_write("cur-stdalloc", "%d", pool->curr_stdalloc);
-        gf_proc_dump_write("max-stdalloc", "%d", pool->max_stdalloc);
-    }
-#else
     LOCK(&ctx->lock);
     {
         list_for_each_entry(pool, &ctx->mempool_list, owner)
@@ -377,6 +398,7 @@ gf_proc_dump_mempool_info(glusterfs_ctx_t *ctx)
 
             gf_proc_dump_write("-----", "-----");
             gf_proc_dump_write("pool-name", "%s", pool->name);
+            gf_proc_dump_write("xlator-name", "%s", pool->xl_name);
             gf_proc_dump_write("active-count", "%" GF_PRI_ATOMIC, active);
             gf_proc_dump_write("sizeof-type", "%lu", pool->sizeof_type);
             gf_proc_dump_write("padded-sizeof", "%d",
@@ -387,15 +409,13 @@ gf_proc_dump_mempool_info(glusterfs_ctx_t *ctx)
         }
     }
     UNLOCK(&ctx->lock);
-
-    /* TODO: details of (struct mem_pool_shared) pool->pool */
-#endif
+#endif /* GF_DISABLE_MEMPOOL */
 }
 
 void
 gf_proc_dump_mempool_info_to_dict(glusterfs_ctx_t *ctx, dict_t *dict)
 {
-#if defined(OLD_MEM_POOLS)
+#ifndef GF_DISABLE_MEMPOOL
     struct mem_pool *pool = NULL;
     char key[GF_DUMP_MAX_BUF_LEN] = {
         0,
@@ -406,51 +426,47 @@ gf_proc_dump_mempool_info_to_dict(glusterfs_ctx_t *ctx, dict_t *dict)
     if (!ctx || !dict)
         return;
 
-    list_for_each_entry(pool, &ctx->mempool_list, global_list)
+    LOCK(&ctx->lock);
     {
-        snprintf(key, sizeof(key), "pool%d.name", count);
-        ret = dict_set_str(dict, key, pool->name);
-        if (ret)
-            return;
+        list_for_each_entry(pool, &ctx->mempool_list, owner)
+        {
+            int64_t active = GF_ATOMIC_GET(pool->active);
 
-        snprintf(key, sizeof(key), "pool%d.hotcount", count);
-        ret = dict_set_int32(dict, key, pool->hot_count);
-        if (ret)
-            return;
+            snprintf(key, sizeof(key), "pool%d.name", count);
+            ret = dict_set_str(dict, key, pool->name);
+            if (ret)
+                goto out;
 
-        snprintf(key, sizeof(key), "pool%d.coldcount", count);
-        ret = dict_set_int32(dict, key, pool->cold_count);
-        if (ret)
-            return;
+            snprintf(key, sizeof(key), "pool%d.active-count", count);
+            ret = dict_set_uint64(dict, key, active);
+            if (ret)
+                goto out;
 
-        snprintf(key, sizeof(key), "pool%d.paddedsizeof", count);
-        ret = dict_set_uint64(dict, key, pool->padded_sizeof_type);
-        if (ret)
-            return;
+            snprintf(key, sizeof(key), "pool%d.sizeof-type", count);
+            ret = dict_set_uint64(dict, key, pool->sizeof_type);
+            if (ret)
+                goto out;
 
-        snprintf(key, sizeof(key), "pool%d.alloccount", count);
-        ret = dict_set_uint64(dict, key, pool->alloc_count);
-        if (ret)
-            return;
+            snprintf(key, sizeof(key), "pool%d.padded-sizeof", count);
+            ret = dict_set_uint64(dict, key, 1 << pool->pool->power_of_two);
+            if (ret)
+                goto out;
 
-        snprintf(key, sizeof(key), "pool%d.max_alloc", count);
-        ret = dict_set_int32(dict, key, pool->max_alloc);
-        if (ret)
-            return;
+            snprintf(key, sizeof(key), "pool%d.size", count);
+            ret = dict_set_uint64(dict, key,
+                                  (1 << pool->pool->power_of_two) * active);
+            if (ret)
+                goto out;
 
-        snprintf(key, sizeof(key), "pool%d.max-stdalloc", count);
-        ret = dict_set_int32(dict, key, pool->max_stdalloc);
-        if (ret)
-            return;
-
-        snprintf(key, sizeof(key), "pool%d.pool-misses", count);
-        ret = dict_set_uint64(dict, key, pool->pool_misses);
-        if (ret)
-            return;
-        count++;
+            snprintf(key, sizeof(key), "pool%d.shared-pool", count);
+            ret = dict_set_static_ptr(dict, key, pool->pool);
+            if (ret)
+                goto out;
+        }
     }
-    ret = dict_set_int32(dict, "mempool-count", count);
-#endif
+out:
+    UNLOCK(&ctx->lock);
+#endif /* !GF_DISABLE_MEMPOOL */
 }
 
 void
@@ -485,7 +501,7 @@ gf_proc_dump_single_xlator_info(xlator_t *trav)
         return;
 
     if (ctx->measure_latency)
-        gf_proc_dump_latency_info(trav);
+        gf_proc_dump_xl_latency_info(trav);
 
     gf_proc_dump_xlator_mem_info(trav);
 
@@ -782,7 +798,7 @@ gf_proc_dump_info(int signum, glusterfs_ctx_t *ctx)
     char brick_name[PATH_MAX] = {
         0,
     };
-    char timestr[256] = {
+    char timestr[GF_TIMESTR_SIZE] = {
         0,
     };
     char sign_string[512] = {
@@ -842,7 +858,7 @@ gf_proc_dump_info(int signum, glusterfs_ctx_t *ctx)
              ? dump_options.dump_path
              : ((ctx->statedump_path != NULL) ? ctx->statedump_path
                                               : DEFAULT_VAR_RUN_DIRECTORY)),
-        brick_name, getpid(), (uint64_t)time(NULL));
+        brick_name, getpid(), (uint64_t)gf_time());
     if ((ret < 0) || (ret >= sizeof(path))) {
         goto out;
     }
@@ -861,10 +877,7 @@ gf_proc_dump_info(int signum, glusterfs_ctx_t *ctx)
     // continue even though gettimeofday() has failed
     ret = gettimeofday(&tv, NULL);
     if (0 == ret) {
-        gf_time_fmt(timestr, sizeof timestr, tv.tv_sec, gf_timefmt_FT);
-        len = strlen(timestr);
-        snprintf(timestr + len, sizeof timestr - len, ".%" GF_PRI_SUSECONDS,
-                 tv.tv_usec);
+        gf_time_fmt_tv(timestr, sizeof timestr, &tv, gf_timefmt_FT);
     }
 
     len = snprintf(sign_string, sizeof(sign_string), "DUMP-START-TIME: %s\n",
@@ -913,10 +926,7 @@ gf_proc_dump_info(int signum, glusterfs_ctx_t *ctx)
 
     ret = gettimeofday(&tv, NULL);
     if (0 == ret) {
-        gf_time_fmt(timestr, sizeof timestr, tv.tv_sec, gf_timefmt_FT);
-        len = strlen(timestr);
-        snprintf(timestr + len, sizeof timestr - len, ".%" GF_PRI_SUSECONDS,
-                 tv.tv_usec);
+        gf_time_fmt_tv(timestr, sizeof timestr, &tv, gf_timefmt_FT);
     }
 
     len = snprintf(sign_string, sizeof(sign_string), "\nDUMP-END-TIME: %s",
@@ -1035,7 +1045,7 @@ gf_proc_dump_xlator_profile(xlator_t *this, strfd_t *strfd)
     {
         gf_dump_strfd = strfd;
 
-        gf_proc_dump_latency_info(this);
+        gf_proc_dump_xl_latency_info(this);
 
         gf_dump_strfd = NULL;
     }
